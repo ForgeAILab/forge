@@ -62,3 +62,70 @@ async fn typed_executor_failure_matches_archived_main_for_every_shape_and_second
     }
     assert_writer_cases("executor", visited);
 }
+
+use crate::worker_runtime::queue::writer_parity::case;
+
+#[tokio::test]
+async fn unavailable_and_retry() {
+    case!("executor-unavailable-typed", "in_progress", f, {
+        let execution = f.execution(db::ExecutionStatus::Failed).await;
+        f.ctx
+            .task_service
+            .annotate_executor_unavailable_block(
+                &execution,
+                None,
+                vec![super::channels::ExecutorRouteAttempt {
+                    candidate_key: "candidate".into(),
+                    outcome: "unavailable".into(),
+                }],
+            )
+            .await
+            .unwrap();
+    });
+    case!(
+        "retry-metadata",
+        "in_progress",
+        f,
+        {
+            let before = chrono::Utc::now();
+            let execution = f.execution(db::ExecutionStatus::Failed).await;
+            let version = serde_json::from_str::<serde_json::Value>(
+                execution.executor_config_snapshot_json.as_ref().unwrap(),
+            )
+            .unwrap()["project_version"]
+                .as_i64()
+                .unwrap();
+            f.ctx
+                .task_service
+                .maybe_schedule_execution_retry(&execution, &f.task, version, None, None, None)
+                .await
+                .unwrap();
+            let after = chrono::Utc::now();
+            let row = db::TaskRepo::get_by_id(&*f.db, &f.task.id, false)
+                .await
+                .unwrap()
+                .unwrap();
+            let metadata: serde_json::Value =
+                serde_json::from_str(row.metadata_json.as_deref().unwrap()).unwrap();
+            let deadline = chrono::DateTime::parse_from_rfc3339(
+                metadata["deferred_dispatch"]["not_before"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+            assert!(deadline >= before + chrono::Duration::seconds(10));
+            assert!(deadline <= after + chrono::Duration::seconds(10));
+        },
+        |row, raw| {
+            let metadata: serde_json::Value =
+                serde_json::from_str(row.metadata_json.as_deref().unwrap()).unwrap();
+            let deadline = metadata["deferred_dispatch"]["not_before"]
+                .as_str()
+                .unwrap();
+            let parsed = chrono::DateTime::parse_from_rfc3339(deadline).unwrap();
+            assert_eq!(parsed.to_rfc3339(), deadline);
+            raw.replace(deadline, "<execution-retry-deadline>")
+        }
+    );
+}

@@ -1,5 +1,6 @@
 use crate::{Result, ServiceError};
 use api_types::MAX_EXECUTION_PLAN_BYTES;
+use db::task_condition::channels;
 use db::{Execution, TaskRepo};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -135,9 +136,48 @@ pub(crate) async fn record_retry(
             | crate::workspace_backend::WorkspaceBackendError::RpcTimeoutBeforeStart { .. }
     ) || matches!(error, crate::workspace_backend::WorkspaceBackendError::Other(error)
             if matches!(error.as_ref(), ServiceError::DaemonUnavailable { .. } | ServiceError::DaemonTimeout { .. }));
-    let marker = serde_json::json!({"execution_id":execution_id,"operation":operation,"daemon_id":daemon_id,"message":message,"retry_at":retry_at});
-    let annotation = serde_json::json!({"type":"plan_settlement_wait","code":if offline {"runtime_offline"} else {"plan_owner_error"}, "message":message,"daemon_id":daemon_id,"execution_id":execution_id,"retry_at":retry_at});
-    let changed = db.record_execution_plan_task_wait_in_tx(&mut tx, db::RecordExecutionPlanTaskWaitInTxInput { task_id: &task.id, marker: marker.to_string(), disposition: serde_json::json!({"target_state":task.status,"reason":message,"not_before":retry_at}).to_string(), annotation: annotation.to_string(), updated_at: now.to_rfc3339(), version: task.version }).await?;
+    let marker = serde_json::to_string(&channels::PlanSettlementWait {
+        execution_id: execution_id.into(),
+        operation: operation.into(),
+        daemon_id: daemon_id.into(),
+        message: message.clone(),
+        retry_at: retry_at.clone(),
+    })
+    .expect("condition channel serializes");
+    let annotation = serde_json::to_string(&channels::ErrorAnnotation::new(
+        channels::AnnotationShape::PlanWait(channels::PlanWaitAnnotation {
+            kind: channels::PlanWaitKind::PlanSettlementWait,
+            code: if offline {
+                channels::PlanWaitCode::RuntimeOffline
+            } else {
+                channels::PlanWaitCode::PlanOwnerError
+            },
+            message: message.clone(),
+            daemon_id: daemon_id.into(),
+            execution_id: execution_id.into(),
+            retry_at: retry_at.clone(),
+        }),
+    ))
+    .expect("condition channel serializes");
+    let changed = db
+        .record_execution_plan_task_wait_in_tx(
+            &mut tx,
+            db::RecordExecutionPlanTaskWaitInTxInput {
+                task_id: &task.id,
+                marker,
+                disposition: serde_json::to_string(&channels::DeferredDispatch {
+                    target_state: task.status.clone(),
+                    reason: message.clone(),
+                    not_before: retry_at.clone(),
+                    kind: None,
+                })
+                .expect("condition channel serializes"),
+                annotation,
+                updated_at: now.to_rfc3339(),
+                version: task.version,
+            },
+        )
+        .await?;
     // A blocking wait must never be lost: outside the Task lease it is
     // queued identity-fenced, so it applies even after a status change and
     // the attention recorded below stays truthful.
@@ -155,7 +195,18 @@ pub(crate) async fn record_retry(
                     .map(str::to_owned)
             })
             .unwrap_or_else(|| now.to_rfc3339());
-        let _queued_or_applied = db.record_execution_plan_owner_wait_in_tx(&mut tx, &task.id, serde_json::json!({"daemon_id":daemon_id,"started_at":started_at,"plan_execution_id":execution_id}).to_string()).await?;
+        let _queued_or_applied = db
+            .record_execution_plan_owner_wait_in_tx(
+                &mut tx,
+                &task.id,
+                serde_json::to_string(&channels::OwnerWait {
+                    daemon_id: daemon_id.into(),
+                    started_at,
+                    plan_execution_id: Some(execution_id.into()),
+                })
+                .expect("condition channel serializes"),
+            )
+            .await?;
     }
     crate::placement::admission::record_wait_attention_in_tx(
         db,
@@ -302,3 +353,6 @@ mod tests {
         assert_eq!(rejected.size, Some(oversized.len() as i64));
     }
 }
+
+#[cfg(test)]
+mod writer_parity_tests;

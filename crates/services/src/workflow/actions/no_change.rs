@@ -1,8 +1,8 @@
 //! Review entry costs nothing when a repair delivered the same clean candidate.
 use super::common::block_task_with_annotation;
 use crate::workflow::{effective_role, HookContext};
+use db::task_condition::channels;
 use db::{budget::RepairNoChangeDecision, now_rfc3339};
-use serde_json::json;
 
 pub(crate) async fn repair_no_change_gate(
     ctx: &HookContext,
@@ -106,13 +106,21 @@ pub(crate) async fn park_no_change(
         .await?
         .ok_or(db::DbError::NotFound)?;
     let kind = api_types::FailureKind::ReviewNeedsOwner;
-    let annotation = json!({
-        "type": kind, "blocking_reason": kind, "message": message,
-        "blocked_at": now_rfc3339(), "blocked_execution_id": ctx.execution_id,
-    });
-    block_task_with_annotation(ctx, task, message, kind, None, Some(annotation.to_string()))
-        .await?;
+    let annotation = serde_json::to_string(&channels::ErrorAnnotation::new(
+        channels::AnnotationShape::ReviewPark(channels::ReviewParkAnnotation {
+            kind,
+            blocking_reason: kind.to_string(),
+            message: message.into(),
+            blocked_at: now_rfc3339(),
+            blocked_execution_id: ctx.execution_id.clone(),
+        }),
+    ))
+    .expect("condition channel serializes");
+    block_task_with_annotation(ctx, task, message, kind, None, Some(annotation)).await?;
     ctx.task_service
         .publish_review_park_comment_as(&review, message, &format!("park:{}", step.id))
         .await
 }
+
+#[cfg(test)]
+mod writer_parity_tests;

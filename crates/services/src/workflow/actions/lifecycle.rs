@@ -1,10 +1,10 @@
+use db::task_condition::channels;
 use std::time::Duration;
 
 use api_types::ProjectSettings;
 use async_trait::async_trait;
 use db::{now_rfc3339, RepoRepo, WorkspacePlacementRepo, WorkspaceRepo};
 use events::{event_timestamp, EventContext, ForgeEvent};
-use serde_json::json;
 
 use crate::{
     lifecycle::{LifecycleHookContext, LifecycleHookRun, LifecycleHookRunner},
@@ -314,35 +314,47 @@ async fn annotate_before_work_hook_block(
     } else {
         api_types::FailureKind::BeforeWorkHookFailed
     };
-    let annotation = json!({
-        "type": annotation_type,
-        "blocking_reason": annotation_type,
-        "blocked_by": api_types::Actor::system(api_types::SystemComponent::LifecycleHook).display(),
-        "blocked_at": now_rfc3339(),
-        "blocked_execution_id": null,
-        "message": failure.error.clone().unwrap_or_else(|| "blocking before_work hook failed".to_owned()),
-        "hook": {
-            "event": "before_work",
-            "index": failure.index,
-            "type": "script",
-            "command": failure.command.clone().unwrap_or_default(),
-            "exit_code": failure.exit_code,
-            "timeout": failure.timed_out,
-            "duration_ms": failure.duration_ms,
-            "working_dir": failure.working_dir,
-            "stdout": truncate_annotation_output(&failure.stdout),
-            "stderr": truncate_annotation_output(&failure.stderr),
-            "log_path": failure.log_path,
-            "environment": failure.environment_preview,
-        },
-        "artifact": {
-            "kind": "hook",
-            "id": format!("before_work:{}", failure.index),
-            "log_path": failure.log_path,
-        },
-    });
+    let annotation = serde_json::to_string(&channels::ErrorAnnotation::sorted(
+        channels::AnnotationShape::Blocking(channels::BlockingAnnotation {
+            kind: annotation_type,
+            blocking_reason: annotation_type.to_string(),
+            blocked_by: Some(
+                api_types::Actor::system(api_types::SystemComponent::LifecycleHook).display(),
+            ),
+            blocked_at: Some(now_rfc3339()),
+            blocked_execution_id: None,
+            message: Some(
+                failure
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "blocking before_work hook failed".to_owned()),
+            ),
+            hook: Some(channels::AnnotationHook::Script(Box::new(
+                channels::ScriptHook {
+                    event: channels::ScriptHookEvent::BeforeWork,
+                    index: failure.index,
+                    hook_type: channels::ScriptHookType::Script,
+                    command: failure.command.clone().unwrap_or_default(),
+                    exit_code: failure.exit_code,
+                    timeout: failure.timed_out,
+                    duration_ms: failure.duration_ms,
+                    working_dir: failure.working_dir.clone(),
+                    stdout: truncate_annotation_output(&failure.stdout),
+                    stderr: truncate_annotation_output(&failure.stderr),
+                    log_path: failure.log_path.clone(),
+                    environment: failure.environment_preview.clone(),
+                },
+            ))),
+            artifact: Some(channels::AnnotationArtifact {
+                kind: "hook".into(),
+                id: Some(format!("before_work:{}", failure.index)),
+                log_path: failure.log_path.clone(),
+            }),
+        }),
+    ))
+    .expect("condition channel serializes");
 
-    persist_before_work_annotation(ctx, task, annotation.to_string()).await
+    persist_before_work_annotation(ctx, task, annotation).await
 }
 
 async fn annotate_before_work_workspace_reset(
@@ -350,15 +362,19 @@ async fn annotate_before_work_workspace_reset(
     task: &db::Task,
     error: &crate::ServiceError,
 ) -> db::Result<()> {
-    let annotation = json!({
-        "type": api_types::FailureKind::WorkspaceResetRequired,
-        "blocking_reason": "workspace_reset_required",
-        "blocked_by": api_types::Actor::system(api_types::SystemComponent::LifecycleHook).display(),
-        "blocked_at": now_rfc3339(),
-        "blocked_execution_id": ctx.execution_id,
-        "message": error.to_string(),
-    });
-    persist_before_work_annotation(ctx, task, annotation.to_string()).await
+    let annotation = serde_json::to_string(&channels::ErrorAnnotation::new(
+        channels::AnnotationShape::RecoveryExecution(channels::RecoveryExecutionAnnotation {
+            kind: api_types::FailureKind::WorkspaceResetRequired,
+            blocking_reason: "workspace_reset_required".into(),
+            blocked_by: api_types::Actor::system(api_types::SystemComponent::LifecycleHook)
+                .display(),
+            blocked_at: now_rfc3339(),
+            blocked_execution_id: ctx.execution_id.clone(),
+            message: error.to_string(),
+        }),
+    ))
+    .expect("condition channel serializes");
+    persist_before_work_annotation(ctx, task, annotation).await
 }
 
 async fn persist_before_work_annotation(
@@ -583,3 +599,6 @@ impl HookAction for AutoCascadeOnCompletion {
         }
     }
 }
+
+#[cfg(test)]
+mod writer_parity_tests;

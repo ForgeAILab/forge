@@ -1,3 +1,4 @@
+use db::task_condition::channels;
 use std::{future::Future, pin::Pin, sync::Arc, time::Instant};
 
 use api_types::{
@@ -47,14 +48,31 @@ struct ReviewEntryFailure {
     bridge: api_types::TransitionBridge,
 }
 
-fn dispatch_failed_annotation_json(state: &str, message: &str) -> String {
-    serde_json::json!({
-        "type": api_types::FailureKind::DispatchFailed,
-        "message": message,
-        "state": state,
-        "detected_at": now_rfc3339(),
-    })
-    .to_string()
+fn dispatch_failed_annotation(
+    state: &str,
+    message: &str,
+    daemon_ids: Option<&[String]>,
+) -> channels::ErrorAnnotation {
+    let detected_at = now_rfc3339();
+    let shape = match daemon_ids {
+        Some(daemon_ids) => {
+            channels::AnnotationShape::UpgradeDispatch(channels::UpgradeDispatchAnnotation {
+                code: channels::UpgradeCode::DaemonUpgradeRequired,
+                daemon_ids: daemon_ids.to_vec(),
+                detected_at,
+                message: message.into(),
+                state: state.into(),
+                kind: api_types::FailureKind::DispatchFailed,
+            })
+        }
+        None => channels::AnnotationShape::DetectedState(channels::DetectedStateAnnotation {
+            kind: api_types::FailureKind::DispatchFailed,
+            message: message.into(),
+            state: state.into(),
+            detected_at,
+        }),
+    };
+    channels::ErrorAnnotation::new(shape)
 }
 
 /// The checks `run_ci_steps` will execute when this Task next enters review,
@@ -132,8 +150,7 @@ pub(crate) async fn annotate_upgrade_dispatch_refusal(
         crate::ServiceError::DaemonUpgradeRequired { daemon_id } => vec![daemon_id],
         _ => return Ok(()),
     };
-    let details =
-        serde_json::json!({"code": api_types::DAEMON_UPGRADE_REQUIRED, "daemon_ids": daemon_ids});
+    let daemon_ids: Vec<String> = daemon_ids.into_iter().map(str::to_owned).collect();
     let task = TaskRepo::get_by_id(db, task_id, false)
         .await?
         .ok_or(db::DbError::NotFound)?;
@@ -141,13 +158,12 @@ pub(crate) async fn annotate_upgrade_dispatch_refusal(
         serde_json::from_str::<serde_json::Value>(task.error_annotation.as_deref().unwrap())
             .expect("blocking annotation JSON")
     } else {
-        let mut annotation: serde_json::Value =
-            serde_json::from_str(&dispatch_failed_annotation_json(state, &error.to_string()))
-                .expect("annotation JSON");
-        annotation
-            .as_object_mut()
-            .unwrap()
-            .extend(details.as_object().unwrap().clone());
+        let mut annotation = serde_json::to_value(dispatch_failed_annotation(
+            state,
+            &error.to_string(),
+            Some(&daemon_ids),
+        ))
+        .expect("condition channel serializes");
         // The annotation writer creates its own timestamp. Fence the refusal's
         // content, without comparing separately generated detection times.
         annotation.as_object_mut().unwrap().remove("detected_at");
@@ -158,10 +174,18 @@ pub(crate) async fn annotate_upgrade_dispatch_refusal(
         .as_deref()
         .and_then(|raw| serde_json::from_str(raw).ok())
         .unwrap_or_default();
-    let mut marker = details.clone();
-    marker["error_annotation"] = expected_annotation;
-    marker["dispatch_disposition"] = metadata["dispatch_disposition"].clone();
-    marker["deferred_dispatch"] = metadata["deferred_dispatch"].clone();
+    let marker = serde_json::to_value(channels::DaemonUpgradeRefusal {
+        code: channels::UpgradeCode::DaemonUpgradeRequired,
+        daemon_ids: daemon_ids.clone(),
+        error_annotation: channels::CopiedJson::new(expected_annotation),
+        dispatch_disposition: Some(channels::CopiedJson::new(
+            metadata["dispatch_disposition"].clone(),
+        )),
+        deferred_dispatch: Some(channels::CopiedJson::new(
+            metadata["deferred_dispatch"].clone(),
+        )),
+    })
+    .expect("condition metadata serializes");
     TaskRepo::mutate_metadata(
         db,
         task_id,
@@ -178,8 +202,15 @@ pub(crate) async fn annotate_upgrade_dispatch_refusal(
         &now_rfc3339(),
     )
     .await?;
-    annotate_dispatch_failure_details(db, task_id, state, &error.to_string(), None, Some(details))
-        .await
+    annotate_dispatch_failure_details(
+        db,
+        task_id,
+        state,
+        &error.to_string(),
+        None,
+        Some(daemon_ids),
+    )
+    .await
 }
 
 async fn annotate_dispatch_failure_details(
@@ -188,18 +219,14 @@ async fn annotate_dispatch_failure_details(
     state: &str,
     message: &str,
     authority: Option<&WorkflowAuthority>,
-    details: Option<serde_json::Value>,
+    upgrade_daemon_ids: Option<Vec<String>>,
 ) -> db::Result<()> {
-    let mut annotation: serde_json::Value =
-        serde_json::from_str(&dispatch_failed_annotation_json(state, message))
-            .expect("annotation JSON");
-    if let Some(details) = &details {
-        annotation
-            .as_object_mut()
-            .unwrap()
-            .extend(details.as_object().unwrap().clone());
-    }
-    let annotation = annotation.to_string();
+    let annotation = serde_json::to_string(&dispatch_failed_annotation(
+        state,
+        message,
+        upgrade_daemon_ids.as_deref(),
+    ))
+    .expect("condition channel serializes");
     let current = TaskRepo::get_by_id(db, task_id, false)
         .await?
         .ok_or(db::DbError::NotFound)?;
@@ -210,7 +237,7 @@ async fn annotate_dispatch_failure_details(
             }
             // The hook retained typed refusal details before the engine's
             // string-only fallback. Preserve them for reconnection recovery.
-            if details.is_none()
+            if upgrade_daemon_ids.is_none()
                 && serde_json::from_str::<serde_json::Value>(raw)
                     .ok()
                     .is_some_and(|value| {
@@ -1504,3 +1531,6 @@ pub(crate) mod resolve_workflow_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod writer_parity_tests;

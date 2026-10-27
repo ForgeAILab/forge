@@ -1,6 +1,8 @@
 //! Execution failure blockers and retry scheduling.
 
 use super::*;
+use crate::condition_metadata::set_condition;
+use db::task_condition::channels;
 
 impl TaskService {
     pub(crate) async fn annotate_executor_failure_block(
@@ -27,7 +29,7 @@ impl TaskService {
         &self,
         execution: &Execution,
         retry_at: Option<String>,
-        attempts: Value,
+        attempts: Vec<channels::ExecutorRouteAttempt>,
     ) -> Result<()> {
         let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
             .await?
@@ -55,11 +57,9 @@ impl TaskService {
         {
             return Ok(());
         }
-        let usage_limited = attempts.as_array().is_some_and(|attempts| {
-            attempts.iter().any(|attempt| {
-                attempt.get("outcome").and_then(Value::as_str) == Some("usage_exhausted")
-            })
-        });
+        let usage_limited = attempts
+            .iter()
+            .any(|attempt| attempt.outcome == "usage_exhausted");
         let transient = retry_at.is_some() || usage_limited;
         let retry_block_reason = if transient {
             let current_state = workflow
@@ -91,38 +91,41 @@ impl TaskService {
             None
         };
 
-        let annotation = api_types::TaskBlockingAnnotation {
-            annotation_type: api_types::FailureKind::ExecutorUnavailable,
-            blocking_reason: "executor_unavailable".to_owned(),
-            blocked_by: Some(
-                api_types::Actor::system(api_types::SystemComponent::Executor).display(),
-            ),
-            blocked_at: Some(now_rfc3339()),
-            blocked_execution_id: Some(execution.id.clone()),
-            artifact: Some(api_types::BlockingArtifact {
-                kind: "execution".to_owned(),
-                id: Some(execution.id.clone()),
-                log_path: execution.logs_path.clone(),
-            }),
-            message: Some(
-                if let Some(reason) = retry_block_reason.filter(|_| execution.role != "interactive")
-                {
-                    format!(
-                        "Provider capacity {reason}: {}",
-                        execution
-                            .error
-                            .as_deref()
-                            .unwrap_or("no executor candidate available")
-                    )
-                } else {
-                    execution.error.clone().unwrap_or_else(|| {
+        let annotation = channels::ErrorAnnotation::new(channels::AnnotationShape::Blocking(
+            channels::BlockingAnnotation {
+                kind: api_types::FailureKind::ExecutorUnavailable,
+                blocking_reason: "executor_unavailable".to_owned(),
+                blocked_by: Some(
+                    api_types::Actor::system(api_types::SystemComponent::Executor).display(),
+                ),
+                blocked_at: Some(now_rfc3339()),
+                blocked_execution_id: Some(execution.id.clone()),
+                artifact: Some(channels::AnnotationArtifact {
+                    kind: "execution".to_owned(),
+                    id: Some(execution.id.clone()),
+                    log_path: execution.logs_path.clone(),
+                }),
+                message: Some(
+                    if let Some(reason) =
+                        retry_block_reason.filter(|_| execution.role != "interactive")
+                    {
+                        format!(
+                            "Provider capacity {reason}: {}",
+                            execution
+                                .error
+                                .as_deref()
+                                .unwrap_or("no executor candidate available")
+                        )
+                    } else {
+                        execution.error.clone().unwrap_or_else(|| {
                         "No executor candidate is available (check CLI installs and authentication)"
                             .to_owned()
                     })
-                },
-            ),
-            hook: None,
-        };
+                    },
+                ),
+                hook: None,
+            },
+        ));
         let annotation = serde_json::to_string(&annotation).map_err(|error| {
             ServiceError::invalid_operation(format!(
                 "failed to serialize executor-unavailable annotation: {error}"
@@ -133,16 +136,20 @@ impl TaskService {
             .error
             .clone()
             .unwrap_or_else(|| "no executor candidate available".to_owned());
-        let blocked_meta = json!({
-            "reason": reason,
-            "created_at": now_rfc3339(),
-            "kind": api_types::FailureKind::ExecutorUnavailable,
-            "execution_id": execution.id,
-            "details": {
-                "retry_at": retry_at,
-                "attempts": attempts,
-            },
-        });
+        let created_at = now_rfc3339();
+        let blocked_meta = serde_json::to_value(channels::Interruption {
+            reason: Some(reason.clone()),
+            created_at: Some(Some(created_at)),
+            kind: Some(Some(api_types::FailureKind::ExecutorUnavailable.into())),
+            execution_id: Some(Some(execution.id.clone())),
+            details: Some(Some(channels::InterruptionDetails {
+                retry_at: Some(retry_at),
+                attempts: Some(Some(attempts)),
+                ..Default::default()
+            })),
+            ..Default::default()
+        })
+        .expect("condition channel serializes");
 
         let Some(updated) = TaskRepo::update_status_for_latest_execution(
             &*self.db,
@@ -289,31 +296,29 @@ impl TaskService {
         let Some(project) = ProjectRepo::get_by_id(&*self.db, &task.project_id).await? else {
             return Ok(());
         };
-        let annotation = db::task_condition::channels::ErrorAnnotation::new(
-            db::task_condition::channels::AnnotationShape::Blocking(
-                db::task_condition::channels::BlockingAnnotation {
-                    kind: api_types::FailureKind::ExecutorFailed,
-                    hook: None,
-                    blocking_reason: "executor_failed".to_owned(),
-                    blocked_by: Some(
-                        api_types::Actor::system(api_types::SystemComponent::Executor).display(),
-                    ),
-                    blocked_at: Some(now_rfc3339()),
-                    blocked_execution_id: Some(execution.id.clone()),
-                    artifact: Some(db::task_condition::channels::AnnotationArtifact {
-                        kind: "execution".to_owned(),
-                        id: Some(execution.id.clone()),
-                        log_path: execution.logs_path.clone(),
-                    }),
-                    message: Some(
-                        execution
-                            .error
-                            .clone()
-                            .unwrap_or_else(|| "Execution failed".to_owned()),
-                    ),
-                },
-            ),
-        );
+        let annotation = channels::ErrorAnnotation::new(channels::AnnotationShape::Blocking(
+            channels::BlockingAnnotation {
+                kind: api_types::FailureKind::ExecutorFailed,
+                hook: None,
+                blocking_reason: "executor_failed".to_owned(),
+                blocked_by: Some(
+                    api_types::Actor::system(api_types::SystemComponent::Executor).display(),
+                ),
+                blocked_at: Some(now_rfc3339()),
+                blocked_execution_id: Some(execution.id.clone()),
+                artifact: Some(channels::AnnotationArtifact {
+                    kind: "execution".to_owned(),
+                    id: Some(execution.id.clone()),
+                    log_path: execution.logs_path.clone(),
+                }),
+                message: Some(
+                    execution
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "Execution failed".to_owned()),
+                ),
+            },
+        ));
         let annotation = serde_json::to_string(&annotation).map_err(|error| {
             ServiceError::invalid_operation(format!(
                 "failed to serialize executor-failure annotation: {error}"
@@ -324,7 +329,7 @@ impl TaskService {
             .error
             .clone()
             .unwrap_or_else(|| "executor failed".to_owned());
-        let blocked_meta = db::task_condition::channels::Interruption {
+        let blocked_meta = channels::Interruption {
             created_at: Some(Some(now_rfc3339())),
             execution_id: Some(Some(execution.id.clone())),
             kind: Some(Some(api_types::FailureKind::InternalCommandFailed.into())),
@@ -495,14 +500,14 @@ impl TaskService {
                     limit: i64::from(budget),
                     step: format!("failure:{}", execution.id),
                 }),
-                db::TaskMetadataMutation::Set {
-                    key: "last_execution_failure_at".to_owned(),
-                    value: Value::String(now.clone()),
-                },
-                db::TaskMetadataMutation::Set {
-                    key: "last_execution_failure_execution_id".to_owned(),
-                    value: Value::String(execution.id.clone()),
-                },
+                set_condition(channels::ConditionMetadataValue::LastExecutionFailureAt(
+                    now.clone(),
+                )),
+                set_condition(
+                    channels::ConditionMetadataValue::LastExecutionFailureExecutionId(
+                        execution.id.clone(),
+                    ),
+                ),
             ],
         )
         .await?

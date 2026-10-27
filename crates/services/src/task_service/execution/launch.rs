@@ -1,4 +1,5 @@
 use super::*;
+use db::task_condition::channels;
 
 impl TaskService {
     /// Fresh dispatcher retry uses the same role prompt and review-bound
@@ -1390,20 +1391,22 @@ impl TaskService {
             }
             return Ok(current);
         }
-        let annotation = api_types::TaskBlockingAnnotation {
-            annotation_type: api_types::FailureKind::ManualStop,
-            blocking_reason: blocking_reason.to_owned(),
-            blocked_by: Some(actor.display()),
-            blocked_at: Some(now.clone()),
-            blocked_execution_id: Some(execution.id.clone()),
-            artifact: Some(api_types::BlockingArtifact {
-                kind: "execution".to_owned(),
-                id: Some(execution.id.clone()),
-                log_path: None,
-            }),
-            message: Some(annotation_message.to_owned()),
-            hook: None,
-        };
+        let annotation = channels::ErrorAnnotation::new(channels::AnnotationShape::Blocking(
+            channels::BlockingAnnotation {
+                kind: api_types::FailureKind::ManualStop,
+                blocking_reason: blocking_reason.to_owned(),
+                blocked_by: Some(actor.display()),
+                blocked_at: Some(now.clone()),
+                blocked_execution_id: Some(execution.id.clone()),
+                artifact: Some(channels::AnnotationArtifact {
+                    kind: "execution".to_owned(),
+                    id: Some(execution.id.clone()),
+                    log_path: None,
+                }),
+                message: Some(annotation_message.to_owned()),
+                hook: None,
+            },
+        ));
         let annotation = serde_json::to_string(&annotation).map_err(|error| {
             ServiceError::invalid_operation(format!(
                 "failed to serialize manual-stop annotation: {error}"
@@ -1684,3 +1687,6 @@ fn first_launch_target(workflow: &api_types::WorkflowDefinition, from: &str) -> 
         })
         .map(|(target, _)| target.clone())
 }
+
+#[cfg(test)]
+mod writer_parity_tests;

@@ -412,3 +412,19 @@ async fn typed_reset_matches_archived_main_for_every_shape_and_second_write() {
     }
     assert_writer_cases("reset", visited);
 }
+
+use crate::worker_runtime::queue::writer_parity::case;
+
+#[tokio::test]
+async fn owner_recovery() {
+    case!("owner-recovery", "in_progress", f, {
+        let execution = f.execution(db::ExecutionStatus::Failed).await;
+        super::annotate_owner_recovery(
+            &f.db,
+            &execution,
+            &db::PlacementFailureCause::OwnerLostExecution,
+        )
+        .await
+        .unwrap();
+    });
+}

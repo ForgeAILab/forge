@@ -1,6 +1,7 @@
 //! Recovery annotation clearing and Task failure transitions.
 
 use super::*;
+use db::task_condition::channels;
 
 impl TaskService {
     pub(super) fn parse_blocking_annotation(
@@ -125,12 +126,14 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
-        let failed_meta = json!({
-            "reason": reason,
-            "created_at": now_rfc3339(),
-            "kind": kind,
-            "execution_id": execution_id,
-        });
+        let failed_meta = serde_json::to_string(&channels::Interruption {
+            reason: Some(reason.clone()),
+            created_at: Some(Some(now_rfc3339())),
+            kind: Some(kind.map(Into::into)),
+            execution_id: Some(execution_id.clone()),
+            ..Default::default()
+        })
+        .expect("condition channel serializes");
         let updated = TaskRepo::update(
             &*self.db,
             UpdateTask {
@@ -143,7 +146,7 @@ impl TaskService {
                 plan: None,
                 error_annotation: Some(None),
                 blocked_json: Some(None),
-                failed_json: Some(Some(failed_meta.to_string())),
+                failed_json: Some(Some(failed_meta)),
                 task_state_config: None,
                 parent_task_id: None,
                 updated_at: now_rfc3339(),
@@ -172,3 +175,6 @@ impl TaskService {
         Ok(updated)
     }
 }
+
+#[cfg(test)]
+mod writer_parity_tests;

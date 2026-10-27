@@ -1,4 +1,5 @@
 use super::*;
+use db::task_condition::channels;
 
 impl TaskService {
     pub(super) async fn run_blocking_before_work_preflight(
@@ -84,33 +85,45 @@ impl TaskService {
         let command = failure.command.clone().unwrap_or_default();
         let stderr_summary = truncate_annotation_output(&failure.stderr);
         let stdout_summary = truncate_annotation_output(&failure.stdout);
-        let annotation = json!({
-            "type": annotation_type,
-            "blocking_reason": annotation_type,
-            "blocked_by": api_types::Actor::system(api_types::SystemComponent::LifecycleHook).display(),
-            "blocked_at": now_rfc3339(),
-            "blocked_execution_id": null,
-            "message": failure.error.clone().unwrap_or_else(|| "blocking before_work hook failed".to_owned()),
-            "hook": {
-                "event": "before_work",
-                "index": failure.index,
-                "type": "script",
-                "command": command,
-                "exit_code": failure.exit_code,
-                "timeout": failure.timed_out,
-                "duration_ms": failure.duration_ms,
-                "working_dir": failure.working_dir,
-                "stdout": stdout_summary,
-                "stderr": stderr_summary,
-                "log_path": failure.log_path,
-                "environment": failure.environment_preview,
-            },
-            "artifact": {
-                "kind": "hook",
-                "id": format!("before_work:{}", failure.index),
-                "log_path": failure.log_path,
-            },
-        });
+        let annotation = serde_json::to_string(&channels::ErrorAnnotation::sorted(
+            channels::AnnotationShape::Blocking(channels::BlockingAnnotation {
+                kind: annotation_type,
+                blocking_reason: annotation_type.to_string(),
+                blocked_by: Some(
+                    api_types::Actor::system(api_types::SystemComponent::LifecycleHook).display(),
+                ),
+                blocked_at: Some(now_rfc3339()),
+                blocked_execution_id: None,
+                message: Some(
+                    failure
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "blocking before_work hook failed".to_owned()),
+                ),
+                hook: Some(channels::AnnotationHook::Script(Box::new(
+                    channels::ScriptHook {
+                        event: channels::ScriptHookEvent::BeforeWork,
+                        index: failure.index,
+                        hook_type: channels::ScriptHookType::Script,
+                        command,
+                        exit_code: failure.exit_code,
+                        timeout: failure.timed_out,
+                        duration_ms: failure.duration_ms,
+                        working_dir: failure.working_dir.clone(),
+                        stdout: stdout_summary,
+                        stderr: stderr_summary,
+                        log_path: failure.log_path.clone(),
+                        environment: failure.environment_preview.clone(),
+                    },
+                ))),
+                artifact: Some(channels::AnnotationArtifact {
+                    kind: "hook".into(),
+                    id: Some(format!("before_work:{}", failure.index)),
+                    log_path: failure.log_path.clone(),
+                }),
+            }),
+        ))
+        .expect("condition channel serializes");
 
         TaskRepo::update(
             &*self.db,
@@ -122,7 +135,7 @@ impl TaskService {
                 priority: None,
                 merge_config: None,
                 plan: None,
-                error_annotation: Some(Some(annotation.to_string())),
+                error_annotation: Some(Some(annotation)),
                 blocked_json: None,
                 failed_json: None,
                 task_state_config: None,
@@ -146,3 +159,6 @@ fn truncate_annotation_output(output: &str) -> String {
     }
     output[..end].to_owned()
 }
+
+#[cfg(test)]
+mod writer_parity_tests;

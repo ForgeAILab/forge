@@ -1,6 +1,7 @@
 //! Workflow transition validation, persistence, and hook dispatch.
 
 use super::*;
+use db::task_condition::channels;
 
 impl WorkflowExecution<'_> {
     #[allow(clippy::too_many_arguments)]
@@ -439,7 +440,18 @@ impl WorkflowExecution<'_> {
                 && !entry_retry
                 && bridge.review_rerun_requester().is_none();
             let should_defer_dispatch=(defer_dispatch_until.is_some() || action_dispatch) && (to_state.kind!=StateKind::Active || action_dispatch) && dispatch_index.is_some();
-            let deferred_marker=should_defer_dispatch.then(||serde_json::json!({"target_state":target_state,"not_before":defer_dispatch_until.clone().unwrap_or_else(now_rfc3339),"reason":if crate::TaskService::task_action_command_active(){"task action dispatch"}else{"board drag dispatch cooldown"}}).to_string());
+            let deferred_marker = should_defer_dispatch.then(|| {
+                serde_json::to_string(&channels::DeferredDispatch {
+                    target_state: target_state.clone(),
+                    not_before: defer_dispatch_until.clone().unwrap_or_else(now_rfc3339),
+                    reason: if crate::TaskService::task_action_command_active() {
+                        "task action dispatch"
+                    } else {
+                        "board drag dispatch cooldown"
+                    }.into(),
+                    kind: None,
+                }).expect("condition channel serializes")
+            });
             // Optional, unassigned planning is an imminent fast role entry:
             // reserve its coder slot while the hook step discovers the skip.
             if admission_agent_id.is_none() && role_unassigned && dispatch_index.is_some() && from_state.hooks.on_exit.is_empty()
@@ -754,3 +766,6 @@ impl WorkflowExecution<'_> {
         .instrument(span))
     }
 }
+
+#[cfg(test)]
+mod writer_parity_tests;
