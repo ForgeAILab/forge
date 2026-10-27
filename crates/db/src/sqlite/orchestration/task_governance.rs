@@ -1,96 +1,25 @@
 use super::*;
-/// Recheck every mutable source-action and executor authorization fact while
-/// the proposal transaction owns SQLite's writer lock.  Service preflight is
-/// useful for a friendly error, but it cannot close a race with action,
-/// binding, or Project membership changes between the read and the write.
+/// Recheck mutable source-actor and executor authorization while the proposal
+/// transaction owns SQLite's writer lock, closing races with binding or
+/// Project membership changes after service preflight.
 async fn recheck_task_proposal_authorization_in_tx(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     input: &CreateTaskProposalCommand,
     receipt: &CreateCommandReceipt,
 ) -> Result<()> {
-    let (actor_identity_id, scope_type, scope_id, operation, requested_permission, policy_result) =
-        if let Some(source_action_id) = input.source_action_id.as_deref() {
-            let action = sqlx::query(
-                "SELECT actor_identity_id, scope_type, scope_id, operation,
-                        requested_permission, policy_result, status, version,
-                        target_type, target_id, payload_hash
-                 FROM agent_action WHERE id = ? LIMIT 1",
-            )
-            .bind(source_action_id)
-            .fetch_optional(&mut **transaction)
-            .await?
-            .ok_or(DbError::NotFound)?;
-            let actor_identity_id: String = action.try_get("actor_identity_id")?;
-            let scope_type: String = action.try_get("scope_type")?;
-            let scope_id: String = action.try_get("scope_id")?;
-            let operation: String = action.try_get("operation")?;
-            let requested_permission: String = action.try_get("requested_permission")?;
-            let policy_result: String = action.try_get("policy_result")?;
-            let status: String = action.try_get("status")?;
-            let version: i64 = action.try_get("version")?;
-            let target_type: Option<String> = action.try_get("target_type")?;
-            let target_id: Option<String> = action.try_get("target_id")?;
-            let payload_hash: String = action.try_get("payload_hash")?;
-            if input.expected_action_version != Some(version) {
-                return Err(DbError::VersionConflict);
-            }
-            if actor_identity_id != input.source_actor_identity_id
-                || scope_type != input.source_scope_type
-                || scope_id != input.source_scope_id
-                || operation != input.source_operation
-                || requested_permission != input.source_requested_permission
-                || policy_result != input.source_policy_result
-                || target_type != input.source_target_type
-                || target_id != input.source_target_id
-                || payload_hash != input.source_payload_hash
-                || !matches!(status.as_str(), "proposed" | "approved")
-                || policy_result == "denied"
-                || (policy_result == "approval_required" && status != "approved")
-            {
-                return Err(DbError::IdempotencyConflict);
-            }
-            (
-                actor_identity_id,
-                scope_type,
-                scope_id,
-                operation,
-                requested_permission,
-                policy_result,
-            )
-        } else {
-            if input.expected_action_version.is_some() || input.action_execution.is_some() {
-                return Err(DbError::IdempotencyConflict);
-            }
-            if input.source_operation != "task.propose"
-                || input.source_requested_permission != "propose_task"
-                || input.source_policy_result != "allowed"
-                || input.source_target_type.as_deref() != Some("project")
-                || input.source_target_id.as_deref() != Some(input.task.project_id.as_str())
-                || receipt.policy_result != input.source_policy_result
-            {
-                return Err(DbError::IdempotencyConflict);
-            }
-            (
-                input.source_actor_identity_id.clone(),
-                input.source_scope_type.clone(),
-                input.source_scope_id.clone(),
-                input.source_operation.clone(),
-                input.source_requested_permission.clone(),
-                input.source_policy_result.clone(),
-            )
-        };
-
-    if operation != "task.propose"
-        || requested_permission != "propose_task"
-        || policy_result != input.source_policy_result
-        || receipt.policy_result != policy_result
+    if input.source_operation != "task.propose"
+        || input.source_requested_permission != "propose_task"
+        || input.source_policy_result != "allowed"
+        || input.source_target_type.as_deref() != Some("project")
+        || input.source_target_id.as_deref() != Some(input.task.project_id.as_str())
+        || receipt.policy_result != input.source_policy_result
     {
         return Err(DbError::IdempotencyConflict);
     }
     if !action_scope_resolves_to_command_scope(
         transaction,
-        &scope_type,
-        &scope_id,
+        &input.source_scope_type,
+        &input.source_scope_id,
         "project",
         &input.task.project_id,
     )
@@ -108,7 +37,7 @@ async fn recheck_task_proposal_authorization_in_tx(
                 selected_profile_id
          FROM agent_identity WHERE id = ? LIMIT 1",
     )
-    .bind(&actor_identity_id)
+    .bind(&input.source_actor_identity_id)
     .fetch_optional(&mut **transaction)
     .await?
     .ok_or(DbError::NotFound)?;
@@ -130,7 +59,7 @@ async fn recheck_task_proposal_authorization_in_tx(
          WHERE id = ? AND identity_id = ? LIMIT 1",
     )
     .bind(selected_profile_id)
-    .bind(&actor_identity_id)
+    .bind(&input.source_actor_identity_id)
     .fetch_optional(&mut **transaction)
     .await?;
     if !profile_policy
@@ -147,7 +76,7 @@ async fn recheck_task_proposal_authorization_in_tx(
          LIMIT 1",
     )
     .bind(&input.task.project_id)
-    .bind(&actor_identity_id)
+    .bind(&input.source_actor_identity_id)
     .fetch_optional(&mut **transaction)
     .await?;
     let Some(binding) = binding else {
@@ -174,7 +103,7 @@ async fn recheck_task_proposal_authorization_in_tx(
 
     match input.executor_type.as_str() {
         "agent" => {
-            if input.executor_id != actor_identity_id {
+            if input.executor_id != input.source_actor_identity_id {
                 return Err(DbError::IdempotencyConflict);
             }
             let identity_exists: Option<i64> =
@@ -212,15 +141,6 @@ async fn recheck_task_proposal_authorization_in_tx(
         }
     }
 
-    if let Some(execution) = input.action_execution.as_ref() {
-        if Some(execution.action_id.as_str()) != input.source_action_id.as_deref()
-            || Some(execution.expected_action_version) != input.expected_action_version
-            || execution.executed_by_type != input.executor_type
-            || execution.executed_by_id != input.executor_id
-        {
-            return Err(DbError::IdempotencyConflict);
-        }
-    }
     Ok(())
 }
 
@@ -473,27 +393,18 @@ pub(super) async fn create_task_proposal_command(
     let mut input = input;
 
     // Receipt lookup is deliberately the first operation.  A response
-    // loss must replay the frozen Task even if the binding, baseline, or
-    // action has since moved on; changed input/principal/version is
-    // rejected by the canonical receipt identity before any current
-    // authorization read can produce a different answer.
+    // loss must replay the frozen Task even if the binding or baseline has
+    // since moved on; changed input/principal is rejected by the canonical
+    // receipt identity before any current authorization read can produce a
+    // different answer.
     if let Some(receipt) =
-        resolve_command_replay(db, &mut transaction, input.command_receipt.as_ref()).await?
+        resolve_command_replay(db, &mut transaction, Some(&input.command_receipt)).await?
     {
         let task_id = command_outcome_string(&receipt, "task_id")?;
         let task_snapshot = command_outcome_task(&receipt)?;
         if task_snapshot.id != task_id || task_snapshot.project_id != receipt.scope_id {
             return Err(DbError::IdempotencyConflict);
         }
-        // The receipt's persisted execution bundle is authoritative on
-        // replay.  A concurrent retry has a newly minted candidate
-        // execution id and (because the Task id is server-assigned) a
-        // candidate outcome containing a different Task id; comparing
-        // those transport candidates would turn an exact replay into a
-        // false idempotency conflict.  The validator still proves that
-        // the committed execution/action outcome exists and matches the
-        // frozen receipt.
-        validate_replay_action_bundle(&mut transaction, &receipt, None).await?;
         let persisted: Option<Task> = sqlx::query(&format!(
             "SELECT {TASK_COLUMNS} FROM task WHERE id = ? AND project_id = ?"
         ))
@@ -513,10 +424,7 @@ pub(super) async fn create_task_proposal_command(
         });
     }
 
-    let receipt = input
-        .command_receipt
-        .as_ref()
-        .ok_or_else(|| DbError::Check("task proposal requires a command receipt".to_owned()))?;
+    let receipt = &input.command_receipt;
     if receipt.operation != "task.propose"
         || receipt.scope_type != "project"
         || receipt.scope_id != input.task.project_id
@@ -538,7 +446,7 @@ pub(super) async fn create_task_proposal_command(
     }
 
     // The receipt lookup above is the replay boundary.  For a new
-    // command, recheck source action admission, target/scope, active
+    // command, recheck direct policy admission, target/scope, active
     // binding permission, and executor ownership/member identity under
     // the same BEGIN IMMEDIATE transaction before any Task write.
     recheck_task_proposal_authorization_in_tx(&mut transaction, &input, receipt).await?;
@@ -780,24 +688,17 @@ pub(super) async fn create_task_proposal_command(
     DomainEventRepo::append_event_in_tx(db, &mut transaction, &event).await?;
 
     let mut receipt = input.command_receipt;
-    let mut action_execution = input.action_execution;
-    if let Some(receipt) = receipt.as_mut() {
-        let mut outcome: serde_json::Value = serde_json::from_str(&receipt.outcome_json)
-            .map_err(|_| DbError::IdempotencyConflict)?;
-        outcome["task_id"] = serde_json::Value::String(frozen_task.id.clone());
-        outcome["task"] = serde_json::to_value(&frozen_task).map_err(|error| {
-            DbError::Check(format!(
-                "Task proposal outcome serialization failed: {error}"
-            ))
-        })?;
-        receipt.outcome_json =
-            serde_json::to_string(&outcome).map_err(|_| DbError::IdempotencyConflict)?;
-        if let Some(action_execution) = action_execution.as_mut() {
-            action_execution.result_json = Some(receipt.outcome_json.clone());
-            action_execution.action_outcome_json = Some(receipt.outcome_json.clone());
-        }
-    }
-    finalize_command_in_tx(db, &mut transaction, &event.id, receipt, action_execution).await?;
+    let mut outcome: serde_json::Value =
+        serde_json::from_str(&receipt.outcome_json).map_err(|_| DbError::IdempotencyConflict)?;
+    outcome["task_id"] = serde_json::Value::String(frozen_task.id.clone());
+    outcome["task"] = serde_json::to_value(&frozen_task).map_err(|error| {
+        DbError::Check(format!(
+            "Task proposal outcome serialization failed: {error}"
+        ))
+    })?;
+    receipt.outcome_json =
+        serde_json::to_string(&outcome).map_err(|_| DbError::IdempotencyConflict)?;
+    finalize_command_in_tx(db, &mut transaction, &event.id, Some(receipt), None).await?;
     transaction.commit().await?;
     Ok(CreatedTaskProposal {
         task: frozen_task,

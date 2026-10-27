@@ -29,14 +29,13 @@ use sqlx::Row;
 use crate::{
     test_support::arm_after_domain_commit, AgentActionService, AgentChatService,
     ApproveActionInput, ExecuteMainOrchestrationActionInput,
-    ExecuteProjectOrchestrationActionInput, ExecuteTaskProposalInput,
-    MainGenesisCharterDraftRequest, MainGenesisCommandService, MainGenesisDraftCommandInput,
-    MainGenesisDraftPrincipal, MainGenesisProjectAgentSelectCommandInput,
-    MainGenesisProjectAgentSelectRequest, MainGenesisStartCommandInput, MainGenesisStartPrincipal,
-    MainGenesisStartRequest, MainOrchestrationActionService, ProjectArtifactCommandService,
-    ProjectCommandAuthorization, ProjectDocumentCreateCommand, ProjectOrchestrationActionService,
-    ProposeActionInput, SendAgentChatMessageInput, ServiceError, TaskService,
-    MAIN_BASELINE_OPERATING_SKILL_REVISION,
+    ExecuteProjectOrchestrationActionInput, MainGenesisCharterDraftRequest,
+    MainGenesisCommandService, MainGenesisDraftCommandInput, MainGenesisDraftPrincipal,
+    MainGenesisProjectAgentSelectCommandInput, MainGenesisProjectAgentSelectRequest,
+    MainGenesisStartCommandInput, MainGenesisStartPrincipal, MainGenesisStartRequest,
+    MainOrchestrationActionService, ProjectArtifactCommandService, ProjectCommandAuthorization,
+    ProjectDocumentCreateCommand, ProjectOrchestrationActionService, ProposeActionInput,
+    SendAgentChatMessageInput, ServiceError, TaskService, MAIN_BASELINE_OPERATING_SKILL_REVISION,
 };
 
 #[tokio::test]
@@ -1520,30 +1519,34 @@ async fn task_proposal_failure_rolls_back_and_retry_replays_exact_receipt() {
     let fixture = project_fixture().await;
     let payload = json!({
         "title": "Characterize task receipt seam",
-        "description": "The Task commits before the action receipt.",
+        "description": "The Task and direct command receipt commit atomically.",
         "task_type": "planning_task",
         "review_requirement_ids": []
     });
-    let action = create_action(
-        &fixture.db,
-        ActionInput {
-            id: "characterization-task-action",
-            actor_identity_id: &fixture.agent_id,
-            scope_type: "project",
-            scope_id: &fixture.project_id,
-            operation: "task.propose",
-            payload: &payload,
-            target_type: "project",
-            target_id: &fixture.project_id,
-        },
-    )
-    .await;
-    let action_service = AgentActionService::new(Arc::clone(&fixture.db));
+    let input = services::DirectTaskProposalInput {
+        actor_identity_id: fixture.agent_id.clone(),
+        executor_type: "agent".to_owned(),
+        executor_id: fixture.agent_id.clone(),
+        source_scope_type: "project".to_owned(),
+        source_scope_id: fixture.project_id.clone(),
+        project_id: fixture.project_id.clone(),
+        payload: serde_json::from_value(payload).expect("Task proposal payload"),
+        idempotency_key: "characterization-task-replay".to_owned(),
+        correlation_id: "characterization-task-correlation".to_owned(),
+        causation_id: None,
+        causation_depth: 0,
+        policy_result: "allowed".to_owned(),
+        preflight_policy_result: None,
+        preflight_policy_reason: None,
+        policy_revision: None,
+        policy_digest: None,
+        requested_permission: "propose_task".to_owned(),
+    };
     let task_service =
         TaskService::new_for_test(Arc::clone(&fixture.db), Arc::new(EventBus::new(16)));
 
     // Fail at the old seam where the Task used to be committed before the
-    // action/command receipt.  The atomic TaskService command must roll back
+    // command receipt.  The atomic TaskService command must roll back
     // every authoritative row instead of stranding a Task that a retry could
     // duplicate.
     sqlx::query(
@@ -1555,17 +1558,8 @@ async fn task_proposal_failure_rolls_back_and_retry_replays_exact_receipt() {
     .execute(fixture.db.pool())
     .await
     .expect("task proposal receipt failpoint");
-    let stopped = action_service
-        .execute_task_proposal(
-            &task_service,
-            ExecuteTaskProposalInput {
-                action_id: action.id.clone(),
-                expected_version: action.version,
-                executed_by_type: "agent".to_owned(),
-                executed_by_id: fixture.agent_id.clone(),
-                idempotency_key: "characterization-task-replay".to_owned(),
-            },
-        )
+    let stopped = task_service
+        .execute_task_proposal_direct(input.clone())
         .await
         .expect_err("failpoint stops before receipt");
     assert!(
@@ -1585,7 +1579,7 @@ async fn task_proposal_failure_rolls_back_and_retry_replays_exact_receipt() {
         )
         .await,
         0,
-        "action execution rolls back with the Task"
+        "direct proposals never create action executions"
     );
     assert_eq!(
         count(
@@ -1613,38 +1607,32 @@ async fn task_proposal_failure_rolls_back_and_retry_replays_exact_receipt() {
         .await
         .expect("remove task proposal receipt failpoint");
 
-    let first = action_service
-        .execute_task_proposal(
-            &task_service,
-            ExecuteTaskProposalInput {
-                action_id: action.id.clone(),
-                expected_version: 1,
-                executed_by_type: "agent".to_owned(),
-                executed_by_id: fixture.agent_id.clone(),
-                idempotency_key: "characterization-task-replay".to_owned(),
-            },
-        )
+    let first = task_service
+        .execute_task_proposal_direct(input.clone())
         .await
         .expect("retry is admitted after rollback");
-    let replay = action_service
-        .execute_task_proposal(
-            &task_service,
-            ExecuteTaskProposalInput {
-                action_id: action.id,
-                expected_version: 1,
-                executed_by_type: "agent".to_owned(),
-                executed_by_id: fixture.agent_id,
-                idempotency_key: "characterization-task-replay".to_owned(),
-            },
-        )
+    sqlx::query("UPDATE task SET title = 'Changed after commit' WHERE id = ?")
+        .bind(&first.task.id)
+        .execute(fixture.db.pool())
+        .await
+        .expect("mutate live Task before replay");
+    let replay = task_service
+        .execute_task_proposal_direct(input.clone())
         .await
         .expect("response-loss retry replays the frozen Task");
     assert_eq!(first.task.id, replay.task.id);
-    assert_eq!(first.execution.id, replay.execution.id);
+    assert_eq!(first.task, replay.task);
+    assert_eq!(first.receipt, replay.receipt);
+    assert!(replay.replayed);
+    assert!(first.receipt.agent_action_execution_id.is_none());
     assert_eq!(
         count(&fixture.db, "SELECT COUNT(*) FROM task", None).await,
         1,
         "the response-loss retry does not create a duplicate Task"
+    );
+    assert_eq!(
+        count(&fixture.db, "SELECT COUNT(*) FROM agent_action", None).await,
+        0
     );
     assert_eq!(
         count(
@@ -1653,7 +1641,7 @@ async fn task_proposal_failure_rolls_back_and_retry_replays_exact_receipt() {
             None
         )
         .await,
-        1
+        0
     );
     assert_eq!(
         count(
