@@ -134,15 +134,27 @@ async fn replay_milestone_check_result(
         return Err(idempotency_conflict());
     }
 
+    let result_id = existing.id().map_err(ApiError::project_artifact_mutation)?;
     let event = DomainEventRepo::get_event_by_dedupe(
         &*state.db,
-        &format!(
-            "milestone.check.recorded:{project_id}:{}",
-            request.mutation.idempotency_key
-        ),
+        &format!("milestone.check.recorded:{storage_idempotency_key}"),
     )
     .await
     .map_err(ApiError::project_artifact_mutation)?;
+    let event = if event.is_some() {
+        event
+    } else {
+        DomainEventRepo::get_event_by_dedupe(
+            &*state.db,
+            &format!(
+                "milestone.check.recorded:{project_id}:{}",
+                request.mutation.idempotency_key
+            ),
+        )
+        .await
+        .map_err(ApiError::project_artifact_mutation)?
+        .filter(|event| event.entity_id == result_id)
+    };
     let details: Option<ManualResultReplayDetails> = event
         .map(|event| serde_json::from_str(&event.payload_json))
         .transpose()
@@ -155,7 +167,6 @@ async fn replay_milestone_check_result(
     }) {
         return Err(idempotency_conflict());
     }
-    let result_id = existing.id().map_err(ApiError::project_artifact_mutation)?;
     if details.as_ref().is_some_and(|details| {
         details.project_id != project_id
             || details.milestone_id != milestone_id
@@ -387,8 +398,7 @@ pub async fn record_milestone_check(
             causation_id: Some(request.mutation.authorization.event_id.clone()),
             causation_depth: 0,
             dedupe_key: Some(format!(
-                "milestone.check.recorded:{project_id}:{}",
-                request.mutation.idempotency_key
+                "milestone.check.recorded:{storage_idempotency_key}"
             )),
             payload_json: serde_json::json!({
                 "project_id": project_id,
@@ -460,7 +470,21 @@ async fn replay_milestone_check_waiver(
     request: &WaiveMilestoneCheckRequest,
     waiver_dedupe: &str,
 ) -> ApiResult<Option<serde_json::Value>> {
-    let Some(event) = DomainEventRepo::get_event_by_dedupe(&*state.db, waiver_dedupe).await? else {
+    let event = DomainEventRepo::get_event_by_dedupe(&*state.db, waiver_dedupe).await?;
+    let event = if event.is_some() {
+        event
+    } else {
+        DomainEventRepo::get_event_by_dedupe(
+            &*state.db,
+            &format!(
+                "milestone.check.waived:{project_id}:{}",
+                request.mutation.idempotency_key
+            ),
+        )
+        .await?
+        .filter(|event| event.actor_type == "user" && event.actor_id.as_deref() == Some(user_id))
+    };
+    let Some(event) = event else {
         return Ok(None);
     };
     let mut payload: serde_json::Value = serde_json::from_str(&event.payload_json)
@@ -643,10 +667,13 @@ pub async fn waive_milestone_check(
     )
     .await?;
     require_idempotency_key(&request.mutation.idempotency_key)?;
-    let waiver_dedupe = format!(
-        "milestone.check.waived:{project_id}:{}",
-        request.mutation.idempotency_key
+    let storage_idempotency_key = scoped_idempotency_key(
+        "milestone-waiver",
+        &project_id,
+        &user.user_id,
+        &request.mutation.idempotency_key,
     );
+    let waiver_dedupe = format!("milestone.check.waived:{storage_idempotency_key}");
     // Resolve the immutable waiver receipt before current Project access,
     // authority, check, or governance validation. Replays must return the
     // persisted decision (or conflict) even after mutable state and
@@ -772,10 +799,7 @@ pub async fn waive_milestone_check(
             correlation_id: request.mutation.authorization.event_id.clone(),
             causation_id: Some(request.mutation.authorization.event_id.clone()),
             causation_depth: 0,
-            dedupe_key: Some(format!(
-                "milestone.check.waived:{project_id}:{}",
-                request.mutation.idempotency_key
-            )),
+            dedupe_key: Some(waiver_dedupe),
             payload_json: serde_json::json!({
                 "waiver_id": waiver_id,
                 "project_id": project_id,

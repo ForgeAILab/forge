@@ -12,6 +12,116 @@ async fn raw(db: &SqliteDb, id: &str) -> String {
 }
 
 #[tokio::test]
+async fn stale_digest_over_identical_body_is_only_stamped_in_both_steady_checks() {
+    let db = db().await;
+    task(&db, "digest-only").await;
+    db.set_setting(
+        MAPPING_REVISION_KEY,
+        &MAPPING_REVISION.to_string(),
+        &crate::now_rfc3339(),
+    )
+    .await
+    .unwrap();
+    assert!(!db.backfill_task_conditions_if_stale().await.unwrap());
+    let before = TaskRepo::get_by_id(&db, "digest-only", false)
+        .await
+        .unwrap()
+        .unwrap();
+    let body = raw(&db, "digest-only").await;
+    let digest = ConditionInput::from(&before).channel_digest();
+    for paged in [false, true] {
+        sqlx::query(
+            "UPDATE task SET condition_digest='wrong-non-null-digest' WHERE id='digest-only'",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        if paged {
+            db.check_task_conditions(CONDITION_CHECK_PAGE)
+                .await
+                .unwrap();
+        } else {
+            assert_eq!(
+                db.check_task_conditions_of(&["digest-only".into()])
+                    .await
+                    .unwrap(),
+                1
+            );
+            db.complete_condition_pass(0);
+        }
+        let pass = db.condition_check_status().last_pass.unwrap();
+        assert_eq!((pass.checked, pass.repaired, pass.stamped), (1, 0, 1));
+        let after = TaskRepo::get_by_id(&db, "digest-only", false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (after.version, after.updated_at),
+            (before.version, before.updated_at.clone())
+        );
+        let stored: (Vec<u8>, String) = sqlx::query_as(
+            "SELECT CAST(condition_json AS BLOB),condition_digest FROM task WHERE id='digest-only'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(stored, (body.as_bytes().to_vec(), digest.clone()));
+    }
+}
+
+#[tokio::test]
+async fn stale_digest_with_a_different_body_is_rewritten_even_when_typed_equal() {
+    let db = db().await;
+    task(&db, "different-body").await;
+    db.set_setting(
+        MAPPING_REVISION_KEY,
+        &MAPPING_REVISION.to_string(),
+        &crate::now_rfc3339(),
+    )
+    .await
+    .unwrap();
+    assert!(!db.backfill_task_conditions_if_stale().await.unwrap());
+    let canonical = raw(&db, "different-body").await;
+    let pretty = serde_json::to_string_pretty(
+        &serde_json::from_str::<serde_json::Value>(&canonical).unwrap(),
+    )
+    .unwrap();
+    assert_ne!(pretty.as_bytes(), canonical.as_bytes());
+    for typed_equal in [true, false] {
+        sqlx::query("UPDATE task SET condition_json=?,condition_digest='wrong-non-null-digest',error_annotation=? WHERE id='different-body'")
+            .bind(&pretty)
+            .bind((!typed_equal).then_some(r#"{"type":"manual_stop","blocking_reason":"wait","blocked_by":"user"}"#))
+            .execute(db.pool()).await.unwrap();
+        let row = TaskRepo::get_by_id(&db, "different-body", false)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut c = db.pool().acquire().await.unwrap();
+        let expected = ConditionFacts::load(&mut c, "different-body")
+            .await
+            .unwrap()
+            .condition(&ConditionInput::from(&row));
+        drop(c);
+        let stored: TaskCondition = serde_json::from_str(&pretty).unwrap();
+        assert_eq!(stored.typed() == expected.typed(), typed_equal);
+        let pass = db
+            .check_task_conditions(CONDITION_CHECK_PAGE)
+            .await
+            .unwrap()
+            .last_pass
+            .unwrap();
+        assert_eq!((pass.checked, pass.repaired, pass.stamped), (1, 1, 0));
+        assert_eq!(raw(&db, "different-body").await, encode(&expected));
+        let digest: String =
+            sqlx::query_scalar("SELECT condition_digest FROM task WHERE id='different-body'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(digest, ConditionInput::from(&row).channel_digest());
+    }
+}
+
+#[tokio::test]
 async fn a_failed_corrupt_row_does_not_stop_the_cursor_or_revision_marker() {
     let db = db().await;
     for id in ["a-good", "b-bad", "c-good"] {

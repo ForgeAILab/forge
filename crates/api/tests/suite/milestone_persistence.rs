@@ -571,6 +571,152 @@ async fn legacy_manual_response_replays_stored_display_name_and_rejects_changed_
     );
 }
 
+async fn second_project_writer(harness: &common::Harness, project: &str) -> String {
+    let now = db::now_rfc3339();
+    db::UserRepo::create_user(
+        &*harness.state.db,
+        &db::User {
+            id: "second-writer".into(),
+            email: "second@milestone.test".into(),
+            password_hash: "unused".into(),
+            display_name: None,
+            is_admin: false,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    db::ProjectMemberRepo::add_member(
+        &*harness.state.db,
+        db::CreateProjectMember {
+            id: db::new_uuid_v4(),
+            project_id: project.into(),
+            user_id: "second-writer".into(),
+            role: "member".into(),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    jsonwebtoken::encode(
+        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+        &json!({"sub":"second-writer", "email":"second@milestone.test", "is_admin":false, "iat":now, "exp":now+900}),
+        &jsonwebtoken::EncodingKey::from_secret(b"test-jwt-secret-for-development"),
+    ).unwrap()
+}
+
+#[tokio::test]
+async fn manual_result_and_waiver_keys_are_user_scoped_with_exact_replays() {
+    for waive in [false, true] {
+        for legacy in [false, true] {
+            let (_root, harness, project) = fixture().await;
+            seed_milestone(&harness, &project, true).await;
+            let token = second_project_writer(&harness, &project).await;
+            let mut a = check_request(waive);
+            a["mutation"]["authorization"]["principal"]["display_name"] = json!("Reviewer A");
+            let suffix = if waive { "waive" } else { "result" };
+            let url =
+                format!("/api/v1/projects/{project}/milestones/milestone/checks/check/{suffix}");
+            let first: Value = if legacy {
+                seed_legacy_receipt(&harness, &project, waive, &a, &json!({})).await
+            } else {
+                common::json_request(&harness.app, Method::POST, &url, a.clone(), StatusCode::OK)
+                    .await
+            };
+            let mut b = a.clone();
+            b["mutation"]["authorization"]["principal"]["id"] = json!("second-writer");
+            b["mutation"]["authorization"]["principal"]["display_name"] = json!("Reviewer B");
+            if !waive {
+                b["mutation"]["expected_version"] = json!(2);
+            }
+            let second: Value = common::json_request_with_bearer(
+                &harness.app,
+                Method::POST,
+                &url,
+                &token,
+                b.clone(),
+                StatusCode::OK,
+            )
+            .await;
+            let id_field = if waive { "waiver_id" } else { "id" };
+            assert_ne!(first[id_field], second[id_field]);
+            assert_eq!(
+                first["authorization"]["principal"]["display_name"],
+                "Reviewer A"
+            );
+            assert_eq!(
+                second["authorization"]["principal"]["display_name"],
+                "Reviewer B"
+            );
+            let a_retry: Value =
+                common::json_request(&harness.app, Method::POST, &url, a, StatusCode::OK).await;
+            let b_retry: Value = common::json_request_with_bearer(
+                &harness.app,
+                Method::POST,
+                &url,
+                &token,
+                b,
+                StatusCode::OK,
+            )
+            .await;
+            assert_eq!(a_retry, first);
+            assert_eq!(b_retry, second);
+            let event_type = if waive {
+                "milestone.check.waived"
+            } else {
+                "milestone.check.recorded"
+            };
+            let events: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM domain_event WHERE event_type=?")
+                    .bind(event_type)
+                    .fetch_one(harness.state.db.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(events, 2);
+            if !waive {
+                let results: i64 =
+                    sqlx::query_scalar("SELECT COUNT(*) FROM project_milestone_check_result")
+                        .fetch_one(harness.state.db.pool())
+                        .await
+                        .unwrap();
+                assert_eq!(results, 2);
+                let keys: (String, String) = sqlx::query_as("SELECT e.dedupe_key,r.idempotency_key FROM domain_event e JOIN project_milestone_check_result r ON r.id=e.entity_id WHERE r.principal_id='second-writer'")
+                    .fetch_one(harness.state.db.pool()).await.unwrap();
+                assert_eq!(keys.0, format!("milestone.check.recorded:{}", keys.1));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn legacy_manual_event_for_another_result_is_ignored() {
+    let (_root, harness, project) = fixture().await;
+    seed_milestone(&harness, &project, true).await;
+    let mut request = check_request(false);
+    request["mutation"]["authorization"]["principal"]["display_name"] = json!("Original reviewer");
+    let first = seed_legacy_receipt(&harness, &project, false, &request, &json!({})).await;
+    sqlx::query("UPDATE domain_event SET entity_id='another-result',payload_json=json_set(payload_json,'$.result_id','another-result','$.authorization.principal.id','another-user') WHERE id='legacy-event'")
+        .execute(harness.state.db.pool()).await.unwrap();
+    let replay: Value = common::json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{project}/milestones/milestone/checks/check/result"),
+        request,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(replay["id"], first["id"]);
+    assert_eq!(replay["result"], first["result"]);
+    assert_eq!(replay["authorization"]["principal"]["id"], "test-user-id");
+    assert!(replay["authorization"]["principal"]["display_name"].is_null());
+}
+
 #[tokio::test]
 async fn legacy_missing_outcome_keeps_blocked_reconstruction() {
     let (_root, harness, project) = fixture().await;

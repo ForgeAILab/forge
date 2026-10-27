@@ -6104,8 +6104,12 @@ recorded revision is neither backfilled nor lowered. A NULL row receives a
 stamp-only repair only when its typed condition agrees and it is stated or all
 six bounded channel/metadata copies agree. The stamp writes only
 `condition_digest`, preserving the exact cache bytes, scheduler dirty generations
-and list revisions. Otherwise the walk rewrites the recomposed cache and digest
-together, refreshing stale public evidence even when its typed condition agrees.
+and list revisions. A stale non-NULL digest also receives a stamp-only refresh
+when the readable cache is byte-identical to the recomposed encoding; typed
+equality alone does not qualify. Neither kind of stamp contributes to a steady
+pass's repair count or repair warning. Otherwise the walk rewrites the recomposed
+cache and digest together, refreshing stale public evidence even when its typed
+condition agrees.
 Repairs do not change Task versions or times, create Attention or interruption
 events, or re-arm incidents. Real body repairs retain normal cache invalidation.
 The revision walk has its own progress record and page/completion log, including

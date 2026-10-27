@@ -154,6 +154,11 @@ Their test paths use `tests::<topic>::<test>` and
 `budget::tests::<test>` and `session::tests::<test>`. The DB shard still selects
 all targets, and the rest shard still covers Solo.
 
+The `task_condition::checkpoint_tests` steady-check cases distinguish digest-only
+stamps from body rewrites, including typed-equal but byte-different bodies.
+Operator-status condition-check tests also assert that digest-only refreshes
+produce neither a repair warning nor an operator Attention row.
+
 ### Test features and required-features
 
 `forge-agent-host`, `services` and `db` do not dev-depend on themselves.
