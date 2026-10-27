@@ -1217,15 +1217,15 @@ ceilings and workflow/assignment gates, and persists `allowed`,
 `approval_required`, or `denied`. Public action responses expose the policy
 result, reason, target, payload hash, and a derived `materialized` boolean; they
 do not expose the persisted payload body. `materialized` is `false` for a
-proposal and becomes `true` only after the typed Task/orchestration executor
+proposal and becomes `true` only after the typed orchestration executor
 has persisted an `executed` status, a server-derived target, and its typed
 outcome. Protected approvals require an independently authorized active
 identity in the same scope and reject self-approval. Executions are
 idempotent by action/idempotency key.
 
-`task.propose` is available through the typed Task proposal endpoint. An
-automatically admitted request invokes one atomic `TaskService` command: the
-Task, derived governance projection, prerequisite dependency links, durable
+`task.propose` is direct-only and is available through the typed Task proposal
+endpoint. An automatically admitted request invokes one atomic `TaskService`
+command: the Task, derived governance projection, prerequisite dependency links, durable
 `task.created` event, and direct command receipt become visible together. It
 does not create an `AgentAction` or `AgentActionExecution`; the receipt
 principal is the authenticated user while the selected Project Agent remains
@@ -6287,7 +6287,7 @@ generic `transient_failure`; its bounded `details` carries
 occupying opaque `execution_id`.
 
 `forge_create_task` is a separate direct Task-service API, not the
-`task.propose` action/receipt operation; its result therefore has no
+`task.propose` command/receipt operation; neither path creates an
 `AgentAction` execution id. It accepts the optional `type` field (`task`,
 `planning_task`, `sub_task`, or `discovery`) and passes it through to the
 authoritative Task service. It also accepts optional `parent_task_id` and

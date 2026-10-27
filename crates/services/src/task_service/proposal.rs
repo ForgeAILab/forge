@@ -1,23 +1,20 @@
 //! Atomic `task.propose` command boundary.
 //!
-//! Agent actions remain the approval/audit envelope when approval is required,
-//! while automatically allowed native proposals use the same Task command
-//! directly. The Task, immutable governance projection, durable event,
-//! command receipt, and optional action execution are one SQLite transaction.
+//! Task proposals execute directly. The Task, immutable governance projection,
+//! durable event, and command receipt are one SQLite transaction.
 //! The receipt is resolved before current binding/baseline authorization so a
 //! lost response can be replayed exactly after mutable Project state changes.
 
 use super::*;
 use crate::command_boundary::{
-    AgentActionProvenance, AuthorizationProvenance, CommandContext, CommandPrincipal, CommandScope,
-    CommandScopeType, ExpectedCommandState, NewCommandContext,
+    AuthorizationProvenance, CommandContext, CommandPrincipal, CommandScope, CommandScopeType,
+    ExpectedCommandState, NewCommandContext,
 };
 use crate::execution_setup::classify_task_execution;
 use db::{
-    AgentAction, AgentActionExecutionStatus, AgentActionPolicyResult, AgentActionStatus,
-    CommandReceipt, CommandReceiptRepo, CreateAgentActionExecution, CreateCommandReceipt,
-    CreateProjectTaskGovernance, CreateTask, CreateTaskProposalCommand, CreateTaskRoleAssignment,
-    ProjectOrchestrationRepo, ProjectRepo, Task, TaskRepo,
+    AgentAction, AgentActionPolicyResult, AgentActionStatus, CommandReceipt, CommandReceiptRepo,
+    CreateCommandReceipt, CreateProjectTaskGovernance, CreateTask, CreateTaskProposalCommand,
+    CreateTaskRoleAssignment, ProjectOrchestrationRepo, ProjectRepo, Task, TaskRepo,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -27,7 +24,7 @@ use std::str::FromStr;
 
 pub const TASK_PROPOSE_COMMAND: &str = "task.propose";
 
-/// Closed action payload shared by REST/native proposal execution.  The
+/// Closed command payload shared by REST/native proposal execution.  The
 /// transport envelope stays in `api-types`; this payload is the server-owned
 /// command input used for canonical digesting and replay.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,36 +164,8 @@ pub(super) fn replace_review_requirement_ids(
 }
 
 impl TaskService {
-    /// Execute an admitted action-backed `task.propose` through the shared
-    /// Task command. REST/user execution keeps this path so an approval/audit
-    /// Action remains the source authorization envelope.
-    pub(crate) async fn execute_task_proposal_command(
-        &self,
-        action: &AgentAction,
-        expected_action_version: i64,
-        executed_by_type: &str,
-        executed_by_id: &str,
-        idempotency_key: &str,
-    ) -> Result<Task> {
-        self.execute_task_proposal_command_with_policy(
-            action,
-            expected_action_version,
-            executed_by_type,
-            executed_by_id,
-            idempotency_key,
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
-        .map(|result| result.task)
-    }
-
-    /// Execute an automatically allowed Task proposal without creating an
-    /// AgentAction. Native tools call this method with the host-derived
-    /// source scope and expected policy provenance; the same atomic command
-    /// materializer is used by the action-backed executor above.
+    /// Execute a Task proposal directly with the host-derived source scope
+    /// and policy provenance. Task creation and its receipt commit atomically.
     pub async fn execute_task_proposal_direct(
         &self,
         input: DirectTaskProposalInput,
@@ -243,8 +212,8 @@ impl TaskService {
                 ServiceError::invalid_operation("direct task proposal policy result is invalid")
             })?;
         let action = AgentAction {
-            // An empty id is the explicit marker for the direct command.  It
-            // is never persisted or queried as an AgentAction.
+            // The empty source action id is part of the direct command's
+            // canonical digest. This envelope is never persisted as an Action.
             id: String::new(),
             actor_identity_id: input.actor_identity_id.clone(),
             scope_type: input.source_scope_type.clone(),
@@ -269,7 +238,6 @@ impl TaskService {
         };
         self.execute_task_proposal_command_with_policy(
             &action,
-            0,
             &input.executor_type,
             &input.executor_id,
             &input.idempotency_key,
@@ -281,14 +249,11 @@ impl TaskService {
         .await
     }
 
-    /// Execute an admitted `task.propose` action through one command
-    /// transaction.  The action row is the source authorization envelope;
-    /// its successful execution is finalized with the Task domain rows.
+    /// Materialize a direct Task proposal and its frozen command receipt.
     #[allow(clippy::too_many_arguments)]
     async fn execute_task_proposal_command_with_policy(
         &self,
         action: &AgentAction,
-        expected_action_version: i64,
         executed_by_type: &str,
         executed_by_id: &str,
         idempotency_key: &str,
@@ -322,13 +287,10 @@ impl TaskService {
             ));
         }
 
-        // Build the canonical command identity from the source Action before
-        // reading current Project/binding state.  In particular, the action
-        // version and executor principal are part of the digest, so changing
-        // either with the same key is an idempotency conflict.
+        // Bind the source provenance and executor principal before reading
+        // current Project/binding state so changed input conflicts on replay.
         let context = task_proposal_context(
             action,
-            expected_action_version,
             executed_by_type,
             executed_by_id,
             idempotency_key,
@@ -338,8 +300,8 @@ impl TaskService {
             policy_digest,
         )?;
 
-        // Replay is intentionally before current authorization, baseline, or
-        // action-status checks.  The immutable receipt is the authority for a
+        // Replay is intentionally before current authorization or baseline
+        // checks.  The immutable receipt is the authority for a
         // response-loss retry; its frozen Task snapshot is returned exactly.
         if let Some(receipt) = self.replay_task_command(&context).await? {
             let task = frozen_task_from_receipt(&receipt)?;
@@ -362,25 +324,6 @@ impl TaskService {
 
         self.authorize_task_proposal_action(action, &project_id, executed_by_type, executed_by_id)
             .await?;
-        if expected_action_version != action.version {
-            return Err(ServiceError::Db(db::DbError::VersionConflict));
-        }
-        if action.status != AgentActionStatus::Proposed
-            && action.status != AgentActionStatus::Approved
-        {
-            return Err(ServiceError::invalid_operation(
-                "task proposal is not admitted for execution",
-            ));
-        }
-        if action.policy_result == AgentActionPolicyResult::Denied
-            || (action.policy_result == AgentActionPolicyResult::ApprovalRequired
-                && action.status != AgentActionStatus::Approved)
-        {
-            return Err(ServiceError::invalid_operation(
-                "task proposal policy has not admitted execution",
-            ));
-        }
-
         let project = ProjectRepo::get_by_id(&*self.db, &project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", project_id.clone()))?;
@@ -586,7 +529,7 @@ impl TaskService {
             "requires_user_authorization": false,
         })
         .to_string();
-        let (receipt, action_execution) = command_bundle(&context, &outcome_json);
+        let receipt = command_receipt(&context, &outcome_json);
         let governance = prepared_governance.map(|governance| CreateProjectTaskGovernance {
             task_id: task_id.clone(),
             project_id: project_id.clone(),
@@ -628,9 +571,6 @@ impl TaskService {
                 role_assignments,
                 depends_on_task_ids: payload.depends_on_task_ids.clone(),
                 metadata_json,
-                source_action_id: (!action.id.trim().is_empty()).then(|| action.id.clone()),
-                expected_action_version: (!action.id.trim().is_empty())
-                    .then_some(expected_action_version),
                 source_actor_identity_id: action.actor_identity_id.clone(),
                 source_scope_type: action.scope_type.clone(),
                 source_scope_id: action.scope_id.clone(),
@@ -641,11 +581,9 @@ impl TaskService {
                 source_policy_result: action.policy_result.to_string(),
                 source_policy_revision: policy_revision.map(str::to_owned),
                 source_policy_digest: policy_digest.map(str::to_owned),
-                source_payload_hash: action.payload_hash.clone(),
                 executor_type: executed_by_type.to_owned(),
                 executor_id: executed_by_id.to_owned(),
                 command_receipt: Some(receipt),
-                action_execution,
             },
         )
         .await
@@ -903,7 +841,6 @@ struct TaskProposalDigestInput<'a> {
 #[allow(clippy::too_many_arguments)]
 fn task_proposal_context(
     action: &AgentAction,
-    expected_action_version: i64,
     executed_by_type: &str,
     executed_by_id: &str,
     idempotency_key: &str,
@@ -912,12 +849,6 @@ fn task_proposal_context(
     policy_revision: Option<&str>,
     policy_digest: Option<&str>,
 ) -> Result<CommandContext> {
-    let mut expected_state = ExpectedCommandState::default();
-    if !action.id.trim().is_empty() {
-        expected_state
-            .versions
-            .insert("agent_action".to_owned(), expected_action_version);
-    }
     CommandContext::from_authorized_input(
         NewCommandContext {
             principal: CommandPrincipal {
@@ -930,23 +861,14 @@ fn task_proposal_context(
             },
             operation: TASK_PROPOSE_COMMAND.to_owned(),
             idempotency_key: idempotency_key.to_owned(),
-            expected_state,
+            expected_state: ExpectedCommandState::default(),
             authorization_provenance: Some(AuthorizationProvenance {
                 policy_result: action.policy_result.to_string(),
                 policy_revision: policy_revision.map(str::to_owned),
                 policy_digest: policy_digest.map(str::to_owned),
                 requested_permission: Some(action.requested_permission.clone()),
             }),
-            action_provenance: (!action.id.trim().is_empty()).then(|| {
-                AgentActionProvenance::new(
-                    action.id.clone(),
-                    expected_action_version,
-                    1,
-                    idempotency_key.to_owned(),
-                    executed_by_type.to_owned(),
-                    executed_by_id.to_owned(),
-                )
-            }),
+            action_provenance: None,
             correlation_id: action.correlation_id.clone(),
             causation_id: action.causation_id.clone(),
             causation_depth: action.causation_depth,
@@ -1019,11 +941,8 @@ fn validate_role_assignments(
         .collect()
 }
 
-fn command_bundle(
-    context: &CommandContext,
-    outcome_json: &str,
-) -> (CreateCommandReceipt, Option<CreateAgentActionExecution>) {
-    let mut receipt = CreateCommandReceipt {
+fn command_receipt(context: &CommandContext, outcome_json: &str) -> CreateCommandReceipt {
+    CreateCommandReceipt {
         id: db::new_uuid_v4(),
         principal_type: context.principal().principal_type().to_owned(),
         principal_id: context.principal().principal_id().to_owned(),
@@ -1043,31 +962,7 @@ fn command_bundle(
         agent_action_execution_id: None,
         outcome_json: outcome_json.to_owned(),
         committed_at: now_rfc3339(),
-    };
-    let execution = context.action_provenance.as_ref().map(|provenance| {
-        let committed_at = now_rfc3339();
-        CreateAgentActionExecution {
-            id: db::new_uuid_v4(),
-            action_id: provenance.action_id.clone(),
-            expected_action_version: provenance.expected_action_version,
-            attempt: provenance.attempt,
-            status: AgentActionExecutionStatus::Succeeded,
-            result_json: Some(receipt.outcome_json.clone()),
-            error: None,
-            executed_by_type: provenance.executed_by_type.clone(),
-            executed_by_id: provenance.executed_by_id.clone(),
-            idempotency_key: provenance.execution_idempotency_key.clone(),
-            action_status: AgentActionStatus::Executed,
-            action_outcome_json: Some(receipt.outcome_json.clone()),
-            created_at: committed_at.clone(),
-            completed_at: Some(committed_at.clone()),
-            updated_at: committed_at,
-        }
-    });
-    if let Some(execution) = execution.as_ref() {
-        receipt.agent_action_execution_id = Some(execution.id.clone());
     }
-    (receipt, execution)
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

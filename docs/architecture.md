@@ -2251,7 +2251,10 @@ Project and inserted in the same transaction, so implementation → verification
 ordering is scheduler-enforced rather than narration-only. Task proposal
 execution commits the Task, governance projection, prerequisite links, durable
 `task.created` event, and command receipt in one transaction; an exact
-response-loss replay returns the frozen Task snapshot.
+response-loss replay returns the frozen Task snapshot. Task proposals are
+direct-only: they create no `AgentAction` or `AgentActionExecution`. Their
+internal receipts retain the complete frozen Task for replay; REST exposes
+receipt metadata and the public Task projection, not the receipt outcome JSON.
 A ReadyOnly Project Agent may likewise invoke the native `task.adaptive`
 Coordination operation in the bound Project or its Project Agent Chat. The
 adapter accepts only the closed `split`, `sequence`, and `replace` payloads

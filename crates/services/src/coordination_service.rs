@@ -11,7 +11,7 @@ use db::{
     AgentInboxListQuery, AgentInboxStatus, AgentQuestion, AgentQuestionListQuery,
     AnswerAgentQuestion, CompleteAgentCommitment, CreateAgentAction, CreateAgentActionApproval,
     CreateAgentActionExecution, CreateAgentCommitment, CreateAgentCommitmentEvidence,
-    CreateAgentInboxItem, CreateAgentQuestion, SqliteDb, Task, TransferAgentCommitment,
+    CreateAgentInboxItem, CreateAgentQuestion, SqliteDb, TransferAgentCommitment,
     UpdateAgentCommitment, UpdateAgentInboxItem,
 };
 use forge_agent_host::{
@@ -26,7 +26,6 @@ use sha2::{Digest, Sha256};
 #[cfg(test)]
 use sqlx::Row;
 
-use crate::task_service::TaskService;
 use crate::{Result, ServiceError};
 
 pub use crate::task_service::TaskProposalPayload;
@@ -541,21 +540,6 @@ pub struct ExecuteActionInput {
     pub idempotency_key: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExecuteTaskProposalInput {
-    pub action_id: String,
-    pub expected_version: i64,
-    pub executed_by_type: String,
-    pub executed_by_id: String,
-    pub idempotency_key: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct ExecutedTaskProposal {
-    pub task: Task,
-    pub execution: AgentActionExecution,
-}
-
 #[derive(Clone)]
 pub struct AgentActionService {
     db: Arc<SqliteDb>,
@@ -835,32 +819,6 @@ impl AgentActionService {
         )
         .await
         .map_err(Into::into)
-    }
-
-    /// Executes an admitted `task.propose` through the atomic TaskService
-    /// command.  The command owns Task/governance/event/receipt/action
-    /// finalization; this service only resolves the source Action and returns
-    /// its durable execution projection.
-    pub async fn execute_task_proposal(
-        &self,
-        task_service: &TaskService,
-        input: ExecuteTaskProposalInput,
-    ) -> Result<ExecutedTaskProposal> {
-        let action = self.get(&input.action_id).await?;
-        let task = task_service
-            .execute_task_proposal_command(
-                &action,
-                input.expected_version,
-                &input.executed_by_type,
-                &input.executed_by_id,
-                &input.idempotency_key,
-            )
-            .await?;
-        let execution =
-            db::AgentActionRepo::get_successful_action_execution(&*self.db, &input.action_id)
-                .await?
-                .ok_or_else(|| ServiceError::Db(db::DbError::IdempotencyConflict))?;
-        Ok(ExecutedTaskProposal { task, execution })
     }
 }
 

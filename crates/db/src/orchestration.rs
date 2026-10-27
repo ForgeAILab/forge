@@ -1261,8 +1261,8 @@ pub struct CreateProjectTaskGovernance {
 
 /// Atomic Task proposal composite.  The Task row, optional immutable
 /// governance projection, prerequisite dependencies, explicit/default role
-/// assignments, durable `task.created` event, command receipt, and optional
-/// AgentAction execution are committed by one SQLite transaction. The command
+/// assignments, durable `task.created` event, and direct command receipt
+/// are committed by one SQLite transaction. The command
 /// receipt is optional only for repository-level characterization callers;
 /// the service command always supplies it.
 #[derive(Debug, Clone)]
@@ -1272,14 +1272,8 @@ pub struct CreateTaskProposalCommand {
     pub role_assignments: Vec<CreateTaskRoleAssignment>,
     pub depends_on_task_ids: Vec<String>,
     pub metadata_json: Option<String>,
-    /// Present only for an approval/audit-backed execution. Directly allowed
-    /// commands intentionally leave these unset and therefore cannot create
-    /// an AgentActionExecution row.
-    pub source_action_id: Option<String>,
-    pub expected_action_version: Option<i64>,
-    /// Frozen authorization provenance shared by action-backed and direct
-    /// transports. SQLite rechecks the mutable binding/action facts under
-    /// BEGIN IMMEDIATE before inserting the Task.
+    /// Frozen direct-command authorization provenance. SQLite rechecks the
+    /// mutable binding facts under BEGIN IMMEDIATE before inserting the Task.
     pub source_actor_identity_id: String,
     pub source_scope_type: String,
     pub source_scope_id: String,
@@ -1290,11 +1284,9 @@ pub struct CreateTaskProposalCommand {
     pub source_policy_result: String,
     pub source_policy_revision: Option<String>,
     pub source_policy_digest: Option<String>,
-    pub source_payload_hash: String,
     pub executor_type: String,
     pub executor_id: String,
     pub command_receipt: Option<CreateCommandReceipt>,
-    pub action_execution: Option<CreateAgentActionExecution>,
 }
 
 /// One bounded child payload for an adaptive Task split.  The payload is

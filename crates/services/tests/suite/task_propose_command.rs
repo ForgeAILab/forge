@@ -1,27 +1,19 @@
 //! Gate A acceptance coverage for the atomic `task.propose` command.
 //!
-//! These tests intentionally enter the public coordination command surface
-//! (`AgentActionService::execute_task_proposal`) rather than calling the
-//! legacy `TaskService::create_task_with_governance` helper.  The former is
-//! the transport-neutral seam used by the native Project Agent adapter; the
-//! command implementation must make the Task, governance link, domain event,
-//! command receipt, and optional action execution one replayable transaction.
+//! These tests enter `TaskService::execute_task_proposal_direct`, the command
+//! used by REST and native Project Agent adapters. The Task, governance link,
+//! domain event, and command receipt form one replayable transaction.
 
 use std::sync::Arc;
 
 use db::{
-    create_sqlite_pool, run_migrations, AgentAction, AgentActionPolicyResult, AgentActionRepo,
-    AgentActionStatus, AgentProfileRepo, AgentRepo, AgentStatus, CreateAgentAction,
+    create_sqlite_pool, run_migrations, AgentProfileRepo, AgentRepo, AgentStatus,
     CreateAgentIdentity, CreateAgentProfile, CreateProject, CreateRepo, ProjectRepo, RepoRepo,
     SqliteDb, TaskRepo, UpdateProject,
 };
 use events::EventBus;
 use serde_json::{json, Value};
-use services::{
-    AgentActionService, DirectTaskProposalInput, ExecuteTaskProposalInput, ServiceError,
-    TaskService,
-};
-use sha2::{Digest, Sha256};
+use services::{DirectTaskProposalInput, ServiceError, TaskService};
 
 const USER_ID: &str = "task-command-user";
 const AGENT_ID: &str = "task-command-project-agent";
@@ -47,7 +39,6 @@ const OPERATION: &str = "task.propose";
 struct Fixture {
     db: Arc<SqliteDb>,
     task_service: TaskService,
-    action_service: AgentActionService,
 }
 
 type GovernanceTraceabilityRow = (
@@ -342,7 +333,6 @@ async fn fixture() -> Fixture {
     .await;
     Fixture {
         task_service: TaskService::new_for_test(Arc::clone(&db), Arc::new(EventBus::new(32))),
-        action_service: AgentActionService::new(Arc::clone(&db)),
         db,
     }
 }
@@ -378,69 +368,42 @@ fn task_proposal_requires_an_explicit_review_requirement_list() {
     assert!(serde_json::from_value::<services::TaskProposalPayload>(value).is_err());
 }
 
-fn payload_hash(payload: &Value) -> String {
-    let mut digest = Sha256::new();
-    digest.update(payload.to_string().as_bytes());
-    hex::encode(digest.finalize())
-}
-
-async fn action(
-    db: &SqliteDb,
+fn proposal_input(
     id: &str,
     actor_identity_id: &str,
     project_id: &str,
     payload: &Value,
-) -> AgentAction {
-    AgentActionRepo::create_action(
-        db,
-        CreateAgentAction {
-            id: id.to_owned(),
-            actor_identity_id: actor_identity_id.to_owned(),
-            scope_type: "project".to_owned(),
-            scope_id: project_id.to_owned(),
-            operation: OPERATION.to_owned(),
-            payload_json: payload.to_string(),
-            payload_hash: payload_hash(payload),
-            dedupe_key: format!("dedupe-{id}"),
-            correlation_id: format!("correlation-{id}"),
-            causation_id: None,
-            causation_depth: 0,
-            requested_permission: "propose_task".to_owned(),
-            policy_result: AgentActionPolicyResult::Allowed,
-            policy_reason: None,
-            status: AgentActionStatus::Proposed,
-            target_type: Some("project".to_owned()),
-            target_id: Some(project_id.to_owned()),
-            created_at: NOW.to_owned(),
-            updated_at: NOW.to_owned(),
-        },
-    )
-    .await
-    .expect("agent action");
-    AgentActionRepo::get_action(db, id)
-        .await
-        .expect("action read")
-        .expect("action exists")
+) -> DirectTaskProposalInput {
+    DirectTaskProposalInput {
+        actor_identity_id: actor_identity_id.to_owned(),
+        executor_type: "agent".to_owned(),
+        executor_id: actor_identity_id.to_owned(),
+        source_scope_type: "project".to_owned(),
+        source_scope_id: project_id.to_owned(),
+        project_id: project_id.to_owned(),
+        payload: serde_json::from_value(payload.clone()).expect("Task proposal payload"),
+        idempotency_key: id.to_owned(),
+        correlation_id: format!("correlation-{id}"),
+        causation_id: None,
+        causation_depth: 0,
+        policy_result: "allowed".to_owned(),
+        preflight_policy_result: None,
+        preflight_policy_reason: None,
+        policy_revision: None,
+        policy_digest: None,
+        requested_permission: "propose_task".to_owned(),
+    }
 }
 
 async fn propose(
     fixture: &Fixture,
-    action_id: String,
-    expected_version: i64,
+    mut input: DirectTaskProposalInput,
     idempotency_key: &str,
-) -> Result<services::ExecutedTaskProposal, ServiceError> {
+) -> Result<services::TaskProposalCommandResult, ServiceError> {
+    input.idempotency_key = idempotency_key.to_owned();
     fixture
-        .action_service
-        .execute_task_proposal(
-            &fixture.task_service,
-            ExecuteTaskProposalInput {
-                action_id,
-                expected_version,
-                executed_by_type: "agent".to_owned(),
-                executed_by_id: AGENT_ID.to_owned(),
-                idempotency_key: idempotency_key.to_owned(),
-            },
-        )
+        .task_service
+        .execute_task_proposal_direct(input)
         .await
 }
 
@@ -491,28 +454,19 @@ async fn task_proposal_commits_one_atomic_bundle_and_replays_frozen_task() {
         "task",
         true,
     );
-    let task_action = action(
-        &fixture.db,
+    let task_input = proposal_input(
         "task-command-atomic-action",
         AGENT_ID,
         BASELINE_PROJECT_ID,
         &task_payload,
-    )
-    .await;
-
-    let first = propose(
-        &fixture,
-        task_action.id.clone(),
-        task_action.version,
-        "task-command-atomic-key",
-    )
-    .await
-    .expect("task proposal");
-    let task_id = first.task.id.clone();
-    assert_eq!(
-        first.execution.status,
-        db::AgentActionExecutionStatus::Succeeded
     );
+
+    let first = propose(&fixture, task_input.clone(), "task-command-atomic-key")
+        .await
+        .expect("task proposal");
+    let task_id = first.task.id.clone();
+    assert!(!first.replayed);
+    assert!(first.receipt.agent_action_execution_id.is_none());
     assert_eq!(
         count(
             &fixture.db,
@@ -520,7 +474,7 @@ async fn task_proposal_commits_one_atomic_bundle_and_replays_frozen_task() {
         )
         .await,
         0,
-        "the server mints the Task id; it is not the source action id"
+        "the server mints the Task id; it is not the input correlation label"
     );
     assert_eq!(
         count(
@@ -550,17 +504,16 @@ async fn task_proposal_commits_one_atomic_bundle_and_replays_frozen_task() {
              (SELECT COUNT(*) FROM domain_event WHERE entity_type = 'task' AND event_type <> 'project_hook.task_created' AND entity_id = ?),
              (SELECT COUNT(*) FROM command_receipt
               WHERE operation = 'task.propose' AND idempotency_key = ?),
-             (SELECT COUNT(*) FROM agent_action_execution WHERE action_id = ?),
+             (SELECT COUNT(*) FROM agent_action_execution),
              (SELECT COUNT(*) FROM project_task_governance WHERE task_id = ?)",
     )
     .bind(&task_id)
     .bind("task-command-atomic-key")
-    .bind(&task_action.id)
     .bind(&task_id)
     .fetch_one(fixture.db.pool())
     .await
     .expect("atomic bundle counts");
-    assert_eq!(bundle, (1, 1, 1, 1));
+    assert_eq!(bundle, (1, 1, 0, 1));
     assert_task_creation_events(&fixture.db, &task_id).await;
 
     let outcome_json: String = sqlx::query_scalar(
@@ -572,21 +525,12 @@ async fn task_proposal_commits_one_atomic_bundle_and_replays_frozen_task() {
     .await
     .expect("frozen command outcome");
     let outcome: Value = serde_json::from_str(&outcome_json).expect("frozen outcome JSON");
-    let execution_result: Value = serde_json::from_str(
-        &first
-            .execution
-            .result_json
-            .clone()
-            .expect("action execution result"),
-    )
-    .expect("action result JSON");
-    assert_eq!(execution_result["task_id"], task_id);
     assert_eq!(outcome["task_id"], task_id);
     assert!(outcome["domain_committed"].as_bool().unwrap_or(false));
 
     // A response-loss replay must resolve the frozen receipt before mutable
     // binding/authorization state.  This also proves that server-minted IDs
-    // are not regenerated from the same source action.
+    // are not regenerated from the same command input.
     sqlx::query("UPDATE task SET title = 'Live row changed after commit' WHERE id = ?")
         .bind(&task_id)
         .execute(fixture.db.pool())
@@ -601,14 +545,9 @@ async fn task_proposal_commits_one_atomic_bundle_and_replays_frozen_task() {
     .execute(fixture.db.pool())
     .await
     .expect("pause binding after commit");
-    let replay = propose(
-        &fixture,
-        task_action.id,
-        task_action.version,
-        "task-command-atomic-key",
-    )
-    .await
-    .expect("replay frozen task after response loss");
+    let replay = propose(&fixture, task_input.clone(), "task-command-atomic-key")
+        .await
+        .expect("replay frozen task after response loss");
     assert_eq!(replay.task.id, task_id);
     assert_eq!(replay.task.title, first.task.title);
     assert_eq!(
@@ -629,7 +568,7 @@ async fn task_proposal_commits_one_atomic_bundle_and_replays_frozen_task() {
     );
     assert_eq!(
         count(&fixture.db, "SELECT COUNT(*) FROM agent_action_execution").await,
-        1
+        0
     );
 }
 
@@ -656,18 +595,15 @@ async fn task_requirement_ids_are_validated_before_task_creation() {
             true,
         );
         task_payload["review_requirement_ids"] = json!([requirement_id]);
-        let task_action = action(
-            &fixture.db,
+        let task_input = proposal_input(
             &format!("task-command-{suffix}-requirement-action"),
             AGENT_ID,
             BASELINE_PROJECT_ID,
             &task_payload,
-        )
-        .await;
+        );
         let error = propose(
             &fixture,
-            task_action.id,
-            task_action.version,
+            task_input.clone(),
             &format!("task-command-{suffix}-requirement-key"),
         )
         .await
@@ -696,18 +632,15 @@ async fn task_requirement_ids_are_validated_before_task_creation() {
         true,
     );
     task_payload["review_requirement_ids"] = json!([requirement_id]);
-    let task_action = action(
-        &fixture.db,
+    let task_input = proposal_input(
         "task-command-exact-requirement-action",
         AGENT_ID,
         BASELINE_PROJECT_ID,
         &task_payload,
-    )
-    .await;
+    );
     let created = propose(
         &fixture,
-        task_action.id,
-        task_action.version,
+        task_input.clone(),
         "task-command-exact-requirement-key",
     )
     .await
@@ -738,18 +671,15 @@ async fn task_review_requirement_ids_can_be_replaced_with_validation() {
         "task",
         true,
     );
-    let task_action = action(
-        &fixture.db,
+    let task_input = proposal_input(
         "task-command-correctable-scope-action",
         AGENT_ID,
         BASELINE_PROJECT_ID,
         &task_payload,
-    )
-    .await;
+    );
     let created = propose(
         &fixture,
-        task_action.id,
-        task_action.version,
+        task_input.clone(),
         "task-command-correctable-scope-key",
     )
     .await
@@ -834,18 +764,15 @@ async fn active_baseline_read_only_task_retains_traceability_and_dependencies() 
         "task",
         true,
     );
-    let implementation_action = action(
-        &fixture.db,
+    let implementation_input = proposal_input(
         "task-command-readonly-prerequisite",
         AGENT_ID,
         BASELINE_PROJECT_ID,
         &implementation_payload,
-    )
-    .await;
+    );
     let implementation = propose(
         &fixture,
-        implementation_action.id,
-        implementation_action.version,
+        implementation_input.clone(),
         "task-command-readonly-prerequisite-key",
     )
     .await
@@ -860,18 +787,15 @@ async fn active_baseline_read_only_task_retains_traceability_and_dependencies() 
     verification_payload["plan_item_id"] = Value::String("plan-2".to_owned());
     verification_payload["capability_class"] = Value::String("repository_read".to_owned());
     verification_payload["depends_on_task_ids"] = json!([implementation.task.id.clone()]);
-    let verification_action = action(
-        &fixture.db,
+    let verification_input = proposal_input(
         "task-command-readonly-verification",
         AGENT_ID,
         BASELINE_PROJECT_ID,
         &verification_payload,
-    )
-    .await;
+    );
     let verification = propose(
         &fixture,
-        verification_action.id,
-        verification_action.version,
+        verification_input.clone(),
         "task-command-readonly-verification-key",
     )
     .await
@@ -909,18 +833,15 @@ async fn active_baseline_read_only_task_retains_traceability_and_dependencies() 
 async fn task_proposal_rejects_parent_as_prerequisite() {
     let fixture = fixture().await;
     let parent_payload = payload(BASELINE_PROJECT_ID, "Coordination root", "task", true);
-    let parent_action = action(
-        &fixture.db,
+    let parent_input = proposal_input(
         "task-command-parent-dependency-parent",
         AGENT_ID,
         BASELINE_PROJECT_ID,
         &parent_payload,
-    )
-    .await;
+    );
     let parent = propose(
         &fixture,
-        parent_action.id,
-        parent_action.version,
+        parent_input.clone(),
         "task-command-parent-dependency-parent-key",
     )
     .await
@@ -935,18 +856,15 @@ async fn task_proposal_rejects_parent_as_prerequisite() {
     );
     child_payload["parent_task_id"] = json!(parent.id.clone());
     child_payload["depends_on_task_ids"] = json!([parent.id]);
-    let child_action = action(
-        &fixture.db,
+    let child_input = proposal_input(
         "task-command-parent-dependency-child",
         AGENT_ID,
         BASELINE_PROJECT_ID,
         &child_payload,
-    )
-    .await;
+    );
     let error = propose(
         &fixture,
-        child_action.id,
-        child_action.version,
+        child_input.clone(),
         "task-command-parent-dependency-child-key",
     )
     .await
@@ -975,18 +893,15 @@ async fn task_proposal_receipt_failure_rolls_back_prerequisite_links() {
         "task",
         true,
     );
-    let prerequisite_action = action(
-        &fixture.db,
+    let prerequisite_input = proposal_input(
         "task-command-dependency-rollback-prerequisite",
         AGENT_ID,
         BASELINE_PROJECT_ID,
         &prerequisite_payload,
-    )
-    .await;
+    );
     let prerequisite = propose(
         &fixture,
-        prerequisite_action.id,
-        prerequisite_action.version,
+        prerequisite_input.clone(),
         "task-command-dependency-rollback-prerequisite-key",
     )
     .await
@@ -1001,14 +916,12 @@ async fn task_proposal_receipt_failure_rolls_back_prerequisite_links() {
     dependent_payload["plan_item_id"] = Value::String("plan-2".to_owned());
     dependent_payload["capability_class"] = Value::String("repository_read".to_owned());
     dependent_payload["depends_on_task_ids"] = json!([prerequisite.task.id]);
-    let dependent_action = action(
-        &fixture.db,
+    let dependent_input = proposal_input(
         "task-command-dependency-rollback-dependent",
         AGENT_ID,
         BASELINE_PROJECT_ID,
         &dependent_payload,
-    )
-    .await;
+    );
     sqlx::query(
         "CREATE TEMP TRIGGER task_dependency_receipt_failpoint
          BEFORE INSERT ON command_receipt
@@ -1020,8 +933,7 @@ async fn task_proposal_receipt_failure_rolls_back_prerequisite_links() {
 
     let failed = propose(
         &fixture,
-        dependent_action.id,
-        dependent_action.version,
+        dependent_input.clone(),
         "task-command-dependency-rollback-dependent-key",
     )
     .await
@@ -1051,42 +963,24 @@ async fn task_proposal_receipt_failure_rolls_back_prerequisite_links() {
 async fn task_proposal_changed_payload_or_principal_on_same_key_conflicts() {
     let fixture = fixture().await;
     let original_payload = payload(BASELINE_PROJECT_ID, "Original task command", "task", true);
-    let task_action = action(
-        &fixture.db,
+    let task_input = proposal_input(
         "task-command-conflict-action",
         AGENT_ID,
         BASELINE_PROJECT_ID,
         &original_payload,
-    )
-    .await;
-    propose(
-        &fixture,
-        task_action.id.clone(),
-        task_action.version,
-        "task-command-conflict-key",
-    )
-    .await
-    .expect("original proposal");
-
-    // Mutating the source action simulates a caller reusing the command key
-    // after changing its payload.  The command receipt digest, not a
-    // read-before-create check, is the conflict boundary.
-    let changed_payload = payload(BASELINE_PROJECT_ID, "Changed task command", "task", true);
-    sqlx::query("UPDATE agent_action SET payload_json = ?, payload_hash = ? WHERE id = ?")
-        .bind(changed_payload.to_string())
-        .bind(payload_hash(&changed_payload))
-        .bind(&task_action.id)
-        .execute(fixture.db.pool())
+    );
+    propose(&fixture, task_input.clone(), "task-command-conflict-key")
         .await
-        .expect("simulate changed source action");
-    let changed_payload_result = propose(
-        &fixture,
-        task_action.id.clone(),
-        task_action.version,
-        "task-command-conflict-key",
-    )
-    .await
-    .expect_err("changed payload must conflict");
+        .expect("original proposal");
+
+    // Reusing the command key with a changed payload must conflict at the
+    // receipt digest boundary before current authorization is checked.
+    let changed_payload = payload(BASELINE_PROJECT_ID, "Changed task command", "task", true);
+    let mut changed_input = task_input.clone();
+    changed_input.payload = serde_json::from_value(changed_payload).expect("changed payload");
+    let changed_payload_result = propose(&fixture, changed_input, "task-command-conflict-key")
+        .await
+        .expect_err("changed payload must conflict");
     assert!(matches!(
         changed_payload_result,
         ServiceError::Db(db::DbError::IdempotencyConflict)
@@ -1103,28 +997,21 @@ async fn task_proposal_changed_payload_or_principal_on_same_key_conflicts() {
         "planning_task",
         false,
     );
-    let principal_action = action(
-        &fixture.db,
+    let principal_input = proposal_input(
         "task-command-principal-conflict-action",
         AGENT_ID,
         BASELINE_PROJECT_ID,
         &principal_payload,
-    )
-    .await;
+    );
     propose(
         &fixture,
-        principal_action.id.clone(),
-        principal_action.version,
+        principal_input.clone(),
         "task-command-principal-conflict-key",
     )
     .await
     .expect("principal-conflict proposal");
-    sqlx::query("UPDATE agent_action SET actor_identity_id = ? WHERE id = ?")
-        .bind(OTHER_AGENT_ID)
-        .bind(&principal_action.id)
-        .execute(fixture.db.pool())
-        .await
-        .expect("simulate changed principal action");
+    let mut changed_principal = principal_input.clone();
+    changed_principal.actor_identity_id = OTHER_AGENT_ID.to_owned();
     sqlx::query(
         "UPDATE project_agent_binding
          SET identity_id = ?, profile_id = ?, updated_at = ?, version = version + 1
@@ -1139,8 +1026,7 @@ async fn task_proposal_changed_payload_or_principal_on_same_key_conflicts() {
     .expect("simulate changed principal binding");
     let changed_principal_result = propose(
         &fixture,
-        principal_action.id,
-        principal_action.version,
+        changed_principal,
         "task-command-principal-conflict-key",
     )
     .await
@@ -1163,18 +1049,15 @@ async fn task_proposal_changed_payload_or_principal_on_same_key_conflicts() {
 async fn task_proposal_changed_executor_on_same_key_conflicts_before_auth() {
     let fixture = fixture().await;
     let task_payload = payload(BASELINE_PROJECT_ID, "Executor conflict task", "task", true);
-    let task_action = action(
-        &fixture.db,
+    let task_input = proposal_input(
         "task-command-executor-conflict-action",
         AGENT_ID,
         BASELINE_PROJECT_ID,
         &task_payload,
-    )
-    .await;
+    );
     propose(
         &fixture,
-        task_action.id.clone(),
-        task_action.version,
+        task_input.clone(),
         "task-command-executor-conflict-key",
     )
     .await
@@ -1183,18 +1066,13 @@ async fn task_proposal_changed_executor_on_same_key_conflicts_before_auth() {
     // The user is a valid Project owner, but changing the executor principal
     // with the same canonical scope/operation/key must be a receipt conflict,
     // never a second execution or an authorization-dependent replay.
+    let mut changed_input = task_input;
+    changed_input.executor_type = "user".to_owned();
+    changed_input.executor_id = USER_ID.to_owned();
+    changed_input.idempotency_key = "task-command-executor-conflict-key".to_owned();
     let changed_executor = fixture
-        .action_service
-        .execute_task_proposal(
-            &fixture.task_service,
-            ExecuteTaskProposalInput {
-                action_id: task_action.id,
-                expected_version: task_action.version,
-                executed_by_type: "user".to_owned(),
-                executed_by_id: USER_ID.to_owned(),
-                idempotency_key: "task-command-executor-conflict-key".to_owned(),
-            },
-        )
+        .task_service
+        .execute_task_proposal_direct(changed_input)
         .await
         .expect_err("changed executor must conflict before current auth");
     assert!(matches!(
@@ -1212,38 +1090,31 @@ async fn task_proposal_changed_executor_on_same_key_conflicts_before_auth() {
 }
 
 #[tokio::test]
-async fn concurrent_same_source_action_creates_one_task_and_one_bundle() {
+async fn concurrent_same_direct_command_creates_one_task_and_one_bundle() {
     let fixture = fixture().await;
     let task_payload = payload(BASELINE_PROJECT_ID, "Concurrent task command", "task", true);
-    let task_action = action(
-        &fixture.db,
+    let task_input = proposal_input(
         "task-command-concurrent-action",
         AGENT_ID,
         BASELINE_PROJECT_ID,
         &task_payload,
-    )
-    .await;
-    let input = ExecuteTaskProposalInput {
-        action_id: task_action.id.clone(),
-        expected_version: task_action.version,
-        executed_by_type: "agent".to_owned(),
-        executed_by_id: AGENT_ID.to_owned(),
-        idempotency_key: "task-command-concurrent-key".to_owned(),
-    };
+    );
+    let mut input = task_input;
+    input.idempotency_key = "task-command-concurrent-key".to_owned();
     let left = fixture.clone();
     let right = fixture.clone();
     let left_input = input.clone();
     let right_input = input;
     let (first, second) = tokio::join!(
         async move {
-            left.action_service
-                .execute_task_proposal(&left.task_service, left_input)
+            left.task_service
+                .execute_task_proposal_direct(left_input)
                 .await
         },
         async move {
             right
-                .action_service
-                .execute_task_proposal(&right.task_service, right_input)
+                .task_service
+                .execute_task_proposal_direct(right_input)
                 .await
         },
     );
@@ -1272,12 +1143,12 @@ async fn concurrent_same_source_action_creates_one_task_and_one_bundle() {
     );
     assert_eq!(
         count(&fixture.db, "SELECT COUNT(*) FROM agent_action_execution").await,
-        1
+        0
     );
 }
 
 #[tokio::test]
-async fn receipt_failure_rolls_back_task_governance_event_and_action_execution() {
+async fn receipt_failure_rolls_back_task_governance_event_and_roles() {
     let fixture = fixture().await;
     let mut task_payload = payload(BASELINE_PROJECT_ID, "Rollback task command", "task", true);
     task_payload["role_assignments"] = json!([{
@@ -1285,14 +1156,12 @@ async fn receipt_failure_rolls_back_task_governance_event_and_action_execution()
         "assignee_type": "agent",
         "assignee_id": AGENT_ID,
     }]);
-    let task_action = action(
-        &fixture.db,
+    let task_input = proposal_input(
         "task-command-rollback-action",
         AGENT_ID,
         BASELINE_PROJECT_ID,
         &task_payload,
-    )
-    .await;
+    );
 
     // This database trigger is a deterministic receipt-write failpoint.  A
     // correct command composite rolls back every preceding insert, including
@@ -1305,14 +1174,9 @@ async fn receipt_failure_rolls_back_task_governance_event_and_action_execution()
     .execute(fixture.db.pool())
     .await
     .expect("receipt failpoint");
-    let failed = propose(
-        &fixture,
-        task_action.id.clone(),
-        task_action.version,
-        "task-command-rollback-key",
-    )
-    .await
-    .expect_err("receipt failpoint must abort the command");
+    let failed = propose(&fixture, task_input.clone(), "task-command-rollback-key")
+        .await
+        .expect_err("receipt failpoint must abort the command");
     assert!(failed.to_string().contains("failpoint"));
     assert_eq!(count(&fixture.db, "SELECT COUNT(*) FROM task").await, 0);
     assert_eq!(
@@ -1349,17 +1213,12 @@ async fn receipt_failure_rolls_back_task_governance_event_and_action_execution()
         .await
         .expect("drop receipt failpoint");
 
-    let retry = propose(
-        &fixture,
-        task_action.id.clone(),
-        task_action.version,
-        "task-command-rollback-key",
-    )
-    .await
-    .expect("retry after rollback");
+    let retry = propose(&fixture, task_input.clone(), "task-command-rollback-key")
+        .await
+        .expect("retry after rollback");
     assert!(!retry.task.id.is_empty());
     let frozen_task = retry.task.clone();
-    let frozen_execution_id = retry.execution.id.clone();
+    let retry_receipt = retry.receipt.clone();
     let (frozen_receipt_id, frozen_event_id, frozen_receipt_execution_id): (
         String,
         String,
@@ -1372,11 +1231,8 @@ async fn receipt_failure_rolls_back_task_governance_event_and_action_execution()
     .bind("task-command-rollback-key")
     .fetch_one(fixture.db.pool())
     .await
-    .expect("frozen action-backed receipt");
-    assert_eq!(
-        frozen_receipt_execution_id.as_deref(),
-        Some(frozen_execution_id.as_str())
-    );
+    .expect("frozen direct receipt");
+    assert!(frozen_receipt_execution_id.is_none());
     let frozen_role_ids = role_ids(&fixture.db, &frozen_task.id).await;
     assert_eq!(frozen_role_ids.len(), 1);
     let frozen_work_epoch = project_work_epoch(&fixture.db, BASELINE_PROJECT_ID).await;
@@ -1417,37 +1273,35 @@ async fn receipt_failure_rolls_back_task_governance_event_and_action_execution()
     );
     assert_eq!(
         count(&fixture.db, "SELECT COUNT(*) FROM agent_action_execution").await,
-        1
+        0
     );
 
     // Discard the successful response and recreate the command owner before
     // replaying.  The live Task may have changed after the original commit,
     // but the receipt remains authoritative and must return the frozen
-    // Task/event/action-execution bundle without allocating anything else.
+    // Task/event/receipt bundle without allocating anything else.
     drop(retry);
-    sqlx::query("UPDATE task SET title = 'live action-backed title' WHERE id = ?")
+    sqlx::query("UPDATE task SET title = 'live migrated direct title' WHERE id = ?")
         .bind(&frozen_task.id)
         .execute(fixture.db.pool())
         .await
-        .expect("mutate live action-backed Task");
+        .expect("mutate live direct Task");
     let restarted_fixture = Fixture {
         db: Arc::clone(&fixture.db),
         task_service: TaskService::new_for_test(
             Arc::clone(&fixture.db),
             Arc::new(EventBus::new(32)),
         ),
-        action_service: fixture.action_service.clone(),
     };
     let replay = propose(
         &restarted_fixture,
-        task_action.id.clone(),
-        task_action.version,
+        task_input.clone(),
         "task-command-rollback-key",
     )
     .await
     .expect("replay after process loss and successful retry");
     assert_eq!(replay.task, frozen_task);
-    assert_eq!(replay.execution.id, frozen_execution_id);
+    assert_eq!(replay.receipt, retry_receipt);
     let replay_receipt: (String, String, Option<String>) = sqlx::query_as(
         "SELECT id, event_id, agent_action_execution_id
          FROM command_receipt
@@ -1456,13 +1310,10 @@ async fn receipt_failure_rolls_back_task_governance_event_and_action_execution()
     .bind("task-command-rollback-key")
     .fetch_one(fixture.db.pool())
     .await
-    .expect("replayed action-backed receipt");
+    .expect("replayed direct receipt");
     assert_eq!(replay_receipt.0, frozen_receipt_id);
     assert_eq!(replay_receipt.1, frozen_event_id);
-    assert_eq!(
-        replay_receipt.2.as_deref(),
-        Some(frozen_execution_id.as_str())
-    );
+    assert!(replay_receipt.2.is_none());
     assert_eq!(
         role_ids(&fixture.db, &frozen_task.id).await,
         frozen_role_ids
@@ -1502,12 +1353,8 @@ async fn receipt_failure_rolls_back_task_governance_event_and_action_execution()
         1
     );
     assert_eq!(
-        count(
-            &fixture.db,
-            "SELECT COUNT(*) FROM agent_action_execution WHERE action_id = 'task-command-rollback-action'",
-        )
-        .await,
-        1
+        count(&fixture.db, "SELECT COUNT(*) FROM agent_action_execution").await,
+        0
     );
 }
 
@@ -1521,18 +1368,15 @@ async fn charter_backed_planning_and_discovery_are_read_only_and_runnable() {
             task_type,
             false,
         );
-        let task_action = action(
-            &fixture.db,
+        let task_input = proposal_input(
             &format!("task-command-prebaseline-{suffix}"),
             AGENT_ID,
             PREBASELINE_PROJECT_ID,
             &task_payload,
-        )
-        .await;
+        );
         let proposal = propose(
             &fixture,
-            task_action.id,
-            task_action.version,
+            task_input.clone(),
             &format!("task-command-prebaseline-{suffix}-key"),
         )
         .await
@@ -1572,22 +1416,15 @@ async fn discovery_tasks_keep_charter_requirements_deferred() {
         false,
     );
     invalid["review_requirement_ids"] = json!([requirement_id.clone()]);
-    let invalid_action = action(
-        &fixture.db,
+    let invalid_input = proposal_input(
         "discovery-requirement-action",
         AGENT_ID,
         PREBASELINE_PROJECT_ID,
         &invalid,
-    )
-    .await;
-    let error = propose(
-        &fixture,
-        invalid_action.id,
-        invalid_action.version,
-        "discovery-requirement-key",
-    )
-    .await
-    .expect_err("discovery requirement allocation is rejected");
+    );
+    let error = propose(&fixture, invalid_input.clone(), "discovery-requirement-key")
+        .await
+        .expect_err("discovery requirement allocation is rejected");
     assert!(error
         .to_string()
         .contains("discovery Tasks cannot own Charter review requirements"));
@@ -1598,23 +1435,16 @@ async fn discovery_tasks_keep_charter_requirements_deferred() {
         "discovery",
         false,
     );
-    let valid_action = action(
-        &fixture.db,
+    let valid_input = proposal_input(
         "discovery-empty-scope-action",
         AGENT_ID,
         PREBASELINE_PROJECT_ID,
         &valid,
-    )
-    .await;
-    let task = propose(
-        &fixture,
-        valid_action.id,
-        valid_action.version,
-        "discovery-empty-scope-key",
-    )
-    .await
-    .expect("discovery with Task-local acceptance creates")
-    .task;
+    );
+    let task = propose(&fixture, valid_input.clone(), "discovery-empty-scope-key")
+        .await
+        .expect("discovery with Task-local acceptance creates")
+        .task;
     let error = fixture
         .task_service
         .update_task(

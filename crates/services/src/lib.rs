@@ -118,8 +118,8 @@ pub use coordination_consumer::{
 pub use coordination_service::{
     AgentActionService, AgentInboxService, ApproveActionInput, AskQuestionInput,
     CommitmentEvidenceInput, CommitmentService, CompleteCommitmentInput, CreateCommitmentInput,
-    DeliverInboxInput, ExecuteActionInput, ExecuteTaskProposalInput, ExecutedTaskProposal,
-    ProposeActionInput, TaskProposalPayload, TransferCommitmentInput, UpdateCommitmentInput,
+    DeliverInboxInput, ExecuteActionInput, ProposeActionInput, TaskProposalPayload,
+    TransferCommitmentInput, UpdateCommitmentInput,
 };
 pub use daemon_monitor::DaemonMonitor;
 pub use daemon_service::{
