@@ -626,6 +626,15 @@ cargo test -p api --test main daemon_connect::test_name
 cargo test -p api --test model_workflow test_name
 ```
 
+The large daemon and model targets mount topic modules from
+`tests/daemon_workspace_roundtrip/` and `tests/model_workflow/`. Their test
+paths add one topic segment; the model keeps its generator, state, invariant
+checker, runner and fixtures separate from its cases. The manual-review suite
+similarly mounts topics from `tests/suite/manual_review_and_comments/`.
+Happy-path cases retain their existing `happy_path::` paths, with shared
+fixtures in `tests/suite/happy_path/helpers.rs`. MCP unit-test topics and their
+shared fixtures live under `crates/mcp-server/src/tests/`.
+
 | Separate binary | Why it stays in its own process |
 | --- | --- |
 | `model_workflow` | Dominant model-sequence workload, task-local run caps and optional global tracing initialization |
