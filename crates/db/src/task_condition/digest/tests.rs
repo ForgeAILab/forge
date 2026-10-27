@@ -72,16 +72,24 @@ async fn write_results_and_frozen_receipts_keep_the_stored_cache_pair() {
         let frozen = serde_json::to_value(&returned).unwrap();
 
         for digest in [None, Some("stale-stored-digest")] {
-            sqlx::query("UPDATE task SET blocked_json=NULL,condition_digest=? WHERE id=?")
-                .bind(digest)
-                .bind(&before.id)
-                .execute(db.pool())
-                .await
-                .unwrap();
+            sqlx::query(
+                "UPDATE task SET blocked_json=NULL,condition_json=?,condition_digest=? WHERE id=?",
+            )
+            .bind(serde_json::to_string(&before.condition).unwrap())
+            .bind(digest)
+            .bind(&before.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
             let live = TaskRepo::get_by_id(&db, &before.id, false)
                 .await
                 .unwrap()
                 .unwrap();
+            assert_ne!(
+                live.condition, returned.condition,
+                "{writer}: live cache drifted"
+            );
+            assert_eq!(live.condition_digest.as_deref(), digest, "{writer}");
             let decoded: Task =
                 serde_json::from_value(serde_json::to_value(&live).unwrap()).unwrap();
             assert_eq!(decoded, live, "{writer}: preserve NULL or stale stamps");

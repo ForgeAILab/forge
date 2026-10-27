@@ -343,8 +343,9 @@ cursor encoding and response projection. Execution timing is fetched before
 ledger usage and decoded afterward; media rows are decoded one at a time before
 checksum reconciliation or response conversion, preserving read and error order.
 SQL/decode failures from these CLI runtime and Project media methods retain the
-existing `500 internal_error` response with `Project artifact mutation failed`; CLI runtime
-policy version conflicts retain their dedicated `cli_runtime.version_conflict`.
+existing `500 internal_error` response with `Project artifact mutation failed`;
+CLI runtime policy version conflicts retain their dedicated
+`cli_runtime.version_conflict`.
 Project artifact pages, Charter/Genesis lookups, context pointers and Overview
 read SQL live in `sqlite/orchestration/` and its `documents/reads.rs`,
 `decisions/reads.rs`, `charters/reads.rs` and `overview.rs` children. Routes retain
@@ -6014,10 +6015,12 @@ same statement or transaction. The digest is separate from the encoded cache,
 whose field order and bytes remain unchanged. No invalidation trigger reads the
 digest column, so stamping it cannot dirty scheduler rows or list revisions.
 Returned Tasks refresh both cache fields after the writer's final condition
-producer, including recovery receipts and execution admission. Private Task
-snapshots in mutation replies, command receipts and move results serialize the
-stored digest with the condition, so replay preserves the original pair even
-after the live row changes. Older snapshots without a digest retain NULL;
+producer, including recovery receipts and execution admission. Service claims
+reload the Task in the same transaction after resolving workspace Attention,
+which can clear the environment wait and update the condition/digest pair.
+Private Task snapshots in mutation replies, command receipts and move results
+serialize the stored digest with the condition, so replay preserves the original
+pair even after the live row changes. Older snapshots without a digest retain NULL;
 replay never guesses a digest from their channels or reads it from a newer row.
 REST and MCP Task representations use their public DTOs and omit this internal
 field. Historical migration replay before the digest column exists writes only
@@ -9711,10 +9714,11 @@ wait keeps an active slot and `ReviewNeedsOwner` a parked one. Active recovery
 precedes new admission; initial candidates keep priority, creation and ID
 order; only an admission from an initial state takes a Project slot.
 
-**Equivalence.** `task_dispatcher/tests/equivalence.rs` replays real rows
-through the dispatcher and compares the outcome with
-`fixtures/scheduler_equivalence_9d9b228f.txt`, recorded by running the same
-file on the base commit: dispatched or held, the target, every legacy field
+**Equivalence.** The `task_dispatcher/tests/equivalence.rs` module root and its
+children under `task_dispatcher/tests/equivalence/` replay real rows through
+the dispatcher and compare the outcome with
+`fixtures/scheduler_equivalence_9d9b228f.txt`, recorded by running the original
+harness on the base commit: dispatched or held, the target, every legacy field
 and every event, for a hundred Task shapes at startup and in steady state, a
 load test with a machine cap and a Project limit, failed-Review recovery and
 wakes. The only differences accepted are the fixture's `@`-lines, each naming
