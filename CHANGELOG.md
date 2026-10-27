@@ -116,6 +116,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Retrying a committed manual milestone check result or waiver with the same
+  idempotency key now returns the stored result instead of HTTP 500. New
+  results record the governing Charter revision and digest; results recorded
+  before this fix replay from their stored receipt. A retry with a changed
+  body still returns 409 `idempotency_conflict`.
 - Whether a Project capacity wait is "at capacity" or "waiting on owner" is
   now recorded as a typed field instead of being read from the message wording.
   Existing waits keep their classification.

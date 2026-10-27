@@ -788,6 +788,17 @@ or milestone with 400 `bad_request`. Manual result writes return 409
 check changes before its result is committed; either failure rolls back the
 result and its event.
 
+Exact retries of committed manual Pass/Fail results and waivers return the original
+200 response body, including its receipt ID and timestamps, without appending
+another result, Decision, or event. Reusing the key with a different body returns
+409 `idempotency_conflict`. Replay still requires Project access and compares the
+stored request and authorization provenance; it does not revalidate against a
+later Charter or milestone definition. New receipts capture the governing
+Charter revision ID and its content digest as internal policy provenance (in the
+manual result manifest, or both the waiver event and Decision). Older receipts
+that omit both policy fields remain authoritative and replay using their stored
+governing revisions and provenance. Replay does not backfill or change them.
+
 Milestone definition revisions use `draft`, `proposed`, `approved`, or
 `superseded`; milestone instances use `planned`, `active`, `ready_for_release`,
 `released`, or `cancelled`. Multiple milestones may be active and the
