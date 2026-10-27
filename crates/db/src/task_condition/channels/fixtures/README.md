@@ -40,7 +40,8 @@ The branch calls the unchanged lenient mapper for those cases. Non-text input is
 represented by the mapper's existing `non_text` boundary, including BLOB and
 invalid-UTF8 classifications; no strict channel decoder is involved.
 
-`provenance.tsv` maps every literal to its producer. The external generation
+`provenance.tsv` maps every `main-13bc2ae1.jsonl` literal to its producer;
+the sibling restore corpus has its provenance below. The external generation
 drivers, archive, source audit and command logs are retained with the gate's
 report. The archive widens test visibility and adds test-only clock/capture
 hooks; it does not replace the channel constructors or serialization code.

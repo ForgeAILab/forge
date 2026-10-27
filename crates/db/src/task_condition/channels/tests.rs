@@ -59,46 +59,75 @@ fn restored_shapes_keep_main_bytes_and_require_string_blocking_reasons() {
 
 #[test]
 fn every_corpus_annotation_has_exactly_one_field_set() {
-    let mut checked = 0;
-    for line in MAIN.lines().chain(RESTORED_MAIN.lines()) {
-        let sample: Sample = serde_json::from_str(line).unwrap();
-        if sample.channel != "annotation" {
-            continue;
+    // This guards the observed corpus field sets, not every possible input.
+    for corpus in [MAIN, RESTORED_MAIN] {
+        let mut checked = 0;
+        for line in corpus.lines() {
+            let sample: Sample = serde_json::from_str(line).unwrap();
+            if sample.channel != "annotation" {
+                continue;
+            }
+            let annotation: ErrorAnnotation = serde_json::from_str(&sample.raw).unwrap();
+            let fields = serde_json::to_value(&annotation.shape).unwrap();
+            macro_rules! accepts {
+                ($($shape:ty),+ $(,)?) => {
+                    [$(serde_json::from_value::<$shape>(fields.clone()).is_ok()),+]
+                };
+            }
+            let accepted = accepts![
+                BlockingAnnotation,
+                HoldAnnotation,
+                TimedBlockAnnotation,
+                RecoveryExecutionAnnotation,
+                RemoteCancelAnnotation,
+                MessageAnnotation,
+                ReasonAnnotation,
+                ReviewCandidateAnnotation,
+                ReviewParkAnnotation,
+                DetectedAnnotation,
+                DetectedStateAnnotation,
+                BudgetAnnotation,
+                StepFailureAnnotation,
+                PlacementRefusalAnnotation,
+                PlanWaitAnnotation,
+                UpgradeDispatchAnnotation,
+            ];
+            assert_eq!(
+                accepted.into_iter().filter(|accepted| *accepted).count(),
+                1,
+                "{} has an ambiguous field set",
+                sample.name
+            );
+            checked += 1;
         }
-        let annotation: ErrorAnnotation = serde_json::from_str(&sample.raw).unwrap();
-        let fields = serde_json::to_value(&annotation.shape).unwrap();
-        macro_rules! accepts {
-            ($($shape:ty),+ $(,)?) => {
-                [$(serde_json::from_value::<$shape>(fields.clone()).is_ok()),+]
-            };
-        }
-        let accepted = accepts![
-            BlockingAnnotation,
-            HoldAnnotation,
-            TimedBlockAnnotation,
-            RecoveryExecutionAnnotation,
-            RemoteCancelAnnotation,
-            MessageAnnotation,
-            ReasonAnnotation,
-            ReviewCandidateAnnotation,
-            ReviewParkAnnotation,
-            DetectedAnnotation,
-            DetectedStateAnnotation,
-            BudgetAnnotation,
-            StepFailureAnnotation,
-            PlacementRefusalAnnotation,
-            PlanWaitAnnotation,
-            UpgradeDispatchAnnotation,
-        ];
-        assert_eq!(
-            accepted.into_iter().filter(|accepted| *accepted).count(),
-            1,
-            "{} has an ambiguous field set",
-            sample.name
-        );
-        checked += 1;
+        assert!(checked > 0, "each corpus must contain annotations");
     }
-    assert_eq!(checked, 72);
+}
+
+#[test]
+fn placement_refusal_marker_shares_the_restore_annotation_shape() {
+    let sample = MAIN
+        .lines()
+        .map(|line| serde_json::from_str::<Sample>(line).unwrap())
+        .find(|sample| sample.channel == "placement_refusal")
+        .unwrap();
+    let mut marker: Value = serde_json::from_str(&sample.raw).unwrap();
+    assert!(!marker["annotation"]
+        .as_object()
+        .unwrap()
+        .contains_key("blocking_reason"));
+    marker["annotation"]["blocking_reason"] = "restored reason".into();
+    let ConditionMetadataValue::PlacementRefusal(decoded) =
+        ConditionMetadataValue::decode("placement_refusal", &marker.to_string()).unwrap()
+    else {
+        panic!("placement_refusal must select its own metadata codec");
+    };
+    assert_eq!(
+        decoded.annotation.blocking_reason.as_deref(),
+        Some("restored reason")
+    );
+    marker["annotation"]["blocking_reason"] = Value::Null;
+    assert!(ConditionMetadataValue::decode("placement_refusal", &marker.to_string()).is_err());
 }
 
 #[test]
