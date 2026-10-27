@@ -416,7 +416,7 @@ async fn typed_reset_matches_archived_main_for_every_shape_and_second_write() {
     assert_writer_cases("reset", visited);
 }
 
-use crate::worker_runtime::queue::writer_parity::case;
+use crate::recovery::test_support::writer_fixture::case;
 
 #[tokio::test]
 async fn owner_recovery() {

@@ -1,4 +1,4 @@
-use crate::worker_runtime::queue::writer_parity::case;
+use crate::recovery::test_support::writer_fixture::case;
 
 #[tokio::test]
 async fn service_hook() {
@@ -8,7 +8,7 @@ async fn service_hook() {
             "in_progress",
             f,
             {
-                let mut failure = crate::worker_runtime::queue::writer_parity::hook_failure();
+                let mut failure = crate::recovery::test_support::writer_fixture::hook_failure();
                 failure.timed_out = timeout;
                 f.ctx
                     .task_service

@@ -45,12 +45,19 @@ green while its push is red or pending.
 The file-size check scans tracked `crates/**/*.rs` and `web/**/*.{ts,tsx}` files,
 excluding generated bindings and `node_modules`, `target` and `dist` directories.
 Caps are 2,000 lines for Rust and 1,000 for TS/TSX (counted like `wc -l`).
-Existing larger files have exact limits in `scripts/file-size-allowlist.txt`.
-Growth fails; shrinking or deleting a listed file also fails until
-`python3 scripts/check-file-sizes.py --update` lowers or removes its entry. That
+The allowlist in `scripts/file-size-allowlist.txt` has no remaining entries.
+Files above the caps fail. For any historical allowlist entry, growth fails;
+shrinking or deleting its file also fails until
+`python3 scripts/check-file-sizes.py --update` lowers or removes the entry. That
 command never adds or raises a limit. Split by responsibility instead of
 expanding the allowlist; `--init` is for maintainers only, to create the
 one-time baseline.
+
+Dispatcher, task-condition, and native-scope-composition tests use topic modules
+beside their original module roots, with shared fixtures in helper modules.
+Existing dispatcher child modules, generated equivalence case groups, and
+ignored task-condition measurement filters retain their paths. Other moved
+tests gain one topic segment; crate targets and CI shard filters stay the same.
 
 The matrix sets `fail-fast: false` and every shard keeps `--no-fail-fast`, so
 one red run still lists every failure.
@@ -118,17 +125,23 @@ future lease, avoiding a real-time deadline and mixed RFC3339 text ordering.
 SQL trigger timestamps remain outside these compared fields; they are not
 rewritten by the harness. Production builds keep the wall clock unchanged.
 
-The additional condition writers use the shared
+The additional condition writers and the `writer_parity_tests` modules use one
 `recovery/test_support/writer_fixture.rs` harness for setup, stored-row snapshots,
-a following metadata write, and queue overlays. Its expected fingerprints live in
-`recovery/test_support/writer_fixture/fixtures/main-94609411.jsonl`; the budget
-writer keeps raw snapshots in `db/src/budget/fixtures/main-94609411.jsonl`.
-Each corpus has one provenance row per case with archived-main writer locations.
-Snapshot options explicitly name wall-clock fields to normalize and whether to
-read offers through the Task's workflow. Both service harnesses share ID
-normalization, byte fingerprints, and canonical Attention incident digests.
-Expected records must come from the harness running against the archived main
-source, never from the branch being checked.
+a following metadata write, queue overlays, and archived-main assertions. Both
+corpora live in `recovery/test_support/writer_fixture/fixtures/`:
+`main-94609411.jsonl` fingerprints each field, including operation text and
+canonical Attention incident digests; `writer-main-94609411.jsonl` compares the
+six stored columns verbatim and hashes the read/public/offers/event projections.
+The two raw merge-annotation records retain exact strings. Explicit comparison
+profiles preserve each corpus's identity normalization and phase names; clock
+options preserve caller sequences, named wall-clock substitutions, and the
+existing plan-wait event-digest omission. Workflow offers remain an explicit
+option. The [fixture README](../crates/services/src/recovery/test_support/writer_fixture/fixtures/README.md)
+lists every option and its callers, corpus provenance, and regeneration steps.
+Expected records must come only from archived main
+`9460941117b4e326c5f090c0e8f48b8f8d142c25`, never from the branch being checked.
+The budget writer separately keeps raw snapshots and per-case provenance in
+`db/src/budget/fixtures/main-94609411.jsonl` and its `provenance.tsv`.
 
 ### DB unit-test layout
 

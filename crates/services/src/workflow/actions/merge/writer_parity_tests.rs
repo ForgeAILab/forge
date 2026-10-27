@@ -1,19 +1,26 @@
+use crate::recovery::test_support::writer_fixture::{
+    assert_main_parity, ClockMode, Comparison, Fixture,
+};
+use serde_json::json;
+
 #[tokio::test]
 async fn merge_annotations() {
     let _clock = db::test_clock::freeze("2026-10-25T00:00:00.123456+00:00".parse().unwrap());
-    crate::worker_runtime::queue::writer_parity::assert_main_parity(
+    assert_main_parity(
         "merge-budget/raw",
-        &super::merge_budget_annotation("exhausted"),
+        &json!(super::merge_budget_annotation("exhausted")),
+        Comparison::VerbatimWithProjectionHash,
     );
-    let f = crate::worker_runtime::queue::writer_parity::Fixture::new("merging").await;
-    crate::worker_runtime::queue::writer_parity::assert_main_parity(
+    let f = Fixture::with_clock("merging", ClockMode::PreserveCaller).await;
+    assert_main_parity(
         "manual-merge/raw",
-        &super::manual_merge_recovery_annotation(
+        &json!(super::manual_merge_recovery_annotation(
             &f.ctx,
             api_types::FailureKind::MergeConflict,
             "recover",
             "user",
-        ),
+        )),
+        Comparison::VerbatimWithProjectionHash,
     );
 }
 
@@ -23,7 +30,7 @@ async fn merge_failure_stores_annotations() {
         api_types::FailureKind::MergeConflict,
         api_types::FailureKind::CiFailed,
     ] {
-        crate::worker_runtime::queue::writer_parity::case!(
+        crate::recovery::test_support::writer_fixture::case!(
             &format!("merge-failure-{kind}"),
             "merging",
             f,
