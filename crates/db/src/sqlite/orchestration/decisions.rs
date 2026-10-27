@@ -198,6 +198,11 @@ impl ProjectDecisionCommandSourceRow {
     pub fn charter_revision_id(&self) -> crate::Result<Option<String>> {
         Ok(self.row.try_get("charter_revision_id")?)
     }
+    pub fn required_charter_revision_id(&self) -> crate::Result<String> {
+        // Waiver replay preserves the original String decode, including NULL
+        // handling and the String type in SQLx decoding errors.
+        Ok(self.row.try_get("charter_revision_id")?)
+    }
     pub fn source_refs_json(&self) -> crate::Result<String> {
         Ok(self.row.try_get("source_refs_json")?)
     }
@@ -1403,4 +1408,54 @@ pub(super) async fn list_effective_project_decisions(
 }
 
 mod reads;
+#[cfg(test)]
+mod tests;
 pub use reads::{ProjectDecisionCandidateRead, ProjectDecisionRead};
+
+pub struct InsertMilestoneWaiverDecisionInput<'a> {
+    pub waiver_id: &'a str,
+    pub project_id: &'a str,
+    pub check_id: &'a str,
+    pub reason: &'a str,
+    pub user_id: &'a str,
+    pub authorization_basis: &'a str,
+    pub authorization_action: &'a str,
+    pub explicit_event: &'a str,
+    pub authorization_occurred_at: &'a str,
+    pub charter_revision_id: &'a str,
+    pub affected_records_json: &'a str,
+    pub created_at: &'a str,
+}
+
+impl SqliteDb {
+    pub async fn insert_milestone_waiver_decision_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        input: InsertMilestoneWaiverDecisionInput<'_>,
+    ) -> Result<()> {
+        sqlx::query(
+        "INSERT INTO project_decision (
+            id, project_id, state, decision_class, question, context_json,
+            selected_outcome, rationale, principal_type, principal_id,
+            authority_basis, authorization_action, explicit_event,
+            authorization_occurred_at, charter_revision_id,
+            source_refs_json, affected_records_json, created_at
+         ) VALUES (?, ?, 'active', 'waiver', ?, '{}', 'waived', ?, 'user', ?, ?, ?, ?, ?, ?, '[]', ?, ?)",
+    )
+    .bind(input.waiver_id)
+    .bind(input.project_id)
+    .bind(format!("Waive milestone check {}", input.check_id))
+    .bind(input.reason)
+    .bind(input.user_id)
+    .bind(input.authorization_basis)
+    .bind(input.authorization_action)
+    .bind(input.explicit_event)
+    .bind(input.authorization_occurred_at)
+    .bind(input.charter_revision_id)
+    .bind(input.affected_records_json)
+    .bind(input.created_at)
+    .execute(connection)
+    .await?;
+        Ok(())
+    }
+}

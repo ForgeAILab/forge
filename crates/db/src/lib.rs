@@ -449,3 +449,9 @@ pub use sqlite::{
 pub use sqlite::{ProjectDocumentIdRead, ProjectDocumentRevisionRead};
 
 pub use sqlite::{ProjectDecisionCandidateRead, ProjectDecisionRead};
+
+pub use sqlite::{
+    InsertMilestoneWaiverDecisionInput, MaterializeMilestoneCheckInput,
+    MaterializeMilestoneCheckOutcome, MilestoneCheckTargetRead, MilestoneDefinitionTransitionRead,
+    MilestoneManualResultRead, ProjectMilestoneIdRead, TransitionMilestoneLifecycleInput,
+};

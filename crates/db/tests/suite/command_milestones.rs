@@ -12,6 +12,9 @@ use std::{
 const PROJECT_ID: &str = "milestone-command-project";
 const NOW: &str = "2026-08-20T00:00:00.000Z";
 
+#[path = "command_milestones/route_persistence.rs"]
+mod route_persistence;
+
 async fn database() -> SqliteDb {
     let pool = create_sqlite_pool("sqlite::memory:").await.expect("pool");
     run_migrations(&pool).await.expect("migrations");

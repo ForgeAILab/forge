@@ -25,7 +25,7 @@ use db::{new_uuid_v4, now_rfc3339, CreateDomainEvent, DomainEventRepo};
 use serde::Deserialize;
 use serde_json::json;
 use services::MilestoneRuntime;
-use sqlx::{Row, Sqlite, Transaction};
+use sqlx::{Sqlite, Transaction};
 use uuid::Uuid;
 
 use crate::{
@@ -142,40 +142,24 @@ pub async fn list_milestones_with_query(
     .await?;
     let limit = bounded_limit(query.limit);
     let cursor = decode_cursor(query.cursor.as_deref())?;
-    let rows = if let Some((sequence, id)) = cursor.as_ref() {
-        let sequence = sequence
-            .parse::<i64>()
-            .map_err(|_| ApiError::bad_request("invalid cursor"))?;
-        sqlx::query(
-            "SELECT id
-             FROM project_milestone
-             WHERE project_id = ?
-               AND (milestone_sequence > ? OR (milestone_sequence = ? AND id > ?))
-             ORDER BY milestone_sequence ASC, id ASC LIMIT ?",
-        )
-        .bind(&project_id)
-        .bind(sequence)
-        .bind(sequence)
-        .bind(id)
-        .bind(limit + 1)
-        .fetch_all(state.db.pool())
-        .await?
-    } else {
-        sqlx::query(
-            "SELECT id FROM project_milestone
-             WHERE project_id = ?
-             ORDER BY milestone_sequence ASC, id ASC LIMIT ?",
-        )
-        .bind(&project_id)
-        .bind(limit + 1)
-        .fetch_all(state.db.pool())
-        .await?
-    };
+    let cursor = cursor
+        .map(|(sequence, id)| {
+            sequence
+                .parse::<i64>()
+                .map(|sequence| (sequence, id))
+                .map_err(|_| ApiError::bad_request("invalid cursor"))
+        })
+        .transpose()?;
+    let rows = state
+        .db
+        .project_milestone_id_page(&project_id, cursor, limit)
+        .await
+        .map_err(ApiError::project_artifact_mutation)?;
     let has_more = rows.len() > limit as usize;
     let runtime = MilestoneRuntime::new(state.db.clone());
     let mut items = Vec::with_capacity(rows.len().min(limit as usize));
     for row in rows.into_iter().take(limit as usize) {
-        let milestone_id: String = row.try_get("id")?;
+        let milestone_id = row.id().map_err(ApiError::project_artifact_mutation)?;
         // `get` already tolerates an unset definition pointer by falling
         // back to the latest revision; a `None` here means the milestone has
         // no revision at all, which `MilestoneRuntime` already warned about.
@@ -288,37 +272,36 @@ pub async fn transition_milestone(
         return Ok(Json(milestone));
     }
     let mut tx = db::begin_immediate(state.db.pool()).await?;
-    let locked = sqlx::query(
-        "UPDATE project_milestone SET version = version
-         WHERE id = ? AND project_id = ? AND version = ?",
-    )
-    .bind(&milestone_id)
-    .bind(&project_id)
-    .bind(request.mutation.expected_version)
-    .execute(&mut *tx)
-    .await?;
-    if locked.rows_affected() != 1 {
+    let locked = state
+        .db
+        .lock_milestone_version_in_tx(
+            &mut tx,
+            &milestone_id,
+            &project_id,
+            request.mutation.expected_version,
+        )
+        .await
+        .map_err(ApiError::project_artifact_mutation)?;
+    if locked != 1 {
         return Err(ApiError::conflict_with_code(
             "version_conflict",
             "the milestone changed before its lifecycle transition",
         ));
     }
-    let row =
-        sqlx::query("SELECT lifecycle FROM project_milestone WHERE id = ? AND project_id = ?")
-            .bind(&milestone_id)
-            .bind(&project_id)
-            .fetch_one(&mut *tx)
-            .await?;
-    let current_name: String = row.try_get("lifecycle")?;
+    let current_name = state
+        .db
+        .milestone_lifecycle_in_tx(&mut tx, &milestone_id, &project_id)
+        .await
+        .map_err(ApiError::project_artifact_mutation)?;
     let current = parse_milestone_lifecycle(&current_name)?;
     services::validate_milestone_transition(current, request.lifecycle)
         .map_err(|error| ApiError::conflict_with_code("invalid_transition", error.to_string()))?;
     if request.lifecycle == MilestoneLifecycle::Cancelled {
-        let primary: Option<String> =
-            sqlx::query_scalar("SELECT primary_milestone_id FROM project WHERE id = ?")
-                .bind(&project_id)
-                .fetch_one(&mut *tx)
-                .await?;
+        let primary = state
+            .db
+            .primary_milestone_id_in_tx(&mut tx, &project_id)
+            .await
+            .map_err(ApiError::project_artifact_mutation)?;
         if primary.as_deref() == Some(milestone_id.as_str()) {
             return Err(ApiError::conflict_with_code(
                 "primary_milestone_required",
@@ -327,28 +310,27 @@ pub async fn transition_milestone(
         }
     }
     let updated_at = now_rfc3339();
-    let updated = sqlx::query(
-        "UPDATE project_milestone SET lifecycle = ?, version = version + 1, updated_at = ?
-         WHERE id = ? AND project_id = ? AND version = ? AND lifecycle = ?",
-    )
-    .bind(milestone_lifecycle_name(request.lifecycle))
-    .bind(&updated_at)
-    .bind(&milestone_id)
-    .bind(&project_id)
-    .bind(request.mutation.expected_version)
-    .bind(&current_name)
-    .execute(&mut *tx)
-    .await?;
-    if updated.rows_affected() != 1 {
-        return Err(ApiError::conflict_with_code(
-            "version_conflict",
-            "the milestone changed before its lifecycle transition",
-        ));
-    }
-    // The primary pointer is an explicit Project invariant. Delivery keeps
-    // pointing at the emphasized milestone; only removal from the intended
-    // outcome set may repair it.
-    repair_primary_pointer_in_tx(&mut tx, &project_id, &milestone_id).await?;
+    state
+        .db
+        .transition_milestone_lifecycle_in_tx(
+            &mut tx,
+            db::TransitionMilestoneLifecycleInput {
+                project_id: &project_id,
+                milestone_id: &milestone_id,
+                expected_version: request.mutation.expected_version,
+                from_lifecycle: &current_name,
+                lifecycle: milestone_lifecycle_name(request.lifecycle),
+                updated_at: &updated_at,
+            },
+        )
+        .await
+        .map_err(|error| match error {
+            db::DbError::VersionConflict => ApiError::conflict_with_code(
+                "version_conflict",
+                "the milestone changed before its lifecycle transition",
+            ),
+            error => ApiError::project_artifact_mutation(error),
+        })?;
     let event_id = new_uuid_v4();
     let event_inserted = append_milestone_event_in_tx(
         &state,
@@ -712,54 +694,6 @@ async fn append_milestone_event_in_tx(
     .await
     .map_err(ApiError::from)?;
     Ok(event.id == event_id)
-}
-
-async fn repair_primary_pointer_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
-    project_id: &str,
-    changed_milestone_id: &str,
-) -> ApiResult<()> {
-    let primary: Option<String> =
-        sqlx::query_scalar("SELECT primary_milestone_id FROM project WHERE id = ?")
-            .bind(project_id)
-            .fetch_one(&mut **tx)
-            .await?;
-    if primary.as_deref() != Some(changed_milestone_id) {
-        return Ok(());
-    }
-    let lifecycle: String = sqlx::query_scalar(
-        "SELECT lifecycle FROM project_milestone WHERE id = ? AND project_id = ?",
-    )
-    .bind(changed_milestone_id)
-    .bind(project_id)
-    .fetch_one(&mut **tx)
-    .await?;
-    if matches!(
-        lifecycle.as_str(),
-        "planned" | "active" | "ready_for_release" | "released"
-    ) {
-        return Ok(());
-    }
-    let replacement: Option<String> = sqlx::query_scalar(
-        "SELECT id FROM project_milestone
-         WHERE project_id = ? AND lifecycle = 'active' AND id != ?
-         ORDER BY milestone_sequence ASC, id ASC LIMIT 1",
-    )
-    .bind(project_id)
-    .bind(changed_milestone_id)
-    .fetch_optional(&mut **tx)
-    .await?;
-    sqlx::query(
-        "UPDATE project SET primary_milestone_id = ?, version = version + 1,
-         updated_at = ? WHERE id = ? AND primary_milestone_id = ?",
-    )
-    .bind(replacement)
-    .bind(now_rfc3339())
-    .bind(project_id)
-    .bind(changed_milestone_id)
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
 }
 
 fn milestone_lifecycle_name(value: MilestoneLifecycle) -> &'static str {
