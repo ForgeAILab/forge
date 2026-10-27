@@ -18,8 +18,9 @@
 //! ("quiescence"), and every coder execution waits on a gate that only a model
 //! action opens.
 //!
-//! The default run is deterministic: the fixed seeds and the corpus below,
-//! nothing drawn from the clock, so it cannot turn an unrelated change red.
+//! The default run is deterministic: fixed seeds from `model_workflow/generator.rs`
+//! and regression cases in `model_workflow/liveness_cases.rs`, with nothing drawn
+//! from the clock, so it cannot turn an unrelated change red.
 //! Random seeds are drawn only when `FORGE_MODEL_CASES=<n>` (n > 0) asks for
 //! them; every seed is printed. Reproduce one case with
 //! `FORGE_MODEL_SEED=<n>` (a comma list runs several). `FORGE_MODEL_LONG=1`

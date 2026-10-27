@@ -487,8 +487,6 @@ async fn a_project_resume_puts_its_waiting_merges_back_in_line_at_once() {
     assert_eq!(world.merges("t").await, 1);
 }
 
-// ----- the reconciler (B) -------------------------------------------------
-
 /// Manual approve authority in the merge state. The owner approves a Task
 /// that is held in `merging`: where the Task offers `approve`, performing it
 /// declares the Task done with nothing merged (the owner's override, as

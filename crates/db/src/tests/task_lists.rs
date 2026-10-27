@@ -774,3 +774,37 @@ async fn task_list_orders_equal_board_positions_by_created_at() {
     assert_eq!(page.items[0].id, earlier.id);
     assert_eq!(page.items[1].id, later.id);
 }
+
+async fn seed_ordered_task(
+    db: &SqliteDb,
+    project_id: &str,
+    parent_task_id: Option<&str>,
+    subtask_order: Option<i64>,
+    title: &str,
+    created_at: &str,
+) -> Task {
+    TaskRepo::create(
+        db,
+        CreateTask {
+            id: new_uuid_v4(),
+            project_id: project_id.to_owned(),
+            parent_task_id: parent_task_id.map(str::to_owned),
+            subtask_order,
+            assignee_type: None,
+            assignee_id: None,
+            title: title.to_owned(),
+            description: None,
+            task_type: "task".to_owned(),
+            status: "todo".to_owned(),
+            is_automation: false,
+            priority: 0,
+            task_state_config: None,
+            merge_config: None,
+            plan: None,
+            created_at: created_at.to_owned(),
+            updated_at: created_at.to_owned(),
+        },
+    )
+    .await
+    .expect("ordered task creates")
+}

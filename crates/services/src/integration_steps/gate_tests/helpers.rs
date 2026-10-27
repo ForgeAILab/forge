@@ -300,8 +300,6 @@ pub(super) async fn merged_as(world: &World, task: &str, status: &str, productio
     let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
 }
 
-// ----- a stopped rebase, and the paused-integration marker (E) -------------
-
 pub(super) fn retry_action() -> TaskAction {
     TaskAction::Retry {
         reason: None,
