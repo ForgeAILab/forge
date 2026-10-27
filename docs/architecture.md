@@ -5952,6 +5952,11 @@ Timestamp strings retain their spelling. Copied snapshots keep their original
 channel strings and JSON values without write-time byte or depth limits; strict
 new-value decoding limits copied JSON to 32 container levels.
 
+Service writer parity uses the single
+`crates/services/src/recovery/test_support/writer_fixture.rs` harness; its two
+archived-main corpora and normalization options are documented in the
+[fixture README](../crates/services/src/recovery/test_support/writer_fixture/fixtures/README.md).
+
 **Channel digest.** The nullable `task.condition_digest` column stores a SHA-256 over length-framed
 member names, value tags and raw stored bytes. SQL NULL/missing, JSON null,
 present text and non-text bytes have distinct tags. The four channels are hashed

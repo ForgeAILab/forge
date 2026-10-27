@@ -1768,6 +1768,20 @@ impl TaskStepWorker {
             .await
     }
 
+    #[cfg(test)]
+    pub(crate) async fn write_annotation_for_test_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        step: &TaskStep,
+        task: &mut db::Task,
+        status: &str,
+        kind: api_types::FailureKind,
+        error: Option<&str>,
+    ) -> Result<()> {
+        self.write_annotation_in_tx(tx, step, task, status, kind, error)
+            .await
+    }
+
     async fn write_annotation_in_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
@@ -1969,6 +1983,3 @@ pub(crate) mod condition_tests;
 
 #[cfg(test)]
 mod workflow_loop_tests;
-
-#[cfg(test)]
-pub(crate) mod writer_parity;

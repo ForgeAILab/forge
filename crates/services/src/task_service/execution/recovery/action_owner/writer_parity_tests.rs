@@ -1,4 +1,4 @@
-use crate::worker_runtime::queue::writer_parity::case;
+use crate::recovery::test_support::writer_fixture::case;
 
 #[test]
 fn restored_shapes_use_typed_path_and_match_main_bytes() {
@@ -9,15 +9,16 @@ fn restored_shapes_use_typed_path_and_match_main_bytes() {
         "plan-wait",
         "dispatch-upgrade",
     ] {
-        let raw = crate::worker_runtime::queue::writer_parity::channel_sample(sample);
+        let raw = crate::recovery::test_support::writer_fixture::channel_sample(sample);
         serde_json::from_str::<super::channels::ErrorAnnotation>(&raw)
             .expect("saved annotation has a strict shape");
-        let expected =
-            include_str!("../../../../worker_runtime/queue/fixtures/writer-main-94609411.jsonl")
-                .lines()
-                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-                .find(|record| record["name"] == format!("restore-{sample}/first"))
-                .unwrap();
+        let expected = include_str!(
+            "../../../../recovery/test_support/writer_fixture/fixtures/writer-main-94609411.jsonl"
+        )
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|record| record["name"] == format!("restore-{sample}/first"))
+        .unwrap();
         let expected: serde_json::Value =
             serde_json::from_str(expected["raw"].as_str().unwrap()).unwrap();
         let expected = expected["annotation"].as_str().unwrap();
@@ -138,7 +139,7 @@ async fn restored_condition() {
                     "{\"type\":\"unknown\",\"recovery_actions\":[\"historical\"],\"extra\":true}"
                         .into()
                 } else {
-                    crate::worker_runtime::queue::writer_parity::channel_sample(sample)
+                    crate::recovery::test_support::writer_fixture::channel_sample(sample)
                 };
                 serde_json::json!({"id":"queued","error_annotation":annotation,"blocked_json":"{\"kind\":\"manual_stop\",\"reason\":\"saved\",\"created_at\":\"old\"}"})
             };
@@ -184,7 +185,7 @@ async fn restored_condition_variants() {
         case!(&format!("restore-variant-{sample}"), "in_progress", f, {
             let failed = sample.starts_with("failed");
             let annotation =
-                crate::worker_runtime::queue::writer_parity::channel_sample(if failed {
+                crate::recovery::test_support::writer_fixture::channel_sample(if failed {
                     "executor"
                 } else {
                     sample
