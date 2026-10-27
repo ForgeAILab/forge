@@ -367,3 +367,42 @@ async fn identity_migration_carries_stage_a_rows_and_their_result_links() {
     assert_eq!(rows(&db, "check_consumer").await, 2);
     db.pool().close().await;
 }
+
+/// A certified reusable pass for `identity()`, then a request that differs
+/// only by `change`: it must neither reuse that result nor join a live run.
+async fn assert_never_shared(change: fn(&mut CheckRunIdentity)) {
+    let db = fixture().await;
+    let result = complete(
+        &db,
+        request("one"),
+        CheckResultOutcome::Pass,
+        CheckCleanup::Success,
+    )
+    .await;
+    assert!(result.certified && result.cacheable);
+    let mut changed = request("two");
+    change(&mut changed.identity);
+    let other = changed.identity.clone();
+    assert!(db.reusable_check_result(&other).await.unwrap().is_none());
+    let scheduled = db.request_check_run(changed).await.unwrap();
+    assert!(matches!(
+        scheduled.disposition,
+        CheckRequestDisposition::Scheduled
+    ));
+    assert_eq!(scheduled.consumer.result_id, None);
+    assert_ne!(
+        scheduled.consumer.run_id.as_deref(),
+        Some(result.run_id.as_str())
+    );
+    // While that second run is live, the original identity does not join it.
+    let original = db.request_check_run(request("three")).await.unwrap();
+    assert!(matches!(
+        original.disposition,
+        CheckRequestDisposition::Reused
+    ));
+    assert_eq!(
+        db.find_live_check_run(&other).await.unwrap().unwrap().id,
+        scheduled.consumer.run_id.unwrap()
+    );
+    assert!(db.find_live_check_run(&identity()).await.unwrap().is_none());
+}

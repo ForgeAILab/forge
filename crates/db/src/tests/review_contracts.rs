@@ -555,3 +555,57 @@ async fn review_frozen_long_form_assessment_refuses_changed_content() {
         assert_eq!(stored, historical, "changed {field} rewrote the frozen row");
     }
 }
+
+async fn assert_review_digest_integrates(db: &SqliteDb, task_id: &str) {
+    let guard = db.lock_review_integration(task_id).await.unwrap();
+    assert!(guard.contract.is_some(), "must check automated authority");
+    guard.release().await.unwrap();
+}
+
+async fn long_form_review_assessment() -> (SqliteDb, api_types::ReviewConformance, String) {
+    let (db, _, _, mut contract) = seed_review_digest_contract(2).await;
+    let now = now_rfc3339();
+    contract.execution_id = new_uuid_v4();
+    contract.digest = String::new();
+    contract.digest = api_types::canonical_digest(&contract).unwrap();
+    sqlx::query("INSERT INTO execution(id,task_id,role,status,created_at,updated_at) VALUES(?,?,'reviewer','completed',?,?)")
+        .bind(&contract.execution_id).bind(&contract.context.task_id).bind(&now).bind(&now)
+        .execute(db.pool()).await.unwrap();
+    sqlx::query("INSERT INTO execution_review_contract VALUES(?,?,?,?,?,?)")
+        .bind(&contract.execution_id)
+        .bind(&contract.context.task_id)
+        .bind(&contract.digest)
+        .bind(&contract.context.source_digest)
+        .bind(serde_json::to_string(&contract).unwrap())
+        .bind(&now)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let assessment = api_types::ReviewConformance {
+        status: api_types::ConformanceStatus::Failed,
+        contract: Some(contract.clone()),
+        assessment: Some(api_types::ReviewAssessment {
+            result: api_types::ReviewResult::Fail,
+            reason: "missing test".into(),
+            report: "## Review\n\nNo test.".into(),
+            fixable_by: api_types::FixableBy::Coder,
+            repeat: false,
+            findings: Vec::new(),
+            resolved: Vec::new(),
+        }),
+        checks: Vec::new(),
+        reason: Some("missing test".into()),
+    };
+    let mut historical = serde_json::to_value(&assessment).unwrap();
+    historical["assessment"]["fixable_by"] = serde_json::json!("coder");
+    historical["assessment"]["repeat"] = serde_json::json!(false);
+    let historical = serde_json::to_string_pretty(&historical).unwrap();
+    sqlx::query("INSERT INTO execution_review_assessment VALUES(?,?,?)")
+        .bind(&contract.execution_id)
+        .bind(&historical)
+        .bind(&now)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    (db, assessment, historical)
+}

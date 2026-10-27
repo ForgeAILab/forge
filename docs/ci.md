@@ -130,6 +130,8 @@ normalization, byte fingerprints, and canonical Attention incident digests.
 Expected records must come from the harness running against the archived main
 source, never from the branch being checked.
 
+### DB unit-test layout
+
 The DB unit-test roots `src/tests.rs` and `src/check_run/tests.rs` register
 sibling topic modules under `src/tests/` and `src/check_run/tests/`.
 Shared fixtures live in each directory's `helpers.rs`, which registers no tests.
@@ -172,7 +174,7 @@ What replaced it:
   `required-features` in `Cargo.toml` and are built with the feature:
 
   ```bash
-  cargo test -p services --features test-support --test main attention_service::test_name
+  cargo test -p services-agents --features test-support --test main attention_service::test_name
   cargo test -p services --features test-support --test '*'   # both targets
   cargo test -p services-agents --features test-support --test main native_chat_tool_exchanges::test_name
   cargo test -p db --features test-template --test main file_backed_migration::<topic>::test_name
@@ -587,13 +589,14 @@ For focused integration work, use the original file stem as a module filter:
 
 ```bash
 cargo test -p db --features test-template --test main file_backed_migration::<topic>::test_name
-cargo test -p services --features test-support --test main attention_service::test_name
+cargo test -p services-agents --features test-support --test main attention_service::test_name
 cargo test -p api --test main happy_path::test_name
 cargo test -p services --features test-support --test project_provisioning_characterization test_name
 ```
 
-The `--features` argument is required for the `services` and `db` integration
-targets; see [Test features and required-features](#test-features-and-required-features).
+The `--features` argument is required for the `services`, `services-agents`, and
+`db` integration targets; see
+[Test features and required-features](#test-features-and-required-features).
 
 Large test modules keep their original target and module filter, with one topic
 segment added to individual test paths. File-backed migrations, integration
@@ -607,6 +610,11 @@ Workflow engine and action unit tests also use this layout, as do the
 and `direct_command_classification`. Their integration target remains `main`;
 the module filters still select every topic, and individual test paths gain
 one topic segment. Existing workflow engine child modules retain their paths.
+
+The integration-step send-back cases use
+`integration_steps::tests::send_back_cases::<test>` (previously
+`integration_steps::tests::send_back::<test>`). The `integration_steps::`
+filter still selects all of them.
 
 To prove a consolidation preserves tests, record combined stdout and stderr
 before moving files, repeat after the change, and compare the names. The
@@ -645,10 +653,12 @@ The large daemon and model targets mount topic modules from
 `tests/daemon_workspace_roundtrip/` and `tests/model_workflow/`. Their test
 paths add one topic segment; the model keeps its generator, state, invariant
 checker, runner and fixtures separate from its cases. The manual-review suite
-similarly mounts topics from `tests/suite/manual_review_and_comments/`.
+similarly mounts topics from `tests/suite/manual_review_and_comments/`, adding
+one topic segment to its test paths.
 Happy-path cases retain their existing `happy_path::` paths, with shared
 fixtures in `tests/suite/happy_path/helpers.rs`. MCP unit-test topics and their
-shared fixtures live under `crates/mcp-server/src/tests/`.
+shared fixtures live under `crates/mcp-server/src/tests/`; those test paths also
+gain one topic segment.
 
 | Separate binary | Why it stays in its own process |
 | --- | --- |
