@@ -9,6 +9,7 @@ pub mod bounded_file;
 pub mod chat_notices;
 pub mod check_runner;
 pub mod command_boundary;
+mod condition_metadata;
 pub mod coordination_consumer;
 pub mod coordination_service;
 pub mod daemon_monitor;

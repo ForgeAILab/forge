@@ -1,0 +1,6 @@
+# Main writer parity fixture
+
+Baseline: main `94609411`; generator: the archived-main services writer harness (`writer_parity.rs` and each writer’s parity cases), with a test-only JSONL capture in `assert_main_parity`.
+Regenerate only in archived main: install the harness without changing production writers, retain main’s `Value` input for executor attempts, set `FORGE_WRITER_ORACLE_OUT` in the capture hook, and run the parity cases plus `queue_channels_and_overlays` with `--test-threads=1`; sort the resulting records by `name` into `writer-main-94609411.jsonl`. The preparation script and command log are retained with the gate review report in `31g2a2/`.
+Each snapshot keeps `annotation` (`error_annotation`), `blocked` (`blocked_json`), `failed` (`failed_json`), `barrier` (`entry_barrier_json`), `metadata` (`metadata_json`) and `condition` (`condition_json`) as exact strings, including their original member order, nulls and escaping. UUID normalization and the two caller-supplied clock normalizers are unchanged.
+`projection_sha256` hashes the compact, recursively key-sorted JSON object containing `read`, `public`, `offers` and `event_digest`; plan-wait omits its uncontrolled event digest as before. The two `/raw` records retain exact annotation strings. The branch harness only asserts against this fixture and cannot regenerate it.

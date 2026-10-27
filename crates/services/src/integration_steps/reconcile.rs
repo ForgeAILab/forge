@@ -13,9 +13,9 @@
 //! owner-visible condition with an offered action. There is no third state.
 use super::admission;
 use crate::{integration_worker::IntegrationEnqueuePort, Result, ServiceError};
+use db::task_condition::channels;
 use db::{IntegrationAttemptState as S, IntegrationQueueRepo, TaskRepo};
 
-use db::task_condition::channels;
 /// The state of `workflow` whose entry admits to the integration queue: the
 /// role a state has by carrying the `run_merge` entry hook, whatever its
 /// name. Nothing in the queue keys on the names of the default workflow.
@@ -858,4 +858,4 @@ pub(crate) fn counts_toward_merge_sweep_bound(error: &crate::ServiceError) -> bo
 }
 
 #[cfg(test)]
-mod lane_condition_tests;
+mod writer_parity_tests;

@@ -146,7 +146,7 @@ impl TaskService {
                 plan: None,
                 error_annotation: Some(None),
                 blocked_json: Some(None),
-                failed_json: Some(Some(failed_meta.to_string())),
+                failed_json: Some(Some(failed_meta)),
                 task_state_config: None,
                 parent_task_id: None,
                 updated_at: now_rfc3339(),
@@ -177,4 +177,4 @@ impl TaskService {
 }
 
 #[cfg(test)]
-mod lane_condition_tests;
+mod writer_parity_tests;

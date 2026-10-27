@@ -1,10 +1,11 @@
 use crate::workflow::HookContext;
 use db::ExecutionRepo;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
-pub(crate) fn assert_or_record(name: &str, raw: &str) {
-    let expected = include_str!("fixtures/lane-main-94609411.jsonl")
+pub(crate) fn assert_main_parity(name: &str, raw: &str) {
+    let expected = include_str!("fixtures/writer-main-94609411.jsonl")
         .lines()
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
         .find(|record| record["name"] == name)
@@ -126,7 +127,10 @@ impl Fixture {
         .unwrap();
     }
     pub(crate) async fn emit(&self, name: &str) {
-        self.snapshot(name, "first").await;
+        self.emit_with(name, |_, raw| raw.to_owned()).await;
+    }
+    pub(crate) async fn emit_with(&self, name: &str, normalize: fn(&db::Task, &str) -> String) {
+        self.snapshot(name, "first", normalize).await;
         db::TaskRepo::mutate_metadata(
             &*self.db,
             &self.task.id,
@@ -139,7 +143,7 @@ impl Fixture {
         )
         .await
         .unwrap();
-        self.snapshot(name, "second").await;
+        self.snapshot(name, "second", normalize).await;
         let original = db::TaskRepo::get_by_id(&*self.db, &self.task.id, false)
             .await
             .unwrap()
@@ -160,10 +164,15 @@ impl Fixture {
                 .await
                 .unwrap();
             tx.commit().await.unwrap();
-            self.snapshot(name, "queue").await;
+            self.snapshot(name, "queue", normalize).await;
         }
     }
-    async fn snapshot(&self, name: &str, phase: &str) {
+    async fn snapshot(
+        &self,
+        name: &str,
+        phase: &str,
+        normalize_snapshot: fn(&db::Task, &str) -> String,
+    ) {
         let row = db::TaskRepo::get_by_id(&*self.db, &self.task.id, false)
             .await
             .unwrap()
@@ -227,40 +236,22 @@ impl Fixture {
             "public": row.condition.public(), "read": row.condition.read(), "offers": offers,
             "event_digest": event.dedupe_key,
         });
-        let mut raw = normalize(&fields.to_string());
-        // Transport deliberately uses Utc::now rather than the DB test clock.
-        // Match the timestamp spelling and relationships separately below.
-        if name == "plan-wait" {
-            let metadata: serde_json::Value =
-                serde_json::from_str(row.metadata_json.as_deref().unwrap()).unwrap();
-            let started = metadata["owner_wait"]["started_at"].as_str().unwrap();
-            let retry = metadata["plan_settlement_wait"]["retry_at"]
-                .as_str()
-                .unwrap();
-            assert_eq!(
-                chrono::DateTime::parse_from_rfc3339(retry).unwrap()
-                    - chrono::DateTime::parse_from_rfc3339(started).unwrap(),
-                chrono::Duration::seconds(5)
-            );
-            raw = raw
-                .replace(started, "<transport-now>")
-                .replace(retry, "<transport-retry>");
-            // The event digest includes the uncontrolled transport times.
-            let mut fields: serde_json::Value = serde_json::from_str(&raw).unwrap();
-            fields.as_object_mut().unwrap().remove("event_digest");
-            raw = fields.to_string();
+        let raw = normalize_snapshot(&row, &normalize(&fields.to_string()));
+        let mut fields: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let fields = fields.as_object_mut().unwrap();
+        let mut projections = serde_json::Map::new();
+        for key in ["read", "public", "offers", "event_digest"] {
+            if let Some(value) = fields.remove(key) {
+                projections.insert(key.into(), value);
+            }
         }
-        if name == "retry-metadata" {
-            let metadata: serde_json::Value =
-                serde_json::from_str(row.metadata_json.as_deref().unwrap()).unwrap();
-            let deadline = metadata["deferred_dispatch"]["not_before"]
-                .as_str()
-                .unwrap();
-            let parsed = chrono::DateTime::parse_from_rfc3339(deadline).unwrap();
-            assert_eq!(parsed.to_rfc3339(), deadline);
-            raw = raw.replace(deadline, "<execution-retry-deadline>");
-        }
-        assert_or_record(&format!("{name}/{phase}"), &raw);
+        let canonical = serde_json::to_vec(&projections).unwrap();
+        fields.insert(
+            "projection_sha256".into(),
+            json!(hex::encode(Sha256::digest(canonical))),
+        );
+        let raw = serde_json::to_string(fields).unwrap();
+        assert_main_parity(&format!("{name}/{phase}"), &raw);
     }
 }
 
@@ -293,105 +284,17 @@ pub(crate) fn channel_sample(name: &str) -> String {
 }
 macro_rules! case {
     ($name:expr,$state:expr,$f:ident,$body:block) => {{
+        $crate::worker_runtime::queue::writer_parity::case!($name, $state, $f, $body, |_, raw| raw
+            .to_owned());
+    }};
+    ($name:expr,$state:expr,$f:ident,$body:block,$normalize:expr) => {{
         let _clock = db::test_clock::freeze("2026-10-25T00:00:00.123456+00:00".parse().unwrap());
-        let $f = $crate::worker_runtime::queue::lane_conditions::Fixture::new($state).await;
+        let $f = $crate::worker_runtime::queue::writer_parity::Fixture::new($state).await;
         db::task_writer::in_task_step($f.step.clone(), async {
             $body;
-            $f.emit($name).await;
+            $f.emit_with($name, $normalize).await;
         })
         .await;
     }};
 }
 pub(crate) use case;
-
-#[tokio::test]
-async fn queue_channels_and_overlays() {
-    for (kind, status, error) in [
-        (
-            api_types::FailureKind::CascadeFailed,
-            "failed",
-            Some("failed"),
-        ),
-        (
-            api_types::FailureKind::WorkspaceError,
-            "failed",
-            Some("workspace"),
-        ),
-        (api_types::FailureKind::WorkspaceError, "failed", None),
-        (api_types::FailureKind::WorkflowLoop, "parked", None),
-        (
-            api_types::FailureKind::MergeConflict,
-            "failed",
-            Some("merge"),
-        ),
-        (api_types::FailureKind::CiFailed, "failed", Some("ci")),
-    ] {
-        case!(
-            &format!("step-{kind}-{}", error.is_some()),
-            "in_progress",
-            f,
-            {
-                let worker = super::TaskStepWorker::new(f.ctx.task_service.clone());
-                let mut tx = f.db.pool().begin().await.unwrap();
-                let mut task = f.task.clone();
-                worker
-                    .write_annotation_in_tx(&mut tx, &f.step, &mut task, status, kind, error)
-                    .await
-                    .unwrap();
-                tx.commit().await.unwrap();
-            }
-        );
-    }
-    for sample in [
-        "executor",
-        "hold",
-        "script-hook",
-        "dispatch-state",
-        "dispatch-upgrade",
-        "lifecycle-reset",
-        "owner-recovery",
-        "removed-machine",
-        "recovered-task",
-        "budget",
-        "review-finding",
-        "workflow-guard",
-        "review-candidate",
-        "review-ci",
-        "placement",
-        "plan-wait",
-        "review-park-null",
-        "historical",
-    ] {
-        case!(&format!("overlay-{sample}"), "in_progress", f, {
-            let raw = if sample == "historical" {
-                "{\"type\":\"unknown\",\"extra\":true}".into()
-            } else {
-                channel_sample(sample)
-            };
-            sqlx::query("UPDATE task SET error_annotation=?,blocked_json='{}' WHERE id=?")
-                .bind(raw)
-                .bind(&f.task.id)
-                .execute(f.db.pool())
-                .await
-                .unwrap();
-            let mut task = db::TaskRepo::get_by_id(&*f.db, &f.task.id, false)
-                .await
-                .unwrap()
-                .unwrap();
-            let worker = super::TaskStepWorker::new(f.ctx.task_service.clone());
-            let mut tx = f.db.pool().begin().await.unwrap();
-            worker
-                .write_annotation_in_tx(
-                    &mut tx,
-                    &f.step,
-                    &mut task,
-                    "failed",
-                    api_types::FailureKind::CascadeFailed,
-                    Some("later hook failed"),
-                )
-                .await
-                .unwrap();
-            tx.commit().await.unwrap();
-        });
-    }
-}

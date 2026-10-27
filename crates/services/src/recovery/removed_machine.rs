@@ -286,7 +286,7 @@ async fn annotate_machine_removed(
     db.annotate_removed_machine_task(
         &task.id,
         db::AnnotateRemovedMachineTaskInput {
-            annotation: annotation.to_string(),
+            annotation,
             updated_at: now_rfc3339(),
             task_id: &task.id,
             terminal_states_json: json!(terminal).to_string(),
@@ -303,4 +303,4 @@ async fn annotate_machine_removed(
 }
 
 #[cfg(test)]
-mod lane_condition_tests;
+mod writer_parity_tests;

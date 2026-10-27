@@ -164,7 +164,7 @@ pub(crate) async fn record_retry(
             &mut tx,
             db::RecordExecutionPlanTaskWaitInTxInput {
                 task_id: &task.id,
-                marker: marker.to_string(),
+                marker,
                 disposition: serde_json::to_string(&channels::DeferredDispatch {
                     target_state: task.status.clone(),
                     reason: message.clone(),
@@ -172,7 +172,7 @@ pub(crate) async fn record_retry(
                     kind: None,
                 })
                 .expect("condition channel serializes"),
-                annotation: annotation.to_string(),
+                annotation,
                 updated_at: now.to_rfc3339(),
                 version: task.version,
             },
@@ -355,4 +355,4 @@ mod tests {
 }
 
 #[cfg(test)]
-mod lane_condition_tests;
+mod writer_parity_tests;

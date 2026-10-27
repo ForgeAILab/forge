@@ -194,8 +194,8 @@ impl TaskService {
                     priority: None,
                     merge_config: None,
                     plan: None,
-                    error_annotation: Some(Some(annotation.to_string())),
-                    blocked_json: Some(Some(blocked_meta.to_string())),
+                    error_annotation: Some(Some(annotation)),
+                    blocked_json: Some(Some(blocked_meta)),
                     failed_json: Some(None),
                     task_state_config: None,
                     parent_task_id: None,
@@ -276,8 +276,8 @@ impl TaskService {
                         priority: None,
                         merge_config: None,
                         plan: None,
-                        error_annotation: Some(Some(annotation.to_string())),
-                        blocked_json: Some(Some(blocked_meta.to_string())),
+                        error_annotation: Some(Some(annotation)),
+                        blocked_json: Some(Some(blocked_meta)),
                         failed_json: Some(None),
                         task_state_config: None,
                         parent_task_id: None,
@@ -644,4 +644,4 @@ impl TaskService {
 }
 
 #[cfg(test)]
-mod lane_condition_tests;
+mod writer_parity_tests;

@@ -1,3 +1,4 @@
+use crate::condition_metadata::set_condition;
 use db::task_condition::channels;
 use std::sync::Arc;
 
@@ -398,7 +399,7 @@ pub(super) async fn persist_merge_error(
             priority: None,
             merge_config: None,
             plan: None,
-            error_annotation: Some(Some(annotation.to_string())),
+            error_annotation: Some(Some(annotation)),
             blocked_json: None,
             failed_json: None,
             task_state_config: None,
@@ -458,7 +459,7 @@ pub(super) async fn block_task_with_annotation(
                 merge_config: None,
                 plan: None,
                 error_annotation: annotation.clone().map(Some),
-                blocked_json: Some(Some(blocked_meta.to_string())),
+                blocked_json: Some(Some(blocked_meta)),
                 failed_json: Some(None),
                 task_state_config: None,
                 parent_task_id: None,
@@ -857,25 +858,13 @@ async fn set_review_awaiting_human_metadata(ctx: &HookContext) -> Result<(), Str
         &task.id,
         Some(task.version),
         vec![
-            db::TaskMetadataMutation::Set {
-                key: "awaiting_human".to_owned(),
-                value: serde_json::to_value(channels::ConditionMetadataValue::AwaitingHuman(true))
-                    .expect("condition metadata serializes"),
-            },
-            db::TaskMetadataMutation::Set {
-                key: "awaiting_human_reason".to_owned(),
-                value: serde_json::to_value(channels::ConditionMetadataValue::AwaitingHumanReason(
-                    "manual_review".into(),
-                ))
-                .expect("condition metadata serializes"),
-            },
-            db::TaskMetadataMutation::Set {
-                key: "awaiting_human_marker_id".to_owned(),
-                value: serde_json::to_value(
-                    channels::ConditionMetadataValue::AwaitingHumanMarkerId(db::new_uuid_v4()),
-                )
-                .expect("condition metadata serializes"),
-            },
+            set_condition(channels::ConditionMetadataValue::AwaitingHuman(true)),
+            set_condition(channels::ConditionMetadataValue::AwaitingHumanReason(
+                "manual_review".into(),
+            )),
+            set_condition(channels::ConditionMetadataValue::AwaitingHumanMarkerId(
+                db::new_uuid_v4(),
+            )),
         ],
         &now_rfc3339(),
     )
@@ -951,4 +940,4 @@ pub(super) async fn disk_wait_over(ctx: &HookContext, task: &db::Task) {
 }
 
 #[cfg(test)]
-mod lane_condition_tests;
+mod writer_parity_tests;

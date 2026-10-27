@@ -174,7 +174,7 @@ async fn annotate_owner_recovery(
                 &mut transaction,
                 &task.id,
                 db::AnnotateOwnerRecoveryInTxInput {
-                    annotation: annotation.to_string(),
+                    annotation,
                     updated_at: now_rfc3339(),
                     task_id: &task.id,
                     expected_version: task.version,
@@ -279,17 +279,15 @@ pub(super) async fn annotate_owner_workspace_reset(
     {
         return Ok(());
     }
-    let annotation = db::task_condition::channels::ErrorAnnotation::new(
-        db::task_condition::channels::AnnotationShape::TimedBlock(
-            db::task_condition::channels::TimedBlockAnnotation {
-                kind: api_types::FailureKind::WorkspaceResetRequired,
-                blocked_at: now_rfc3339(),
-                blocked_by: actor.display(),
-                blocking_reason: "owner_workspace_reset_required".into(),
-                message: message.into(),
-            },
-        ),
-    );
+    let annotation = channels::ErrorAnnotation::new(channels::AnnotationShape::TimedBlock(
+        channels::TimedBlockAnnotation {
+            kind: api_types::FailureKind::WorkspaceResetRequired,
+            blocked_at: now_rfc3339(),
+            blocked_by: actor.display(),
+            blocking_reason: "owner_workspace_reset_required".into(),
+            message: message.into(),
+        },
+    ));
     let annotation = serde_json::to_string(&annotation).map_err(|error| {
         ServiceError::invalid_operation(format!(
             "failed to serialize workspace-reset annotation: {error}"
@@ -403,6 +401,3 @@ pub(super) async fn reconcile_owner_receipts(
 
 #[cfg(test)]
 mod condition_tests;
-
-#[cfg(test)]
-mod lane_condition_tests;

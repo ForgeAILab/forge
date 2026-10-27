@@ -1,6 +1,7 @@
 //! Completion guard retries, rejection prompts, and metadata.
 
 use super::*;
+use crate::condition_metadata::set_condition;
 use db::task_condition::channels;
 
 impl TaskService {
@@ -75,38 +76,20 @@ impl TaskService {
                     limit: i64::from(budget),
                     step: format!("guard:{}", execution.id),
                 }),
-                db::TaskMetadataMutation::Set {
-                    key: "last_workflow_guard_rejection_at".to_owned(),
-                    value: serde_json::to_value(
-                        channels::ConditionMetadataValue::LastWorkflowGuardRejectionAt(now.clone()),
-                    )
-                    .expect("condition metadata serializes"),
-                },
-                db::TaskMetadataMutation::Set {
-                    key: "last_workflow_guard_name".to_owned(),
-                    value: serde_json::to_value(
-                        channels::ConditionMetadataValue::LastWorkflowGuardName(guard.to_owned()),
-                    )
-                    .expect("condition metadata serializes"),
-                },
-                db::TaskMetadataMutation::Set {
-                    key: "last_workflow_guard_reason".to_owned(),
-                    value: serde_json::to_value(
-                        channels::ConditionMetadataValue::LastWorkflowGuardReason(
-                            reason.to_owned(),
-                        ),
-                    )
-                    .expect("condition metadata serializes"),
-                },
-                db::TaskMetadataMutation::Set {
-                    key: "last_workflow_guard_execution_id".to_owned(),
-                    value: serde_json::to_value(
-                        channels::ConditionMetadataValue::LastWorkflowGuardExecutionId(
-                            execution.id.clone(),
-                        ),
-                    )
-                    .expect("condition metadata serializes"),
-                },
+                set_condition(
+                    channels::ConditionMetadataValue::LastWorkflowGuardRejectionAt(now.clone()),
+                ),
+                set_condition(channels::ConditionMetadataValue::LastWorkflowGuardName(
+                    guard.to_owned(),
+                )),
+                set_condition(channels::ConditionMetadataValue::LastWorkflowGuardReason(
+                    reason.to_owned(),
+                )),
+                set_condition(
+                    channels::ConditionMetadataValue::LastWorkflowGuardExecutionId(
+                        execution.id.clone(),
+                    ),
+                ),
             ],
             &now,
         )
@@ -267,7 +250,7 @@ impl TaskService {
                 status: task.status.clone(),
                 assignee_id: None,
                 error_annotation: Some(Some(annotation)),
-                blocked_json: Some(Some(blocked_meta.to_string())),
+                blocked_json: Some(Some(blocked_meta)),
                 failed_json: Some(None),
                 updated_at: now_rfc3339(),
             },
@@ -350,4 +333,4 @@ impl TaskService {
 }
 
 #[cfg(test)]
-mod lane_condition_tests;
+mod writer_parity_tests;

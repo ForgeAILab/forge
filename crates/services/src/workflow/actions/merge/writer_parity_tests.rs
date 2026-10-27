@@ -1,12 +1,12 @@
 #[tokio::test]
 async fn merge_annotations() {
     let _clock = db::test_clock::freeze("2026-10-25T00:00:00.123456+00:00".parse().unwrap());
-    crate::worker_runtime::queue::lane_conditions::assert_or_record(
+    crate::worker_runtime::queue::writer_parity::assert_main_parity(
         "merge-budget/raw",
         &super::merge_budget_annotation("exhausted"),
     );
-    let f = crate::worker_runtime::queue::lane_conditions::Fixture::new("merging").await;
-    crate::worker_runtime::queue::lane_conditions::assert_or_record(
+    let f = crate::worker_runtime::queue::writer_parity::Fixture::new("merging").await;
+    crate::worker_runtime::queue::writer_parity::assert_main_parity(
         "manual-merge/raw",
         &super::manual_merge_recovery_annotation(
             &f.ctx,
@@ -23,7 +23,7 @@ async fn merge_failure_stores_annotations() {
         api_types::FailureKind::MergeConflict,
         api_types::FailureKind::CiFailed,
     ] {
-        crate::worker_runtime::queue::lane_conditions::case!(
+        crate::worker_runtime::queue::writer_parity::case!(
             &format!("merge-failure-{kind}"),
             "merging",
             f,

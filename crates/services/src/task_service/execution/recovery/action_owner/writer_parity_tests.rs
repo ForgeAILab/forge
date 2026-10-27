@@ -1,4 +1,4 @@
-use crate::worker_runtime::queue::lane_conditions::case;
+use crate::worker_runtime::queue::writer_parity::case;
 
 #[tokio::test]
 async fn restored_condition() {
@@ -23,7 +23,7 @@ async fn restored_condition() {
                     "{\"type\":\"unknown\",\"recovery_actions\":[\"historical\"],\"extra\":true}"
                         .into()
                 } else {
-                    crate::worker_runtime::queue::lane_conditions::channel_sample(sample)
+                    crate::worker_runtime::queue::writer_parity::channel_sample(sample)
                 };
                 serde_json::json!({"id":"queued","error_annotation":annotation,"blocked_json":"{\"kind\":\"manual_stop\",\"reason\":\"saved\",\"created_at\":\"old\"}"})
             };
@@ -69,7 +69,7 @@ async fn restored_condition_variants() {
         case!(&format!("restore-variant-{sample}"), "in_progress", f, {
             let failed = sample.starts_with("failed");
             let annotation =
-                crate::worker_runtime::queue::lane_conditions::channel_sample(if failed {
+                crate::worker_runtime::queue::writer_parity::channel_sample(if failed {
                     "executor"
                 } else {
                     sample

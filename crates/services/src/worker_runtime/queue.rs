@@ -8,6 +8,7 @@ use crate::{
     Result, ServiceError,
 };
 use api_types::{Actor, SystemComponent};
+use db::task_condition::channels;
 use db::{TaskRepo, TaskStep, TaskStepRepo, WorkflowReference};
 use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Duration};
@@ -16,7 +17,6 @@ use tokio::{
     task::{JoinHandle, JoinSet},
 };
 
-use db::task_condition::channels;
 pub(crate) mod command_reply;
 
 pub const CHAIN_LIMIT: i64 = 64;
@@ -1835,7 +1835,7 @@ impl TaskStepWorker {
             .db
             .annotate_task_step_failure_in_tx(
                 tx,
-                annotation.to_string(),
+                annotation.clone(),
                 &blocked,
                 &now,
                 &step.task_id,
@@ -1849,7 +1849,7 @@ impl TaskStepWorker {
         self.db
             .state_condition_in_tx(tx, &step.task_id, db::ConditionChange::Legacy)
             .await?;
-        task.error_annotation = Some(annotation.to_string());
+        task.error_annotation = Some(annotation);
         if blocked.is_some() {
             task.blocked_json = blocked;
         }
@@ -1971,4 +1971,4 @@ pub(crate) mod condition_tests;
 mod workflow_loop_tests;
 
 #[cfg(test)]
-pub(crate) mod lane_conditions;
+pub(crate) mod writer_parity;

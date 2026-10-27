@@ -413,7 +413,7 @@ impl TaskService {
                 status: current.status.clone(),
                 assignee_id: None,
                 error_annotation: Some(Some(annotation)),
-                blocked_json: Some(Some(blocked_meta.to_string())),
+                blocked_json: Some(Some(blocked_meta)),
                 failed_json: Some(None),
                 updated_at: now_rfc3339(),
             },
@@ -693,4 +693,4 @@ impl TaskService {
 }
 
 #[cfg(test)]
-mod lane_condition_tests;
+mod writer_parity_tests;

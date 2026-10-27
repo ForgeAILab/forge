@@ -219,12 +219,12 @@ async fn annotate_dispatch_failure_details(
     state: &str,
     message: &str,
     authority: Option<&WorkflowAuthority>,
-    details: Option<Vec<String>>,
+    upgrade_daemon_ids: Option<Vec<String>>,
 ) -> db::Result<()> {
     let annotation = serde_json::to_string(&dispatch_failed_annotation(
         state,
         message,
-        details.as_deref(),
+        upgrade_daemon_ids.as_deref(),
     ))
     .expect("condition channel serializes");
     let current = TaskRepo::get_by_id(db, task_id, false)
@@ -237,7 +237,7 @@ async fn annotate_dispatch_failure_details(
             }
             // The hook retained typed refusal details before the engine's
             // string-only fallback. Preserve them for reconnection recovery.
-            if details.is_none()
+            if upgrade_daemon_ids.is_none()
                 && serde_json::from_str::<serde_json::Value>(raw)
                     .ok()
                     .is_some_and(|value| {
@@ -1533,4 +1533,4 @@ pub(crate) mod resolve_workflow_tests {
 }
 
 #[cfg(test)]
-mod lane_condition_tests;
+mod writer_parity_tests;

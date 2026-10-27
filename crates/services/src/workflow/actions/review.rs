@@ -671,7 +671,7 @@ impl HookAction for RunCiSteps {
                     reason,
                     api_types::FailureKind::ReviewBlocked,
                     Some("verify"),
-                    Some(annotation.to_string()),
+                    Some(annotation),
                 )
                 .await
                 {
@@ -696,7 +696,7 @@ impl HookAction for RunCiSteps {
                     &*ctx.db,
                     &parked.id,
                     parked.version,
-                    Some(barrier.to_string()),
+                    Some(barrier),
                     &now,
                 )
                 .await

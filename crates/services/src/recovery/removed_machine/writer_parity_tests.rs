@@ -1,4 +1,4 @@
-use crate::worker_runtime::queue::lane_conditions::case;
+use crate::worker_runtime::queue::writer_parity::case;
 
 #[tokio::test]
 async fn removed_machine() {
@@ -54,7 +54,7 @@ async fn refreshed_cancel_keeps_raw_fence() {
             let raw = if historical {
                 "{\"type\":\"manual_stop\",\"blocking_reason\":\"pending_remote_cancel\",\"extension\":true}".into()
             } else {
-                crate::worker_runtime::queue::lane_conditions::channel_sample("remote-cancel")
+                crate::worker_runtime::queue::writer_parity::channel_sample("remote-cancel")
             };
             sqlx::query("UPDATE task SET error_annotation=? WHERE id=?")
                 .bind(format!("  {raw}  "))

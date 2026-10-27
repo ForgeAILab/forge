@@ -1,6 +1,7 @@
 //! Execution failure blockers and retry scheduling.
 
 use super::*;
+use crate::condition_metadata::set_condition;
 use db::task_condition::channels;
 
 impl TaskService {
@@ -28,7 +29,7 @@ impl TaskService {
         &self,
         execution: &Execution,
         retry_at: Option<String>,
-        attempts: Value,
+        attempts: Vec<channels::ExecutorRouteAttempt>,
     ) -> Result<()> {
         let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
             .await?
@@ -56,11 +57,9 @@ impl TaskService {
         {
             return Ok(());
         }
-        let usage_limited = attempts.as_array().is_some_and(|attempts| {
-            attempts.iter().any(|attempt| {
-                attempt.get("outcome").and_then(Value::as_str) == Some("usage_exhausted")
-            })
-        });
+        let usage_limited = attempts
+            .iter()
+            .any(|attempt| attempt.outcome == "usage_exhausted");
         let transient = retry_at.is_some() || usage_limited;
         let retry_block_reason = if transient {
             let current_state = workflow
@@ -138,30 +137,19 @@ impl TaskService {
             .clone()
             .unwrap_or_else(|| "no executor candidate available".to_owned());
         let created_at = now_rfc3339();
-        let blocked_meta = if let Ok(attempts) =
-            serde_json::from_value::<Option<Vec<channels::ExecutorRouteAttempt>>>(attempts.clone())
-        {
-            serde_json::to_value(channels::Interruption {
-                reason: Some(reason.clone()),
-                created_at: Some(Some(created_at.clone())),
-                kind: Some(Some(api_types::FailureKind::ExecutorUnavailable.into())),
-                execution_id: Some(Some(execution.id.clone())),
-                details: Some(Some(channels::InterruptionDetails {
-                    retry_at: Some(retry_at.clone()),
-                    attempts: Some(attempts),
-                    ..Default::default()
-                })),
+        let blocked_meta = serde_json::to_value(channels::Interruption {
+            reason: Some(reason.clone()),
+            created_at: Some(Some(created_at)),
+            kind: Some(Some(api_types::FailureKind::ExecutorUnavailable.into())),
+            execution_id: Some(Some(execution.id.clone())),
+            details: Some(Some(channels::InterruptionDetails {
+                retry_at: Some(retry_at),
+                attempts: Some(Some(attempts)),
                 ..Default::default()
-            })
-            .expect("condition channel serializes")
-        } else {
-            // Preserve caller-supplied attempts outside the closed route shape.
-            json!({
-                "reason": reason, "created_at": created_at,
-                "kind": api_types::FailureKind::ExecutorUnavailable, "execution_id": execution.id,
-                "details": { "retry_at": retry_at, "attempts": attempts },
-            })
-        };
+            })),
+            ..Default::default()
+        })
+        .expect("condition channel serializes");
 
         let Some(updated) = TaskRepo::update_status_for_latest_execution(
             &*self.db,
@@ -308,31 +296,29 @@ impl TaskService {
         let Some(project) = ProjectRepo::get_by_id(&*self.db, &task.project_id).await? else {
             return Ok(());
         };
-        let annotation = db::task_condition::channels::ErrorAnnotation::new(
-            db::task_condition::channels::AnnotationShape::Blocking(
-                db::task_condition::channels::BlockingAnnotation {
-                    kind: api_types::FailureKind::ExecutorFailed,
-                    hook: None,
-                    blocking_reason: "executor_failed".to_owned(),
-                    blocked_by: Some(
-                        api_types::Actor::system(api_types::SystemComponent::Executor).display(),
-                    ),
-                    blocked_at: Some(now_rfc3339()),
-                    blocked_execution_id: Some(execution.id.clone()),
-                    artifact: Some(db::task_condition::channels::AnnotationArtifact {
-                        kind: "execution".to_owned(),
-                        id: Some(execution.id.clone()),
-                        log_path: execution.logs_path.clone(),
-                    }),
-                    message: Some(
-                        execution
-                            .error
-                            .clone()
-                            .unwrap_or_else(|| "Execution failed".to_owned()),
-                    ),
-                },
-            ),
-        );
+        let annotation = channels::ErrorAnnotation::new(channels::AnnotationShape::Blocking(
+            channels::BlockingAnnotation {
+                kind: api_types::FailureKind::ExecutorFailed,
+                hook: None,
+                blocking_reason: "executor_failed".to_owned(),
+                blocked_by: Some(
+                    api_types::Actor::system(api_types::SystemComponent::Executor).display(),
+                ),
+                blocked_at: Some(now_rfc3339()),
+                blocked_execution_id: Some(execution.id.clone()),
+                artifact: Some(channels::AnnotationArtifact {
+                    kind: "execution".to_owned(),
+                    id: Some(execution.id.clone()),
+                    log_path: execution.logs_path.clone(),
+                }),
+                message: Some(
+                    execution
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "Execution failed".to_owned()),
+                ),
+            },
+        ));
         let annotation = serde_json::to_string(&annotation).map_err(|error| {
             ServiceError::invalid_operation(format!(
                 "failed to serialize executor-failure annotation: {error}"
@@ -343,7 +329,7 @@ impl TaskService {
             .error
             .clone()
             .unwrap_or_else(|| "executor failed".to_owned());
-        let blocked_meta = db::task_condition::channels::Interruption {
+        let blocked_meta = channels::Interruption {
             created_at: Some(Some(now_rfc3339())),
             execution_id: Some(Some(execution.id.clone())),
             kind: Some(Some(api_types::FailureKind::InternalCommandFailed.into())),
@@ -514,22 +500,14 @@ impl TaskService {
                     limit: i64::from(budget),
                     step: format!("failure:{}", execution.id),
                 }),
-                db::TaskMetadataMutation::Set {
-                    key: "last_execution_failure_at".to_owned(),
-                    value: serde_json::to_value(
-                        channels::ConditionMetadataValue::LastExecutionFailureAt(now.clone()),
-                    )
-                    .expect("condition metadata serializes"),
-                },
-                db::TaskMetadataMutation::Set {
-                    key: "last_execution_failure_execution_id".to_owned(),
-                    value: serde_json::to_value(
-                        channels::ConditionMetadataValue::LastExecutionFailureExecutionId(
-                            execution.id.clone(),
-                        ),
-                    )
-                    .expect("condition metadata serializes"),
-                },
+                set_condition(channels::ConditionMetadataValue::LastExecutionFailureAt(
+                    now.clone(),
+                )),
+                set_condition(
+                    channels::ConditionMetadataValue::LastExecutionFailureExecutionId(
+                        execution.id.clone(),
+                    ),
+                ),
             ],
         )
         .await?
@@ -610,6 +588,3 @@ impl TaskService {
 
 #[cfg(test)]
 mod condition_tests;
-
-#[cfg(test)]
-mod lane_condition_tests;

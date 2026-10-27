@@ -1,9 +1,9 @@
 //! Review entry costs nothing when a repair delivered the same clean candidate.
 use super::common::block_task_with_annotation;
 use crate::workflow::{effective_role, HookContext};
+use db::task_condition::channels;
 use db::{budget::RepairNoChangeDecision, now_rfc3339};
 
-use db::task_condition::channels;
 pub(crate) async fn repair_no_change_gate(
     ctx: &HookContext,
     task: &db::Task,
@@ -116,12 +116,11 @@ pub(crate) async fn park_no_change(
         }),
     ))
     .expect("condition channel serializes");
-    block_task_with_annotation(ctx, task, message, kind, None, Some(annotation.to_string()))
-        .await?;
+    block_task_with_annotation(ctx, task, message, kind, None, Some(annotation)).await?;
     ctx.task_service
         .publish_review_park_comment_as(&review, message, &format!("park:{}", step.id))
         .await
 }
 
 #[cfg(test)]
-mod lane_condition_tests;
+mod writer_parity_tests;

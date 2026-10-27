@@ -135,7 +135,7 @@ impl TaskService {
                 priority: None,
                 merge_config: None,
                 plan: None,
-                error_annotation: Some(Some(annotation.to_string())),
+                error_annotation: Some(Some(annotation)),
                 blocked_json: None,
                 failed_json: None,
                 task_state_config: None,
@@ -161,4 +161,4 @@ fn truncate_annotation_output(output: &str) -> String {
 }
 
 #[cfg(test)]
-mod lane_condition_tests;
+mod writer_parity_tests;

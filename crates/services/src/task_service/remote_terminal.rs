@@ -691,20 +691,18 @@ impl TaskService {
             && notification.failure_class
                 == Some(api_types::RemoteExecutionFailureClass::ExecutorUnavailable)
         {
-            let attempts = serde_json::Value::Array(
-                notification
-                    .route_attempts
-                    .as_deref()
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|attempt| {
-                        serde_json::json!({
-                            "candidate_key": attempt.candidate_key,
-                            "outcome": attempt.outcome,
-                        })
-                    })
-                    .collect(),
-            );
+            let attempts = notification
+                .route_attempts
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(
+                    |attempt| db::task_condition::channels::ExecutorRouteAttempt {
+                        candidate_key: attempt.candidate_key.clone(),
+                        outcome: attempt.outcome.clone(),
+                    },
+                )
+                .collect();
             self.annotate_executor_unavailable_block(
                 execution,
                 notification.retry_at.clone(),

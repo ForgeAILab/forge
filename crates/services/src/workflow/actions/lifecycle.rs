@@ -354,7 +354,7 @@ async fn annotate_before_work_hook_block(
     ))
     .expect("condition channel serializes");
 
-    persist_before_work_annotation(ctx, task, annotation.to_string()).await
+    persist_before_work_annotation(ctx, task, annotation).await
 }
 
 async fn annotate_before_work_workspace_reset(
@@ -374,7 +374,7 @@ async fn annotate_before_work_workspace_reset(
         }),
     ))
     .expect("condition channel serializes");
-    persist_before_work_annotation(ctx, task, annotation.to_string()).await
+    persist_before_work_annotation(ctx, task, annotation).await
 }
 
 async fn persist_before_work_annotation(
@@ -601,4 +601,4 @@ impl HookAction for AutoCascadeOnCompletion {
 }
 
 #[cfg(test)]
-mod lane_condition_tests;
+mod writer_parity_tests;

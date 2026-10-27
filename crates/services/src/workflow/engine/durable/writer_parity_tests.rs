@@ -1,4 +1,4 @@
-use crate::worker_runtime::queue::lane_conditions::Fixture;
+use crate::worker_runtime::queue::writer_parity::Fixture;
 use db::TaskStepRepo;
 
 #[tokio::test]

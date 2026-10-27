@@ -1,8 +1,8 @@
 //! Durable post-commit phase. CAS callers only insert its outbox row.
 use super::*;
+use db::task_condition::channels;
 use serde::{Deserialize, Serialize};
 
-use db::task_condition::channels;
 #[derive(Serialize, Deserialize)]
 pub(crate) struct HookDefinition {
     pub workflow: WorkflowDefinition,
@@ -1401,4 +1401,4 @@ impl WorkflowExecution<'_> {
 }
 
 #[cfg(test)]
-mod lane_condition_tests;
+mod writer_parity_tests;

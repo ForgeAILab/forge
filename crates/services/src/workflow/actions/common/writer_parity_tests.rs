@@ -1,4 +1,4 @@
-use crate::worker_runtime::queue::lane_conditions::case;
+use crate::worker_runtime::queue::writer_parity::case;
 
 #[tokio::test]
 async fn merge_error_and_block() {

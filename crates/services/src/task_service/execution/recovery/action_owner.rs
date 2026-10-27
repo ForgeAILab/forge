@@ -1,8 +1,7 @@
 //! Stored action normalization and queued recovery owner reconciliation.
 
-use db::task_condition::channels;
-
 use super::*;
+use db::task_condition::channels;
 
 impl TaskService {
     /// Read historical persisted commands at the storage boundary. No old
@@ -410,21 +409,23 @@ impl TaskService {
     }
 }
 
+fn is_json_object(raw: &str) -> bool {
+    serde_json::from_str::<Value>(raw).is_ok_and(|value| value.is_object())
+}
+
 // Restore known channels through their closed shapes; historical extensions keep
 // the original Value edit at the caller.
 fn restore_action_annotation(raw: Option<&str>, reason: &str) -> Option<String> {
-    let mut annotation = match raw
-        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-        .filter(Value::is_object)
-    {
-        Some(_) => serde_json::from_str::<channels::ErrorAnnotation>(raw?).ok()?,
-        None => channels::ErrorAnnotation::new(channels::AnnotationShape::Reason(
+    let mut annotation = if !raw.is_some_and(is_json_object) {
+        channels::ErrorAnnotation::new(channels::AnnotationShape::Reason(
             channels::ReasonAnnotation {
                 blocking_reason: reason.into(),
                 message: reason.into(),
                 kind: api_types::FailureKind::RecoveryRequired,
             },
-        )),
+        ))
+    } else {
+        serde_json::from_str::<channels::ErrorAnnotation>(raw?).ok()?
     };
     use channels::AnnotationShape as S;
     match &mut annotation.shape {
@@ -507,20 +508,18 @@ fn restore_action_interruption(
     reason: &str,
     fallback: api_types::FailureKind,
 ) -> Option<String> {
-    let mut interruption = match raw
-        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-        .filter(Value::is_object)
-    {
-        Some(_) => serde_json::from_str::<channels::Interruption>(raw?).ok()?,
-        None => channels::Interruption {
+    let mut interruption = if !raw.is_some_and(is_json_object) {
+        channels::Interruption {
             reason: Some(reason.into()),
             kind: Some(Some(fallback.into())),
             ..Default::default()
-        },
+        }
+    } else {
+        serde_json::from_str::<channels::Interruption>(raw?).ok()?
     };
     interruption.reason = Some(reason.into());
     Some(serde_json::to_string(&interruption).expect("condition channel serializes"))
 }
 
 #[cfg(test)]
-mod lane_condition_tests;
+mod writer_parity_tests;
