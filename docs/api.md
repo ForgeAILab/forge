@@ -803,7 +803,7 @@ including any historical policy fields. The policy pair has three replay shapes:
   the original release-policy values, which need not equal the Charter ID.
   The waiver event and Decision must agree on both fields.
 - Exactly one present, or either value empty or invalid: refuse replay with 500
-  `internal_error` for a manual result or 409 `idempotency_conflict` for a waiver.
+  `internal_error` for either route.
 
 New receipts omit both policy fields. Replay preserves stored governing revisions
 and provenance without backfilling or stripping policy fields.

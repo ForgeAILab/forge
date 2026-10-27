@@ -436,13 +436,31 @@ async fn v08_waiver_replays_with_original_release_policy_fields() {
 #[tokio::test]
 async fn replay_refuses_partial_or_empty_policy_fields() {
     for waive in [false, true] {
-        for policy_fields in [
-            json!({"governing_policy_revision": "v076-policy-r1"}),
-            json!({"governing_policy_digest": "v076-policy-digest"}),
-            json!({"governing_policy_revision": "", "governing_policy_digest": "v076-policy-digest"}),
-            json!({"governing_policy_revision": "v076-policy-r1", "governing_policy_digest": ""}),
-            json!({"governing_policy_revision": "  ", "governing_policy_digest": "v076-policy-digest"}),
-            json!({"governing_policy_revision": "v076-policy-r1", "governing_policy_digest": "  "}),
+        for (policy_fields, missing_field) in [
+            (
+                json!({"governing_policy_revision": "v076-policy-r1"}),
+                "digest",
+            ),
+            (
+                json!({"governing_policy_digest": "v076-policy-digest"}),
+                "revision",
+            ),
+            (
+                json!({"governing_policy_revision": "", "governing_policy_digest": "v076-policy-digest"}),
+                "revision",
+            ),
+            (
+                json!({"governing_policy_revision": "v076-policy-r1", "governing_policy_digest": ""}),
+                "digest",
+            ),
+            (
+                json!({"governing_policy_revision": "  ", "governing_policy_digest": "v076-policy-digest"}),
+                "revision",
+            ),
+            (
+                json!({"governing_policy_revision": "v076-policy-r1", "governing_policy_digest": "  "}),
+                "digest",
+            ),
         ] {
             let (_root, harness, project) = fixture().await;
             seed_milestone(&harness, &project, true).await;
@@ -455,18 +473,14 @@ async fn replay_refuses_partial_or_empty_policy_fields() {
                 Method::POST,
                 &format!("/api/v1/projects/{project}/milestones/milestone/checks/check/{suffix}"),
                 request,
-                if waive {
-                    StatusCode::CONFLICT
-                } else {
-                    StatusCode::INTERNAL_SERVER_ERROR
-                },
+                StatusCode::INTERNAL_SERVER_ERROR,
             )
             .await;
             if waive {
                 assert_command_error(
                     error,
-                    "idempotency_conflict",
-                    "the waiver idempotency key was already used for a different waiver",
+                    "internal_error",
+                    &format!("persisted milestone waiver policy {missing_field} is missing"),
                 );
             } else {
                 assert_command_error(
