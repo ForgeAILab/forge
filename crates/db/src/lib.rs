@@ -438,3 +438,14 @@ pub use sqlite::{
     ProjectCleanupOwner, ProjectEvidenceAttachmentRead, ProjectMediaAssetIdRead,
     TaskExecutionTimingRead,
 };
+
+pub use sqlite::{
+    OverviewAcceptanceCheckRead, OverviewCandidateRead, OverviewCharterRead, OverviewCheckRead,
+    OverviewDecisionRead, OverviewDocumentRead, OverviewEvidenceRead, OverviewMilestoneRead,
+    OverviewMilestoneRevisionRead, OverviewReadinessRead, OverviewReleaseRead,
+    OverviewReplacementRead, OverviewTaskRead,
+};
+
+pub use sqlite::{ProjectDocumentIdRead, ProjectDocumentRevisionRead};
+
+pub use sqlite::{ProjectDecisionCandidateRead, ProjectDecisionRead};

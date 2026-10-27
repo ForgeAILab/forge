@@ -753,3 +753,34 @@ async fn v076_genesis_handoff_is_atomic_and_legacy_adoption_is_explicit() {
     assert_eq!(legacy_after["charter_status"], json!("charter_backed"));
     assert_eq!(legacy_after["charter_setup_required"], json!(false));
 }
+
+#[tokio::test]
+async fn genesis_charter_read_database_errors_keep_the_historical_response() {
+    let root = tempfile::tempdir().unwrap();
+    let harness = common::test_app(root.path(), "genesis-charter-read-errors").await;
+    harness.stop_step_worker();
+    let genesis =
+        create_genesis_project(&harness.app, &common::test_jwt(), "genesis-read-error").await;
+    sqlx::query(
+        "ALTER TABLE project_charter_approval RENAME COLUMN created_at TO unavailable_created_at",
+    )
+    .execute(harness.state.db.pool())
+    .await
+    .unwrap();
+    let body: Value = common::empty_request(
+        &harness.app,
+        Method::GET,
+        &format!(
+            "/api/v1/account/main-agent/product-genesis/{}/charter",
+            genesis.genesis_session_id
+        ),
+        StatusCode::INTERNAL_SERVER_ERROR,
+    )
+    .await;
+    assert!(!body["request_id"].as_str().unwrap().is_empty());
+    assert_eq!(
+        body,
+        json!({"code":"internal_error", "message":"Project artifact mutation failed",
+        "details":null, "request_id":body["request_id"]})
+    );
+}

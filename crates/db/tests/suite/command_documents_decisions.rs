@@ -1587,3 +1587,6 @@ async fn decision_candidate_effective_and_rejection_commands_are_atomic() {
             .expect("reject replay");
     assert_eq!(rejected, rejected_replay);
 }
+
+#[path = "command_documents_decisions/reads.rs"]
+mod reads;

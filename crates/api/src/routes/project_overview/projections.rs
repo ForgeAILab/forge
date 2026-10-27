@@ -4,12 +4,6 @@ use super::*;
 
 const NO_APPROVED_CHARTER_VISION: &str = "No approved Charter vision recorded.";
 
-macro_rules! try_get {
-    ($row:expr, $ty:ty, $column:expr) => {
-        $row.try_get::<$ty, _>($column).map_err(sql_error)?
-    };
-}
-
 pub(super) async fn load_current_charter(
     state: &AppState,
     project: &db::Project,
@@ -21,41 +15,17 @@ pub(super) async fn load_current_charter(
         return Ok((None, NO_APPROVED_CHARTER_VISION.to_owned(), true));
     };
 
-    let row = sqlx::query(
-        "SELECT c.id AS charter_id, c.project_id, c.project_mode, c.maturity,
-                r.id AS revision_id,
-                r.revision, r.base_revision, r.base_revision_id,
-                r.lifecycle, r.schema_version,
-                r.render_version, r.content_json, r.rendered_view,
-                r.change_summary, r.author_type, r.author_id,
-                r.source_refs_json, r.content_digest, r.rendered_digest,
-                r.created_at,
-                (SELECT ca.created_at
-                   FROM project_charter_approval ca
-                  WHERE ca.charter_id = c.id
-                    AND ca.revision_id = r.id
-                    AND ca.lifecycle IN ('active', 'consumed')
-                  ORDER BY ca.created_at DESC, ca.id DESC
-                  LIMIT 1) AS approved_at
-         FROM project_charter c
-         JOIN project_charter_revision r ON r.id = ? AND r.charter_id = c.id
-         WHERE c.id = ? AND c.project_id = ?
-           AND c.current_approved_revision_id = r.id
-           AND c.lifecycle = 'attached'
-           AND r.lifecycle = 'approved'",
-    )
-    .bind(revision_id)
-    .bind(charter_id)
-    .bind(&project.id)
-    .fetch_optional(state.db.pool())
-    .await
-    .map_err(sql_error)?;
+    let row = state
+        .db
+        .overview_current_charter(revision_id, charter_id, &project.id)
+        .await
+        .map_err(sql_error)?;
 
     let Some(row) = row else {
         return Ok((None, NO_APPROVED_CHARTER_VISION.to_owned(), true));
     };
 
-    let content: Value = row_json(&row, "content_json")?;
+    let content: Value = row_json(row.content_json(), "content_json")?;
     let vision = content
         .pointer("/identity/one_line_vision")
         .and_then(Value::as_str)
@@ -63,30 +33,30 @@ pub(super) async fn load_current_charter(
         .unwrap_or(NO_APPROVED_CHARTER_VISION)
         .to_owned();
     let principal = principal_value(
-        try_get!(row, String, "author_type").as_str(),
-        try_get!(row, Option<String>, "author_id").as_deref(),
+        row.author_type().map_err(sql_error)?.as_str(),
+        row.author_id().map_err(sql_error)?.as_deref(),
     )
     .ok_or_else(|| ApiError::internal("invalid Charter author principal"))?;
-    let source_refs = row_json_array(&row, "source_refs_json")?;
-    let content_digest = try_get!(row, String, "content_digest");
-    let rendered_view = try_get!(row, String, "rendered_view");
-    let render_version = try_get!(row, String, "render_version");
-    let rendered_digest = try_get!(row, String, "rendered_digest");
-    let approved_at = try_get!(row, Option<String>, "approved_at");
+    let source_refs = row_json_array(row.source_refs_json(), "source_refs_json")?;
+    let content_digest = row.content_digest().map_err(sql_error)?;
+    let rendered_view = row.rendered_view().map_err(sql_error)?;
+    let render_version = row.render_version().map_err(sql_error)?;
+    let rendered_digest = row.rendered_digest().map_err(sql_error)?;
+    let approved_at = row.approved_at().map_err(sql_error)?;
     let charter_stale = content_digest.trim().is_empty()
         || rendered_view.trim().is_empty()
         || render_version.trim().is_empty()
         || rendered_digest.trim().is_empty()
         || approved_at.is_none();
     let charter = json!({
-        "id": try_get!(row, String, "revision_id"),
-        "charter_id": try_get!(row, String, "charter_id"),
-        "revision_number": try_get!(row, i64, "revision"),
-        "base_revision_id": try_get!(row, Option<String>, "base_revision_id"),
+        "id": row.revision_id().map_err(sql_error)?,
+        "charter_id": row.charter_id().map_err(sql_error)?,
+        "revision_number": row.revision().map_err(sql_error)?,
+        "base_revision_id": row.base_revision_id().map_err(sql_error)?,
         "lifecycle": "approved",
-        "project_mode": try_get!(row, String, "project_mode"),
-        "maturity": try_get!(row, String, "maturity"),
-        "schema_version": try_get!(row, String, "schema_version"),
+        "project_mode": row.project_mode().map_err(sql_error)?,
+        "maturity": row.maturity().map_err(sql_error)?,
+        "schema_version": row.schema_version().map_err(sql_error)?,
         "content": content,
         "rendered_view": rendered_view,
         "render_version": render_version,
@@ -97,13 +67,13 @@ pub(super) async fn load_current_charter(
             "profile_revision": Value::Null,
             "operating_skill_revision": Value::Null,
             "source_refs": source_refs,
-            "change_summary": try_get!(row, String, "change_summary"),
+            "change_summary": row.change_summary().map_err(sql_error)?,
             "material_diff": Value::Null,
         },
         "readiness": Value::Null,
         "approved_at": approved_at,
         "superseded_by_revision_id": Value::Null,
-        "created_at": try_get!(row, String, "created_at"),
+        "created_at": row.created_at().map_err(sql_error)?,
     });
     Ok((Some(charter), vision, charter_stale))
 }
@@ -112,69 +82,33 @@ pub(super) async fn load_active_milestones(
     state: &AppState,
     project_id: &str,
 ) -> ApiResult<(Vec<(Value, Value)>, bool)> {
-    let rows = sqlx::query(
-        "SELECT id, project_id, milestone_sequence, milestone_key,
-                display_label, current_definition_revision_id, lifecycle,
-                blocker_reason_json, stale_reason_json,
-                reconciliation_reason_json, version, created_at, updated_at
-         FROM project_milestone
-         WHERE project_id = ?
-           AND (
-                lifecycle IN ('active', 'ready_for_release')
-                OR id = (SELECT primary_milestone_id FROM project WHERE id = ?)
-           )
-         ORDER BY milestone_sequence ASC, id ASC",
-    )
-    .bind(project_id)
-    .bind(project_id)
-    .fetch_all(state.db.pool())
-    .await
-    .map_err(sql_error)?;
+    let rows = state
+        .db
+        .overview_active_milestones(project_id)
+        .await
+        .map_err(sql_error)?;
 
     let mut stale = false;
     let mut result = Vec::with_capacity(rows.len());
     for row in rows {
-        let milestone_row_id = row.try_get::<String, _>("id").map_err(sql_error)?;
-        let Some(revision_id) = row
-            .try_get::<Option<String>, _>("current_definition_revision_id")
-            .map_err(sql_error)?
-        else {
+        let milestone_row_id = row.id().map_err(sql_error)?;
+        let Some(revision_id) = row.current_definition_revision_id().map_err(sql_error)? else {
             stale = true;
             continue;
         };
-        let Some(revision) = sqlx::query(
-            "SELECT mr.id, mr.milestone_id, mr.revision, mr.base_revision, mr.lifecycle,
-                    mr.display_label, mr.outcome, mr.included_scope_json,
-                    mr.excluded_scope_json, mr.charter_revision_id,
-                    mr.document_revisions_json, mr.task_selection_json,
-                    mr.dependencies_json, mr.risks_json, mr.acceptance_checks_json,
-                    mr.evidence_requirements_json, mr.known_issues_json,
-                    mr.change_summary, mr.schema_version, mr.render_version, mr.rendered_view,
-                    mr.content_digest, mr.rendered_digest, mr.author_type, mr.author_id,
-                    mr.source_refs_json, mr.created_at,
-                    mr.base_revision_id AS base_revision_id,
-                    cr.charter_id AS charter_id,
-                    cr.content_digest AS charter_content_digest,
-                    cr.render_version AS charter_render_version,
-                    cr.rendered_digest AS charter_render_digest
-             FROM project_milestone_revision mr
-             LEFT JOIN project_charter_revision cr
-               ON cr.id = mr.charter_revision_id
-             WHERE mr.id = ? AND mr.milestone_id = ?",
-        )
-        .bind(&revision_id)
-        .bind(&milestone_row_id)
-        .fetch_optional(state.db.pool())
-        .await
-        .map_err(sql_error)?
+        let Some(revision) = state
+            .db
+            .overview_milestone_revision(&revision_id, &milestone_row_id)
+            .await
+            .map_err(sql_error)?
         else {
             stale = true;
             continue;
         };
 
         let principal = match principal_value(
-            try_get!(revision, String, "author_type").as_str(),
-            try_get!(revision, Option<String>, "author_id").as_deref(),
+            revision.author_type().map_err(sql_error)?.as_str(),
+            revision.author_id().map_err(sql_error)?.as_deref(),
         ) {
             Some(value) => value,
             None => {
@@ -182,11 +116,11 @@ pub(super) async fn load_active_milestones(
                 continue;
             }
         };
-        let charter_revision_id = try_get!(revision, Option<String>, "charter_revision_id");
-        let charter_id = try_get!(revision, Option<String>, "charter_id");
-        let charter_content_digest = try_get!(revision, Option<String>, "charter_content_digest");
-        let charter_render_version = try_get!(revision, Option<String>, "charter_render_version");
-        let charter_render_digest = try_get!(revision, Option<String>, "charter_render_digest");
+        let charter_revision_id = revision.charter_revision_id().map_err(sql_error)?;
+        let charter_id = revision.charter_id().map_err(sql_error)?;
+        let charter_content_digest = revision.charter_content_digest().map_err(sql_error)?;
+        let charter_render_version = revision.charter_render_version().map_err(sql_error)?;
+        let charter_render_digest = revision.charter_render_digest().map_err(sql_error)?;
         let charter_revision = match (
             charter_revision_id.as_deref(),
             charter_id.as_deref(),
@@ -220,46 +154,57 @@ pub(super) async fn load_active_milestones(
                 Value::Null
             }
         };
-        let rendered_view = try_get!(revision, String, "rendered_view");
+        let rendered_view = revision.rendered_view().map_err(sql_error)?;
         if rendered_view.trim().is_empty() {
             stale = true;
         }
-        if try_get!(revision, String, "content_digest")
+        if revision
+            .content_digest()
+            .map_err(sql_error)?
             .trim()
             .is_empty()
-            || try_get!(revision, String, "rendered_digest")
+            || revision
+                .rendered_digest()
+                .map_err(sql_error)?
                 .trim()
                 .is_empty()
-            || try_get!(revision, String, "render_version")
+            || revision
+                .render_version()
+                .map_err(sql_error)?
                 .trim()
                 .is_empty()
         {
             stale = true;
         }
-        if try_get!(revision, String, "lifecycle") != "approved" {
+        if revision.lifecycle().map_err(sql_error)? != "approved" {
             stale = true;
         }
-        let definition_name = try_get!(revision, Option<String>, "display_label")
-            .unwrap_or(try_get!(row, String, "milestone_key"));
+        let definition_name = revision
+            .display_label()
+            .map_err(sql_error)?
+            .unwrap_or(row.milestone_key().map_err(sql_error)?);
         let definition_content = json!({
             "name": definition_name,
-            "outcome": try_get!(revision, String, "outcome"),
-            "included_scope": row_json_array_from(&revision, "included_scope_json")?,
-            "excluded_scope": row_json_array_from(&revision, "excluded_scope_json")?,
+            "outcome": revision.outcome().map_err(sql_error)?,
+            "included_scope": row_json_array_from(revision.included_scope_json(), "included_scope_json")?,
+            "excluded_scope": row_json_array_from(revision.excluded_scope_json(), "excluded_scope_json")?,
             "charter_revision": charter_revision,
-            "document_revisions": row_json_array_from(&revision, "document_revisions_json")?,
-            "task_ids": row_json_array_from(&revision, "task_selection_json")?,
-            "dependencies": row_json_array_from(&revision, "dependencies_json")?,
-            "risks": row_json_array_from(&revision, "risks_json")?,
-            "acceptance_checks": row_json_array_from(&revision, "acceptance_checks_json")?,
-            "evidence_requirements": row_json_array_from(&revision, "evidence_requirements_json")?,
-            "known_issues": row_json_array_from(&revision, "known_issues_json")?,
+            "document_revisions": row_json_array_from(revision.document_revisions_json(), "document_revisions_json")?,
+            "task_ids": row_json_array_from(revision.task_selection_json(), "task_selection_json")?,
+            "dependencies": row_json_array_from(revision.dependencies_json(), "dependencies_json")?,
+            "risks": row_json_array_from(revision.risks_json(), "risks_json")?,
+            "acceptance_checks": row_json_array_from(revision.acceptance_checks_json(), "acceptance_checks_json")?,
+            "evidence_requirements": row_json_array_from(revision.evidence_requirements_json(), "evidence_requirements_json")?,
+            "known_issues": row_json_array_from(revision.known_issues_json(), "known_issues_json")?,
             "target_date": Value::Null,
         });
         let reasons = concat_json_arrays(
-            row_json_array_from(&row, "blocker_reason_json")?,
-            row_json_array_from(&row, "stale_reason_json")?,
-            row_json_array_from(&row, "reconciliation_reason_json")?,
+            row_json_array_from(row.blocker_reason_json(), "blocker_reason_json")?,
+            row_json_array_from(row.stale_reason_json(), "stale_reason_json")?,
+            row_json_array_from(
+                row.reconciliation_reason_json(),
+                "reconciliation_reason_json",
+            )?,
         );
         let reasons = if rendered_view.trim().is_empty() {
             append_projection_reason(
@@ -275,40 +220,40 @@ pub(super) async fn load_active_milestones(
             reasons
         };
         let milestone = json!({
-            "id": try_get!(row, String, "id"),
-            "project_id": try_get!(row, String, "project_id"),
-            "milestone_sequence": try_get!(row, i64, "milestone_sequence"),
-            "canonical_id": try_get!(row, String, "milestone_key"),
-            "display_label": try_get!(row, Option<String>, "display_label"),
+            "id": row.id().map_err(sql_error)?,
+            "project_id": row.project_id().map_err(sql_error)?,
+            "milestone_sequence": row.milestone_sequence().map_err(sql_error)?,
+            "canonical_id": row.milestone_key().map_err(sql_error)?,
+            "display_label": row.display_label().map_err(sql_error)?,
             "definition_revision_id": revision_id,
-            "lifecycle": try_get!(row, String, "lifecycle"),
+            "lifecycle": row.lifecycle().map_err(sql_error)?,
             "projection_reasons": reasons,
-            "version": try_get!(row, i64, "version"),
-            "created_at": try_get!(row, String, "created_at"),
-            "updated_at": try_get!(row, String, "updated_at"),
+            "version": row.version().map_err(sql_error)?,
+            "created_at": row.created_at().map_err(sql_error)?,
+            "updated_at": row.updated_at().map_err(sql_error)?,
         });
         let definition = json!({
-            "id": try_get!(revision, String, "id"),
-            "milestone_id": try_get!(revision, String, "milestone_id"),
+            "id": revision.id().map_err(sql_error)?,
+            "milestone_id": revision.milestone_id().map_err(sql_error)?,
             "project_id": project_id,
-            "revision_number": try_get!(revision, i64, "revision"),
-            "base_revision_id": try_get!(revision, Option<String>, "base_revision_id"),
-            "lifecycle": try_get!(revision, String, "lifecycle"),
-            "schema_version": try_get!(revision, String, "schema_version"),
+            "revision_number": revision.revision().map_err(sql_error)?,
+            "base_revision_id": revision.base_revision_id().map_err(sql_error)?,
+            "lifecycle": revision.lifecycle().map_err(sql_error)?,
+            "schema_version": revision.schema_version().map_err(sql_error)?,
             "content": definition_content,
             "rendered_view": rendered_view,
-            "render_version": try_get!(revision, String, "render_version"),
-            "content_digest": try_get!(revision, String, "content_digest"),
-            "render_digest": try_get!(revision, String, "rendered_digest"),
+            "render_version": revision.render_version().map_err(sql_error)?,
+            "content_digest": revision.content_digest().map_err(sql_error)?,
+            "render_digest": revision.rendered_digest().map_err(sql_error)?,
             "provenance": {
                 "author": principal,
                 "profile_revision": Value::Null,
                 "operating_skill_revision": Value::Null,
-                "source_refs": row_json_array_from(&revision, "source_refs_json")?,
-                "change_summary": try_get!(revision, String, "change_summary"),
+                "source_refs": row_json_array_from(revision.source_refs_json(), "source_refs_json")?,
+                "change_summary": revision.change_summary().map_err(sql_error)?,
                 "material_diff": Value::Null,
             },
-            "created_at": try_get!(revision, String, "created_at"),
+            "created_at": revision.created_at().map_err(sql_error)?,
         });
         result.push((milestone, definition));
     }
@@ -321,26 +266,15 @@ pub(super) async fn load_current_acceptance_checks(
     milestone_id: &str,
     definition_revision_id: &str,
 ) -> ApiResult<Vec<Value>> {
-    let rows = sqlx::query(
-        "SELECT c.id, c.description, c.required, c.source_kind, c.expected_result,
-                c.version, r.id AS result_id, r.outcome, r.input_digest
-         FROM project_milestone_check c
-         LEFT JOIN project_milestone_check_result r ON r.id = c.current_result_id
-         WHERE c.project_id = ? AND c.milestone_id = ? AND c.definition_revision_id = ?
-         ORDER BY c.check_key ASC, c.id ASC",
-    )
-    .bind(project_id)
-    .bind(milestone_id)
-    .bind(definition_revision_id)
-    .fetch_all(state.db.pool())
-    .await
-    .map_err(sql_error)?;
+    let rows = state
+        .db
+        .overview_acceptance_checks(project_id, milestone_id, definition_revision_id)
+        .await
+        .map_err(sql_error)?;
 
     rows.into_iter()
         .map(|row| {
-            let outcome = row
-                .try_get::<Option<String>, _>("outcome")
-                .map_err(sql_error)?;
+            let outcome = row.outcome;
             let latest_result = match outcome.as_deref() {
                 Some("passed") => Some("pass"),
                 Some("failed") => Some("fail"),
@@ -351,15 +285,15 @@ pub(super) async fn load_current_acceptance_checks(
                 None => None,
             };
             Ok(json!({
-                "id": try_get!(row, String, "id"),
-                "description": try_get!(row, String, "description"),
-                "required": try_get!(row, i64, "required") != 0,
-                "source_kind": try_get!(row, String, "source_kind"),
-                "expected_result": try_get!(row, String, "expected_result"),
-                "version": try_get!(row, i64, "version"),
+                "id": row.id,
+                "description": row.description,
+                "required": row.required != 0,
+                "source_kind": row.source_kind,
+                "expected_result": row.expected_result,
+                "version": row.version,
                 "latest_result": latest_result,
-                "latest_result_id": try_get!(row, Option<String>, "result_id"),
-                "latest_result_digest": try_get!(row, Option<String>, "input_digest"),
+                "latest_result_id": row.result_id,
+                "latest_result_digest": row.input_digest,
             }))
         })
         .collect()
@@ -374,43 +308,29 @@ pub(super) async fn load_task_counts(
     let workflow =
         services::workflow::engine::WorkflowEngine::resolve_workflow(&project.workflow_definition);
     let rows = if let Some(milestone_id) = milestone_id {
-        sqlx::query(
-            "SELECT t.status, t.condition_json
-             FROM task t
-             JOIN project_task_governance g ON g.task_id = t.id
-             WHERE t.project_id = ? AND g.project_id = ? AND g.milestone_id = ?
-               AND t.deleted_at IS NULL",
-        )
-        .bind(project_id)
-        .bind(project_id)
-        .bind(milestone_id)
-        .fetch_all(state.db.pool())
-        .await
-        .map_err(sql_error)?
+        state
+            .db
+            .overview_milestone_tasks(project_id, milestone_id)
+            .await
+            .map_err(sql_error)?
     } else {
-        sqlx::query(
-            "SELECT status, condition_json FROM task
-             WHERE project_id = ? AND deleted_at IS NULL",
-        )
-        .bind(project_id)
-        .fetch_all(state.db.pool())
-        .await
-        .map_err(sql_error)?
+        state
+            .db
+            .overview_project_tasks(project_id)
+            .await
+            .map_err(sql_error)?
     };
 
     let mut counts = Counts::default();
     for row in rows {
         counts.total += 1;
-        let status = row.try_get::<String, _>("status").map_err(sql_error)?;
+        let status = row.status;
         // A Task keeps its workflow status when an execution fails, so status
         // alone reports stalled work as active. The blocked record is what the
         // user is actually waiting on, and a terminal Task has moved past it.
         // An unreadable condition is the same typed unknown park every row
         // reader shows; one such Task never fails the whole overview.
-        let condition = db::task_condition::decode_or_unknown(
-            &row.try_get::<String, _>("condition_json")
-                .map_err(sql_error)?,
-        );
+        let condition = db::task_condition::decode_or_unknown(&row.condition_json);
         // A blank blocked record was never counted as blocked.
         let blocked = condition.read().interruption_present
             && !condition
@@ -443,64 +363,27 @@ pub(super) async fn load_check_summary(
     milestone_id: Option<&str>,
 ) -> ApiResult<Value> {
     let rows = if let Some(milestone_id) = milestone_id {
-        sqlx::query(
-            "SELECT c.required, r.outcome
-             FROM project_milestone_check c
-             JOIN project_milestone m
-               ON m.id = c.milestone_id AND m.project_id = c.project_id
-              AND m.current_definition_revision_id = c.definition_revision_id
-             LEFT JOIN project_milestone_check_result r
-               ON r.id = COALESCE(
-                    c.current_result_id,
-                    (SELECT r2.id FROM project_milestone_check_result r2
-                     WHERE r2.check_id = c.id
-                       AND r2.definition_revision_id = c.definition_revision_id
-                     ORDER BY r2.created_at DESC, r2.id DESC LIMIT 1)
-                  )
-              AND r.definition_revision_id = c.definition_revision_id
-             WHERE c.project_id = ? AND c.milestone_id = ?",
-        )
-        .bind(project_id)
-        .bind(milestone_id)
-        .fetch_all(state.db.pool())
-        .await
-        .map_err(sql_error)?
+        state
+            .db
+            .overview_milestone_checks(project_id, milestone_id)
+            .await
+            .map_err(sql_error)?
     } else {
-        sqlx::query(
-            "SELECT c.required, r.outcome
-             FROM project_milestone_check c
-             JOIN project_milestone m
-               ON m.id = c.milestone_id AND m.project_id = c.project_id
-              AND m.current_definition_revision_id = c.definition_revision_id
-             LEFT JOIN project_milestone_check_result r
-               ON r.id = COALESCE(
-                    c.current_result_id,
-                    (SELECT r2.id FROM project_milestone_check_result r2
-                     WHERE r2.check_id = c.id
-                       AND r2.definition_revision_id = c.definition_revision_id
-                     ORDER BY r2.created_at DESC, r2.id DESC LIMIT 1)
-                  )
-              AND r.definition_revision_id = c.definition_revision_id
-             WHERE c.project_id = ?",
-        )
-        .bind(project_id)
-        .fetch_all(state.db.pool())
-        .await
-        .map_err(sql_error)?
+        state
+            .db
+            .overview_project_checks(project_id)
+            .await
+            .map_err(sql_error)?
     };
 
     let mut summary = CheckSummary::default();
     for row in rows {
-        let required = row.try_get::<i64, _>("required").map_err(sql_error)? != 0;
+        let required = row.required().map_err(sql_error)? != 0;
         if !required {
             continue;
         }
         summary.required_total += 1;
-        match row
-            .try_get::<Option<String>, _>("outcome")
-            .map_err(sql_error)?
-            .as_deref()
-        {
+        match row.outcome().map_err(sql_error)?.as_deref() {
             Some("passed") => summary.passed += 1,
             Some("failed") => summary.failed += 1,
             Some("stale") => summary.stale += 1,
@@ -524,56 +407,25 @@ pub(super) async fn load_document_freshness(
     state: &AppState,
     project_id: &str,
 ) -> ApiResult<(Vec<Value>, bool)> {
-    let rows = sqlx::query(
-        "SELECT d.id, d.kind, d.lifecycle AS document_lifecycle,
-                d.current_draft_revision_id,
-                d.current_approved_revision_id,
-                approved.content_digest AS approved_digest,
-                approved.lifecycle AS approved_lifecycle,
-                working.content_digest AS working_digest,
-                working.lifecycle AS working_lifecycle
-         FROM project_document d
-         LEFT JOIN project_document_revision approved
-           ON approved.id = d.current_approved_revision_id
-          AND approved.document_id = d.id
-         LEFT JOIN project_document_revision working
-           ON working.id = d.current_draft_revision_id
-          AND working.document_id = d.id
-         WHERE d.project_id = ?
-         ORDER BY d.updated_at DESC, d.id ASC",
-    )
-    .bind(project_id)
-    .fetch_all(state.db.pool())
-    .await
-    .map_err(sql_error)?;
+    let rows = state
+        .db
+        .overview_document_freshness(project_id)
+        .await
+        .map_err(sql_error)?;
     let mut stale = false;
     let mut documents = Vec::new();
     for row in rows {
-        let approved = row
-            .try_get::<Option<String>, _>("current_approved_revision_id")
-            .map_err(sql_error)?;
-        let Some(kind) = document_kind(row.try_get::<String, _>("kind").map_err(sql_error)?) else {
+        let approved = row.current_approved_revision_id().map_err(sql_error)?;
+        let Some(kind) = document_kind(row.kind().map_err(sql_error)?) else {
             stale = true;
             continue;
         };
-        let document_lifecycle = row
-            .try_get::<String, _>("document_lifecycle")
-            .map_err(sql_error)?;
-        let draft = row
-            .try_get::<Option<String>, _>("current_draft_revision_id")
-            .map_err(sql_error)?;
-        let approved_digest = row
-            .try_get::<Option<String>, _>("approved_digest")
-            .map_err(sql_error)?;
-        let approved_lifecycle = row
-            .try_get::<Option<String>, _>("approved_lifecycle")
-            .map_err(sql_error)?;
-        let working_digest = row
-            .try_get::<Option<String>, _>("working_digest")
-            .map_err(sql_error)?;
-        let working_lifecycle = row
-            .try_get::<Option<String>, _>("working_lifecycle")
-            .map_err(sql_error)?;
+        let document_lifecycle = row.document_lifecycle().map_err(sql_error)?;
+        let draft = row.current_draft_revision_id().map_err(sql_error)?;
+        let approved_digest = row.approved_digest().map_err(sql_error)?;
+        let approved_lifecycle = row.approved_lifecycle().map_err(sql_error)?;
+        let working_digest = row.working_digest().map_err(sql_error)?;
+        let working_lifecycle = row.working_lifecycle().map_err(sql_error)?;
         let approved_is_valid = approved.as_deref().is_some_and(|id| !id.trim().is_empty())
             && approved_digest
                 .as_deref()
@@ -623,7 +475,7 @@ pub(super) async fn load_document_freshness(
             DocumentFreshnessStatus::Current => None,
         };
         documents.push(json!({
-            "document_id": try_get!(row, String, "id"),
+            "document_id": row.id().map_err(sql_error)?,
             "kind": kind,
             "approved_revision_id": approved,
             "approved_digest": approved_digest,
@@ -688,32 +540,25 @@ pub(super) async fn load_pending_decisions(
     state: &AppState,
     project_id: &str,
 ) -> ApiResult<Vec<Value>> {
-    let rows = sqlx::query(
-        "SELECT id, lifecycle, question, context_json, options_json,
-                selected_outcome, rationale, principal_type, principal_id,
-                version, created_at, updated_at
-         FROM project_decision_candidate
-         WHERE project_id = ? AND lifecycle IN ('draft', 'proposed')
-         ORDER BY created_at ASC, id ASC",
-    )
-    .bind(project_id)
-    .fetch_all(state.db.pool())
-    .await
-    .map_err(sql_error)?;
+    let rows = state
+        .db
+        .overview_pending_decisions(project_id)
+        .await
+        .map_err(sql_error)?;
 
     let mut pending = Vec::with_capacity(rows.len());
     for row in rows {
-        let id = try_get!(row, String, "id");
+        let id = row.id().map_err(sql_error)?;
         let mut reasons: Vec<String> = Vec::new();
 
-        let question = try_get!(row, String, "question");
+        let question = row.question().map_err(sql_error)?;
         if question.trim().is_empty() {
             reasons.push("question is empty".to_owned());
         }
         let options: Vec<String> =
-            serde_json::from_str(&try_get!(row, String, "options_json")).unwrap_or_default();
-        let selected_outcome = try_get!(row, Option<String>, "selected_outcome");
-        let rationale = try_get!(row, Option<String>, "rationale");
+            serde_json::from_str(&row.options_json().map_err(sql_error)?).unwrap_or_default();
+        let selected_outcome = row.selected_outcome().map_err(sql_error)?;
+        let rationale = row.rationale().map_err(sql_error)?;
         if rationale
             .as_deref()
             .map(str::trim)
@@ -728,7 +573,7 @@ pub(super) async fn load_pending_decisions(
             reasons.push(reason.to_owned());
         }
 
-        let context_value: Value = serde_json::from_str(&try_get!(row, String, "context_json"))
+        let context_value: Value = serde_json::from_str(&row.context_json().map_err(sql_error)?)
             .unwrap_or_else(|_| json!({}));
         let decision_class = context_value
             .get("decision_class")
@@ -745,8 +590,8 @@ pub(super) async fn load_pending_decisions(
             "affected_milestone_ids": context_value.get("affected_milestone_ids").cloned().unwrap_or_else(|| json!([])),
         });
 
-        let principal_type = try_get!(row, Option<String>, "principal_type");
-        let principal_id = try_get!(row, Option<String>, "principal_id");
+        let principal_type = row.principal_type().map_err(sql_error)?;
+        let principal_id = row.principal_id().map_err(sql_error)?;
         let proposed_by = principal_type
             .as_deref()
             .and_then(|kind| principal_value(kind, principal_id.as_deref()))
@@ -772,8 +617,8 @@ pub(super) async fn load_pending_decisions(
         let summary = json!({
             "id": id,
             "project_id": project_id,
-            "lifecycle": try_get!(row, String, "lifecycle"),
-            "version": try_get!(row, i64, "version"),
+            "lifecycle": row.lifecycle().map_err(sql_error)?,
+            "version": row.version().map_err(sql_error)?,
             "question": question,
             "options": options,
             "recommendation": selected_outcome,
@@ -786,8 +631,8 @@ pub(super) async fn load_pending_decisions(
             "invalid_reason": if valid { None } else { Some(reasons.join("; ")) },
             "approve_target": approve_target,
             "reject_target": reject_target,
-            "created_at": try_get!(row, String, "created_at"),
-            "updated_at": try_get!(row, String, "updated_at"),
+            "created_at": row.created_at().map_err(sql_error)?,
+            "updated_at": row.updated_at().map_err(sql_error)?,
         });
         // Validate the closed public contract at the projection boundary so
         // a malformed persisted row can only ever surface through the
@@ -804,54 +649,38 @@ pub(super) async fn load_pending_decisions(
 /// included here; they remain in `pending_decisions` so a draft cannot
 /// be mistaken for an authoritative decision.
 pub(super) async fn load_decisions(state: &AppState, project_id: &str) -> ApiResult<Vec<Value>> {
-    let rows = sqlx::query(
-        "SELECT id, project_id, state, decision_class, question, context_json,
-                options_json, selected_outcome, rationale, principal_type,
-                principal_id, authority_basis, source_refs_json,
-                affected_records_json, supersedes_decision_id, created_at
-         FROM project_decision
-         WHERE project_id = ?
-         ORDER BY created_at DESC, id DESC
-         LIMIT 64",
-    )
-    .bind(project_id)
-    .fetch_all(state.db.pool())
-    .await
-    .map_err(sql_error)?;
+    let rows = state
+        .db
+        .overview_decisions(project_id)
+        .await
+        .map_err(sql_error)?;
 
-    let replacement_rows = sqlx::query(
-        "SELECT supersedes_decision_id, state FROM project_decision
-         WHERE project_id = ? AND supersedes_decision_id IS NOT NULL
-         ORDER BY created_at DESC, id DESC",
-    )
-    .bind(project_id)
-    .fetch_all(state.db.pool())
-    .await
-    .map_err(sql_error)?;
+    let replacement_rows = state
+        .db
+        .overview_decision_replacements(project_id)
+        .await
+        .map_err(sql_error)?;
     let mut replacement_state = HashMap::<String, String>::new();
     for row in replacement_rows {
-        let Some(superseded_id) = row
-            .try_get::<Option<String>, _>("supersedes_decision_id")
-            .map_err(sql_error)?
-        else {
+        let Some(superseded_id) = row.supersedes_decision_id().map_err(sql_error)? else {
             continue;
         };
-        replacement_state.insert(superseded_id, try_get!(row, String, "state"));
+        replacement_state.insert(superseded_id, row.state().map_err(sql_error)?);
     }
 
     let mut decisions = Vec::with_capacity(rows.len());
     for row in rows {
-        let id = try_get!(row, String, "id");
+        let id = row.id().map_err(sql_error)?;
         let state = effective_decision_state(
-            &try_get!(row, String, "state"),
+            &row.state().map_err(sql_error)?,
             replacement_state.get(&id).map(String::as_str),
         );
         let principal = principal_value(
-            try_get!(row, String, "principal_type").as_str(),
-            Some(try_get!(row, String, "principal_id").as_str()),
+            row.principal_type().map_err(sql_error)?.as_str(),
+            Some(row.principal_id().map_err(sql_error)?.as_str()),
         )
         .ok_or_else(|| ApiError::internal("invalid persisted Decision principal"))?;
-        let affected = row_json(&row, "affected_records_json")?;
+        let affected = row_json(row.affected_records_json(), "affected_records_json")?;
         let affected_artifact_refs = affected
             .get("artifact_refs")
             .cloned()
@@ -866,23 +695,23 @@ pub(super) async fn load_decisions(state: &AppState, project_id: &str) -> ApiRes
             .unwrap_or_else(|| json!([]));
         let decision = json!({
             "id": id,
-            "project_id": try_get!(row, String, "project_id"),
+            "project_id": row.project_id().map_err(sql_error)?,
             "state": state,
-            "question": try_get!(row, String, "question"),
-            "context": Some(try_get!(row, String, "context_json")),
-            "options": row_json_array(&row, "options_json")?,
-            "selected_outcome": try_get!(row, String, "selected_outcome"),
-            "rationale": try_get!(row, String, "rationale"),
+            "question": row.question().map_err(sql_error)?,
+            "context": Some(row.context_json().map_err(sql_error)?),
+            "options": row_json_array(row.options_json(), "options_json")?,
+            "selected_outcome": row.selected_outcome().map_err(sql_error)?,
+            "rationale": row.rationale().map_err(sql_error)?,
             "decision_maker": principal,
-            "decision_class": try_get!(row, String, "decision_class"),
-            "authority_basis": Some(try_get!(row, String, "authority_basis")),
+            "decision_class": row.decision_class().map_err(sql_error)?,
+            "authority_basis": Some(row.authority_basis().map_err(sql_error)?),
             "affected_artifact_refs": affected_artifact_refs,
             "affected_task_ids": affected_task_ids,
             "affected_milestone_ids": affected_milestone_ids,
-            "supersedes_id": try_get!(row, Option<String>, "supersedes_decision_id"),
-            "provenance": row_json_array(&row, "source_refs_json")?,
-            "created_at": try_get!(row, String, "created_at"),
-            "effective_at": try_get!(row, String, "created_at"),
+            "supersedes_id": row.supersedes_decision_id().map_err(sql_error)?,
+            "provenance": row_json_array(row.source_refs_json(), "source_refs_json")?,
+            "created_at": row.created_at().map_err(sql_error)?,
+            "effective_at": row.created_at().map_err(sql_error)?,
         });
         // Validate the closed public contract at the projection boundary so a
         // malformed persisted row cannot become a permissive JSON blob.
@@ -908,41 +737,19 @@ pub(super) async fn load_evidence(
     state: &AppState,
     project_id: &str,
 ) -> ApiResult<(Vec<Value>, bool)> {
-    let rows = sqlx::query(
-        "SELECT a.id, a.project_id, a.asset_id, a.task_id,
-                a.source_task_id, a.source_execution_id, a.source_validation_id,
-                a.source_task_version, a.source_context_digest,
-                a.source_definition_revision_id,
-                a.milestone_id, a.acceptance_check_ids_json, a.caption,
-                a.evidence_kind, COALESCE(a.checksum, m.checksum) AS checksum,
-                CASE WHEN m.availability != 'available' THEN m.availability
-                     ELSE a.availability END AS availability,
-                a.author_type, a.author_id, a.created_at,
-                a.updated_at, a.deleted_at, a.version
-         FROM project_media_attachment a
-         JOIN media_asset m ON m.id = a.asset_id AND m.project_id = a.project_id
-         WHERE a.project_id = ? AND a.attachment_kind = 'evidence'
-         ORDER BY a.created_at ASC, a.id ASC",
-    )
-    .bind(project_id)
-    .fetch_all(state.db.pool())
-    .await
-    .map_err(sql_error)?;
+    let rows = state
+        .db
+        .overview_evidence(project_id)
+        .await
+        .map_err(sql_error)?;
     let mut evidence = Vec::new();
     let mut stale = false;
     for row in rows {
-        let Some(kind) = evidence_kind(
-            row.try_get::<Option<String>, _>("evidence_kind")
-                .map_err(sql_error)?
-                .as_deref(),
-        ) else {
+        let Some(kind) = evidence_kind(row.evidence_kind().map_err(sql_error)?.as_deref()) else {
             stale = true;
             continue;
         };
-        let Some(checksum) = row
-            .try_get::<Option<String>, _>("checksum")
-            .map_err(sql_error)?
-        else {
+        let Some(checksum) = row.checksum().map_err(sql_error)? else {
             stale = true;
             continue;
         };
@@ -950,48 +757,40 @@ pub(super) async fn load_evidence(
             stale = true;
             continue;
         }
-        let availability_value = try_get!(row, String, "availability");
+        let availability_value = row.availability().map_err(sql_error)?;
         let Some(availability) = evidence_availability(availability_value.as_str()) else {
             stale = true;
             continue;
         };
         let Some(author) = principal_value(
-            row.try_get::<String, _>("author_type")
-                .map_err(sql_error)?
-                .as_str(),
-            row.try_get::<Option<String>, _>("author_id")
-                .map_err(sql_error)?
-                .as_deref(),
+            row.author_type().map_err(sql_error)?.as_str(),
+            row.author_id().map_err(sql_error)?.as_deref(),
         ) else {
             stale = true;
             continue;
         };
         evidence.push(json!({
-            "id": try_get!(row, String, "id"),
-            "project_id": try_get!(row, String, "project_id"),
-            "asset_id": try_get!(row, String, "asset_id"),
-            "task_id": try_get!(row, Option<String>, "task_id"),
-        "source_task_id": try_get!(row, Option<String>, "source_task_id"),
-        "source_run_id": try_get!(row, Option<String>, "source_execution_id"),
-        "source_validation_id": try_get!(row, Option<String>, "source_validation_id"),
-        "source_task_version": try_get!(row, Option<i64>, "source_task_version"),
-        "source_context_digest": try_get!(row, Option<String>, "source_context_digest"),
-        "source_definition_revision_id": try_get!(
-            row,
-            Option<String>,
-            "source_definition_revision_id"
-        ),
-        "milestone_id": try_get!(row, Option<String>, "milestone_id"),
-            "acceptance_check_ids": row_json_array_from(&row, "acceptance_check_ids_json")?,
-            "caption": try_get!(row, Option<String>, "caption").unwrap_or_default(),
+            "id": row.id().map_err(sql_error)?,
+            "project_id": row.project_id().map_err(sql_error)?,
+            "asset_id": row.asset_id().map_err(sql_error)?,
+            "task_id": row.task_id().map_err(sql_error)?,
+        "source_task_id": row.source_task_id().map_err(sql_error)?,
+        "source_run_id": row.source_execution_id().map_err(sql_error)?,
+        "source_validation_id": row.source_validation_id().map_err(sql_error)?,
+        "source_task_version": row.source_task_version().map_err(sql_error)?,
+        "source_context_digest": row.source_context_digest().map_err(sql_error)?,
+        "source_definition_revision_id": row.source_definition_revision_id().map_err(sql_error)?,
+        "milestone_id": row.milestone_id().map_err(sql_error)?,
+            "acceptance_check_ids": row_json_array_from(row.acceptance_check_ids_json(), "acceptance_check_ids_json")?,
+            "caption": row.caption().map_err(sql_error)?.unwrap_or_default(),
             "kind": kind,
             "checksum": checksum,
             "availability": availability,
             "author": author,
-            "captured_at": try_get!(row, String, "created_at"),
-            "version": try_get!(row, i64, "version"),
-            "created_at": try_get!(row, String, "created_at"),
-            "removed_at": try_get!(row, Option<String>, "deleted_at"),
+            "captured_at": row.created_at().map_err(sql_error)?,
+            "version": row.version().map_err(sql_error)?,
+            "created_at": row.created_at().map_err(sql_error)?,
+            "removed_at": row.deleted_at().map_err(sql_error)?,
         }));
     }
     Ok((evidence, stale))
@@ -1004,40 +803,37 @@ pub(super) async fn load_latest_readiness(
     current_definition_revision_id: &str,
     project_evidence: &[Value],
 ) -> ApiResult<(Option<Value>, bool)> {
-    let row = sqlx::query(
-        "SELECT id, project_id, milestone_id, definition_revision_id,
-                input_manifest_json, event_watermark, outcome,
-                blocking_reasons_json, check_results_json, waiver_manifest_json,
-                evidence_manifest_json, commit_context_json,
-                computing_policy_revision, readiness_digest,
-                principal_type, principal_id, authorization_basis,
-                authorization_action, authorization_occurred_at,
-                expected_milestone_version, explicit_event, created_at
-         FROM project_readiness_snapshot
-         WHERE project_id = ? AND milestone_id = ?
-         ORDER BY created_at DESC, id DESC LIMIT 1",
-    )
-    .bind(project_id)
-    .bind(milestone_id)
-    .fetch_optional(state.db.pool())
-    .await
-    .map_err(sql_error)?;
+    let row = state
+        .db
+        .overview_latest_readiness(project_id, milestone_id)
+        .await
+        .map_err(sql_error)?;
     let Some(row) = row else {
         return Ok((None, false));
     };
-    let definition_revision_id = try_get!(row, String, "definition_revision_id");
-    let source_event_watermark = try_get!(row, String, "event_watermark");
+    let definition_revision_id = row.definition_revision_id().map_err(sql_error)?;
+    let source_event_watermark = row.event_watermark().map_err(sql_error)?;
     let stale = definition_revision_id != current_definition_revision_id
         || source_event_watermark.trim().is_empty();
-    let input_manifest =
-        typed_json_array::<api_types::ReadinessInput>(&row, "input_manifest_json")?;
-    let reasons = typed_json_array::<api_types::ReadinessReason>(&row, "blocking_reasons_json")?;
-    let check_results =
-        typed_json_array::<api_types::ValidationResult>(&row, "check_results_json")?;
-    let waiver_ids = string_array_from(&row, "waiver_manifest_json")?;
-    let evidence_attachment_ids =
-        readiness_evidence_ids(&row_json(&row, "evidence_manifest_json")?)?;
-    let persisted_evidence_manifest = row_json(&row, "evidence_manifest_json")?;
+    let input_manifest = typed_json_array::<api_types::ReadinessInput>(
+        row.input_manifest_json(),
+        "input_manifest_json",
+    )?;
+    let reasons = typed_json_array::<api_types::ReadinessReason>(
+        row.blocking_reasons_json(),
+        "blocking_reasons_json",
+    )?;
+    let check_results = typed_json_array::<api_types::ValidationResult>(
+        row.check_results_json(),
+        "check_results_json",
+    )?;
+    let waiver_ids = string_array_from(row.waiver_manifest_json(), "waiver_manifest_json")?;
+    let evidence_attachment_ids = readiness_evidence_ids(&row_json(
+        row.evidence_manifest_json(),
+        "evidence_manifest_json",
+    )?)?;
+    let persisted_evidence_manifest =
+        row_json(row.evidence_manifest_json(), "evidence_manifest_json")?;
     let persisted_evidence_digests = persisted_evidence_manifest
         .get("digests")
         .or_else(|| persisted_evidence_manifest.get("evidence_digests"))
@@ -1086,21 +882,22 @@ pub(super) async fn load_latest_readiness(
             evidence_availability.push(Value::String(availability.to_owned()));
         }
     }
-    let commit_build_check_context = string_array_from(&row, "commit_context_json")?;
-    let result = try_get!(row, String, "outcome");
-    let computing_policy_revision = try_get!(row, String, "computing_policy_revision");
-    let readiness_digest = try_get!(row, String, "readiness_digest");
-    let expected_milestone_version = try_get!(row, i64, "expected_milestone_version");
+    let commit_build_check_context =
+        string_array_from(row.commit_context_json(), "commit_context_json")?;
+    let result = row.outcome().map_err(sql_error)?;
+    let computing_policy_revision = row.computing_policy_revision().map_err(sql_error)?;
+    let readiness_digest = row.readiness_digest().map_err(sql_error)?;
+    let expected_milestone_version = row.expected_milestone_version().map_err(sql_error)?;
     let Some(requesting_principal) = principal_value(
-        try_get!(row, String, "principal_type").as_str(),
-        Some(try_get!(row, String, "principal_id").as_str()),
+        row.principal_type().map_err(sql_error)?.as_str(),
+        Some(row.principal_id().map_err(sql_error)?.as_str()),
     ) else {
         return Ok((None, true));
     };
-    let authorization_basis = try_get!(row, String, "authorization_basis");
-    let authorization_action = try_get!(row, String, "authorization_action");
-    let authorization_event = try_get!(row, String, "explicit_event");
-    let authorization_occurred_at = try_get!(row, String, "authorization_occurred_at");
+    let authorization_basis = row.authorization_basis().map_err(sql_error)?;
+    let authorization_action = row.authorization_action().map_err(sql_error)?;
+    let authorization_event = row.explicit_event().map_err(sql_error)?;
+    let authorization_occurred_at = row.authorization_occurred_at().map_err(sql_error)?;
     let stale = stale
         || result == "stale"
         || evidence_stale
@@ -1114,9 +911,9 @@ pub(super) async fn load_latest_readiness(
 
     Ok((
         Some(json!({
-            "id": try_get!(row, String, "id"),
-            "project_id": try_get!(row, String, "project_id"),
-            "milestone_id": try_get!(row, String, "milestone_id"),
+            "id": row.id().map_err(sql_error)?,
+            "project_id": row.project_id().map_err(sql_error)?,
+            "milestone_id": row.milestone_id().map_err(sql_error)?,
             "expected_milestone_version": expected_milestone_version,
             "milestone_definition_revision_id": definition_revision_id,
             "input_manifest": input_manifest,
@@ -1131,7 +928,7 @@ pub(super) async fn load_latest_readiness(
             "commit_build_check_context": commit_build_check_context,
             "computing_policy_revision": computing_policy_revision,
             "readiness_digest": readiness_digest,
-            "computed_at": try_get!(row, String, "created_at"),
+            "computed_at": row.created_at().map_err(sql_error)?,
             "requesting_principal": requesting_principal,
             "authorization": {
                 "principal": requesting_principal,
@@ -1149,69 +946,34 @@ pub(super) async fn load_releases(
     state: &AppState,
     project_id: &str,
 ) -> ApiResult<(Vec<Value>, bool)> {
-    let rows = sqlx::query(
-        "SELECT r.id, r.project_id, r.milestone_id, r.release_sequence,
-                r.release_revision, r.release_identifier,
-                r.milestone_revision_id, r.readiness_snapshot_id,
-                r.readiness_digest,
-                r.summary, r.changelog, r.known_issues_json,
-                r.charter_revision_id, r.document_revisions_json,
-                r.decision_ids_json, r.task_references_json,
-                r.validation_references_json, r.git_references_json,
-                r.evidence_references_json, r.waivers_json,
-                r.releasing_principal_type, r.releasing_principal_id,
-                r.authorization_basis, r.authorization_action,
-                r.explicit_event, r.authorization_occurred_at,
-                r.schema_version, r.snapshot_digest, r.idempotency_key,
-                r.created_at, m.milestone_key, m.display_label,
-                mr.content_digest AS milestone_definition_digest,
-                rs.expected_milestone_version,
-                rs.event_watermark AS source_event_watermark,
-                cr.charter_id AS historic_charter_id,
-                cr.content_digest AS charter_content_digest,
-                cr.render_version AS charter_render_version,
-                cr.rendered_digest AS charter_render_digest
-         FROM project_release r
-         JOIN project_milestone m ON m.id = r.milestone_id AND m.project_id = r.project_id
-         JOIN project_milestone_revision mr
-           ON mr.id = r.milestone_revision_id AND mr.milestone_id = r.milestone_id
-         JOIN project_readiness_snapshot rs
-           ON rs.id = r.readiness_snapshot_id
-          AND rs.project_id = r.project_id
-          AND rs.milestone_id = r.milestone_id
-         LEFT JOIN project_charter_revision cr ON cr.id = r.charter_revision_id
-         WHERE r.project_id = ?
-         ORDER BY r.created_at DESC, r.id DESC",
-    )
-    .bind(project_id)
-    .fetch_all(state.db.pool())
-    .await
-    .map_err(sql_error)?;
+    let rows = state
+        .db
+        .overview_releases(project_id)
+        .await
+        .map_err(sql_error)?;
     let mut releases = Vec::new();
     let mut stale = false;
     for row in rows {
         // The release wire contract intentionally contains full immutable
         // references.  A malformed/incomplete persisted row is not silently
         // filled with guessed digests; it is omitted from the projection.
-        let Some(charter_revision_id) = try_get!(row, Option<String>, "charter_revision_id") else {
+        let Some(charter_revision_id) = row.charter_revision_id().map_err(sql_error)? else {
             stale = true;
             continue;
         };
-        let Some(charter_id) = try_get!(row, Option<String>, "historic_charter_id") else {
+        let Some(charter_id) = row.historic_charter_id().map_err(sql_error)? else {
             stale = true;
             continue;
         };
-        let Some(charter_digest) = try_get!(row, Option<String>, "charter_content_digest") else {
+        let Some(charter_digest) = row.charter_content_digest().map_err(sql_error)? else {
             stale = true;
             continue;
         };
-        let Some(charter_render_version) = try_get!(row, Option<String>, "charter_render_version")
-        else {
+        let Some(charter_render_version) = row.charter_render_version().map_err(sql_error)? else {
             stale = true;
             continue;
         };
-        let Some(charter_render_digest) = try_get!(row, Option<String>, "charter_render_digest")
-        else {
+        let Some(charter_render_digest) = row.charter_render_digest().map_err(sql_error)? else {
             stale = true;
             continue;
         };
@@ -1231,24 +993,18 @@ pub(super) async fn load_releases(
             "render_version": charter_render_version,
             "render_digest": charter_render_digest,
         });
-        let decision_refs = parse_release_refs::<api_types::ReleaseDecisionReference>(&try_get!(
-            row,
-            String,
-            "decision_ids_json"
-        ));
-        let task_refs = parse_release_refs::<api_types::ReleaseTaskReference>(&try_get!(
-            row,
-            String,
-            "task_references_json"
-        ));
-        let validation_refs = parse_release_refs::<api_types::ReleaseValidationReference>(
-            &try_get!(row, String, "validation_references_json"),
+        let decision_refs = parse_release_refs::<api_types::ReleaseDecisionReference>(
+            &row.decision_ids_json().map_err(sql_error)?,
         );
-        let evidence_pins = parse_release_refs::<api_types::EvidencePin>(&try_get!(
-            row,
-            String,
-            "evidence_references_json"
-        ));
+        let task_refs = parse_release_refs::<api_types::ReleaseTaskReference>(
+            &row.task_references_json().map_err(sql_error)?,
+        );
+        let validation_refs = parse_release_refs::<api_types::ReleaseValidationReference>(
+            &row.validation_references_json().map_err(sql_error)?,
+        );
+        let evidence_pins = parse_release_refs::<api_types::EvidencePin>(
+            &row.evidence_references_json().map_err(sql_error)?,
+        );
         if decision_refs.is_none()
             || task_refs.is_none()
             || validation_refs.is_none()
@@ -1258,24 +1014,24 @@ pub(super) async fn load_releases(
             continue;
         }
         let Some(released_by) = principal_value(
-            try_get!(row, String, "releasing_principal_type").as_str(),
-            Some(try_get!(row, String, "releasing_principal_id").as_str()),
+            row.releasing_principal_type().map_err(sql_error)?.as_str(),
+            Some(row.releasing_principal_id().map_err(sql_error)?.as_str()),
         ) else {
             stale = true;
             continue;
         };
-        let milestone_definition_revision_id = try_get!(row, String, "milestone_revision_id");
-        let milestone_definition_digest = try_get!(row, String, "milestone_definition_digest");
-        let readiness_snapshot_id = try_get!(row, String, "readiness_snapshot_id");
-        let readiness_digest = try_get!(row, String, "readiness_digest");
-        let snapshot_digest = try_get!(row, String, "snapshot_digest");
-        let release_identifier = try_get!(row, String, "release_identifier");
-        let expected_milestone_version = try_get!(row, i64, "expected_milestone_version");
-        let source_event_watermark = try_get!(row, String, "source_event_watermark");
-        let authorization_basis = try_get!(row, String, "authorization_basis");
-        let authorization_action = try_get!(row, String, "authorization_action");
-        let authorization_event = try_get!(row, String, "explicit_event");
-        let authorization_occurred_at = try_get!(row, String, "authorization_occurred_at");
+        let milestone_definition_revision_id = row.milestone_revision_id().map_err(sql_error)?;
+        let milestone_definition_digest = row.milestone_definition_digest().map_err(sql_error)?;
+        let readiness_snapshot_id = row.readiness_snapshot_id().map_err(sql_error)?;
+        let readiness_digest = row.readiness_digest().map_err(sql_error)?;
+        let snapshot_digest = row.snapshot_digest().map_err(sql_error)?;
+        let release_identifier = row.release_identifier().map_err(sql_error)?;
+        let expected_milestone_version = row.expected_milestone_version().map_err(sql_error)?;
+        let source_event_watermark = row.source_event_watermark().map_err(sql_error)?;
+        let authorization_basis = row.authorization_basis().map_err(sql_error)?;
+        let authorization_action = row.authorization_action().map_err(sql_error)?;
+        let authorization_event = row.explicit_event().map_err(sql_error)?;
+        let authorization_occurred_at = row.authorization_occurred_at().map_err(sql_error)?;
         if milestone_definition_revision_id.trim().is_empty()
             || milestone_definition_digest.trim().is_empty()
             || readiness_snapshot_id.trim().is_empty()
@@ -1293,30 +1049,30 @@ pub(super) async fn load_releases(
             continue;
         }
         let snapshot = json!({
-            "schema_version": try_get!(row, String, "schema_version"),
+            "schema_version": row.schema_version().map_err(sql_error)?,
             "project_id": project_id,
-            "milestone_id": try_get!(row, String, "milestone_id"),
-            "milestone_canonical_id": try_get!(row, String, "milestone_key"),
-            "release_revision": try_get!(row, i64, "release_revision"),
+            "milestone_id": row.milestone_id().map_err(sql_error)?,
+            "milestone_canonical_id": row.milestone_key().map_err(sql_error)?,
+            "release_revision": row.release_revision().map_err(sql_error)?,
             "release_identity": release_identifier,
             "milestone_definition_revision_id": milestone_definition_revision_id,
             "milestone_definition_digest": milestone_definition_digest,
             "expected_milestone_version": expected_milestone_version,
-            "display_label": try_get!(row, Option<String>, "display_label"),
-            "summary": try_get!(row, String, "summary"),
-            "changelog": string_array_from(&row, "changelog")?,
-            "known_issues": row_json_array_from(&row, "known_issues_json")?,
+            "display_label": row.display_label().map_err(sql_error)?,
+            "summary": row.summary().map_err(sql_error)?,
+            "changelog": string_array_from(row.changelog(), "changelog")?,
+            "known_issues": row_json_array_from(row.known_issues_json(), "known_issues_json")?,
             "readiness_snapshot_id": readiness_snapshot_id,
             "readiness_digest": readiness_digest,
             "source_event_watermark": source_event_watermark,
             "charter_revision": charter_ref,
-            "document_revisions": row_json_array_from(&row, "document_revisions_json")?,
+            "document_revisions": row_json_array_from(row.document_revisions_json(), "document_revisions_json")?,
             "included_decisions": decision_refs,
             "included_tasks": task_refs,
             "validation_results": validation_refs,
-            "repository_references": string_array_from(&row, "git_references_json")?,
+            "repository_references": string_array_from(row.git_references_json(), "git_references_json")?,
             "evidence_pins": evidence_pins,
-            "waived_check_ids": string_array_from(&row, "waivers_json")?,
+            "waived_check_ids": string_array_from(row.waivers_json(), "waivers_json")?,
             "released_by": released_by,
             "authorization": {
                 "principal": released_by,
@@ -1325,19 +1081,19 @@ pub(super) async fn load_releases(
                 "event_id": authorization_event,
                 "occurred_at": authorization_occurred_at,
             },
-            "released_at": try_get!(row, String, "created_at"),
-            "idempotency_key": try_get!(row, String, "idempotency_key"),
+            "released_at": row.created_at().map_err(sql_error)?,
+            "idempotency_key": row.idempotency_key().map_err(sql_error)?,
             "snapshot_digest": snapshot_digest,
         });
         releases.push(json!({
-            "id": try_get!(row, String, "id"),
+            "id": row.id().map_err(sql_error)?,
             "project_id": project_id,
-            "milestone_id": try_get!(row, String, "milestone_id"),
-            "release_sequence": try_get!(row, i64, "release_sequence"),
+            "milestone_id": row.milestone_id().map_err(sql_error)?,
+            "release_sequence": row.release_sequence().map_err(sql_error)?,
             "release_identity": release_identifier,
             "snapshot": snapshot,
-            "version": try_get!(row, i64, "release_revision"),
-            "created_at": try_get!(row, String, "created_at"),
+            "version": row.release_revision().map_err(sql_error)?,
+            "created_at": row.created_at().map_err(sql_error)?,
         }));
     }
     Ok((releases, stale))
@@ -1348,48 +1104,32 @@ pub(super) async fn load_watermark(
     project_id: &str,
     project_work_epoch: i64,
 ) -> ApiResult<String> {
-    let row = sqlx::query(
-        "SELECT id FROM domain_event
-         WHERE scope_type = 'project' AND scope_id = ?
-         ORDER BY sequence DESC LIMIT 1",
-    )
-    .bind(project_id)
-    .fetch_optional(state.db.pool())
-    .await
-    .map_err(sql_error)?;
+    let row = state
+        .db
+        .overview_event_watermark(project_id)
+        .await
+        .map_err(sql_error)?;
     Ok(match row {
-        Some(row) => try_get!(row, String, "id"),
+        Some(id) => id,
         None => format!("project-work-epoch:{project_work_epoch}"),
     })
 }
 
 pub(super) async fn load_failed_task_count(state: &AppState, project_id: &str) -> ApiResult<i64> {
-    sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM task
-         WHERE project_id = ? AND deleted_at IS NULL
-           AND (lower(status) LIKE '%failed%'
-                OR lower(status) LIKE '%error%'
-                OR json_extract(condition_json, '$.evidence.presentation.hard_failure') = 1)",
-    )
-    .bind(project_id)
-    .fetch_one(state.db.pool())
-    .await
-    .map_err(sql_error)
+    state
+        .db
+        .overview_failed_task_count(project_id)
+        .await
+        .map_err(sql_error)
 }
 
 pub(super) async fn load_reconciliation_required(
     state: &AppState,
     project_id: &str,
 ) -> ApiResult<bool> {
-    sqlx::query_scalar::<_, i64>(
-        "SELECT EXISTS (
-             SELECT 1 FROM project_reconciliation_record
-             WHERE project_id = ? AND state = 'required'
-         )",
-    )
-    .bind(project_id)
-    .fetch_one(state.db.pool())
-    .await
-    .map(|value| value != 0)
-    .map_err(sql_error)
+    state
+        .db
+        .overview_reconciliation_required(project_id)
+        .await
+        .map_err(sql_error)
 }

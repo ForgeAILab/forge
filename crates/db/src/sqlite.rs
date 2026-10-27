@@ -1272,3 +1272,14 @@ fn push_coordination_visibility<'a>(
         .push(format!("))) OR ({table}.scope_type = 'agent_chat' AND EXISTS (SELECT 1 FROM agent_chat WHERE agent_chat.id = {table}.scope_id AND agent_chat.kind = 'account_main' AND agent_chat.account_id = ")).push_bind(user_id)
         .push(")))");
 }
+
+pub use orchestration::overview::{
+    OverviewAcceptanceCheckRead, OverviewCandidateRead, OverviewCharterRead, OverviewCheckRead,
+    OverviewDecisionRead, OverviewDocumentRead, OverviewEvidenceRead, OverviewMilestoneRead,
+    OverviewMilestoneRevisionRead, OverviewReadinessRead, OverviewReleaseRead,
+    OverviewReplacementRead, OverviewTaskRead,
+};
+
+pub use orchestration::documents::{ProjectDocumentIdRead, ProjectDocumentRevisionRead};
+
+pub use orchestration::decisions::{ProjectDecisionCandidateRead, ProjectDecisionRead};
