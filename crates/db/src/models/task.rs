@@ -34,6 +34,9 @@ pub struct Task {
     pub updated_at: String,
     #[serde(default)]
     pub condition: crate::TaskCondition,
+    /// Freshness of the stored channels; private receipts use the NULL fallback.
+    #[serde(skip)]
+    pub condition_digest: Option<String>,
 }
 /// Decoder for private stored Task receipts written before condition became public.
 /// Live REST/MCP serializers always use their dedicated DTOs.
@@ -101,6 +104,7 @@ impl From<TaskArchive> for Task {
             created_at: archive.created_at,
             updated_at: archive.updated_at,
             condition: crate::TaskCondition::default(),
+            condition_digest: None,
         };
         task.condition = condition
             .unwrap_or_else(|| crate::compose_condition(&crate::ConditionInput::from(&task)));

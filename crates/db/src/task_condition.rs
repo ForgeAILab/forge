@@ -70,10 +70,6 @@ pub enum TaskCondition {
 /// This evidence is private and non-authoritative.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConditionEvidence {
-    /// SHA-256 of the raw channel members used by the producer. Missing on
-    /// caches written before this encoding revision.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub channel_digest: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub observations: Vec<ParkReason>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -324,7 +320,6 @@ impl TaskCondition {
     pub fn typed(&self) -> Self {
         let mut typed = self.clone();
         let evidence = typed.evidence_mut();
-        evidence.channel_digest = None;
         evidence.stated = false;
         evidence.diagnostic_ids.clear();
         evidence.error_annotation = None;
@@ -335,15 +330,13 @@ impl TaskCondition {
         evidence.unparsed_metadata = None;
         typed
     }
-    /// Channel freshness is the digest comparison. Durable witnesses and
-    /// their projection must agree independently; bounded copies and the
-    /// writer's `stated` mark do not establish freshness.
+    /// Compare the typed body and durable projections. Callers independently
+    /// fence channel freshness with the row's digest, or validate bounded
+    /// evidence before stamping a pre-digest row.
     pub(crate) fn stored_agrees(stored: &[u8], expected: &Self, encoded: &str) -> bool {
         stored == encoded.as_bytes()
-            || serde_json::from_slice::<Self>(stored).is_ok_and(|stored| {
-                stored.evidence().channel_digest == expected.evidence().channel_digest
-                    && stored.typed() == expected.typed()
-            })
+            || serde_json::from_slice::<Self>(stored)
+                .is_ok_and(|stored| stored.typed() == expected.typed())
     }
 }
 
@@ -469,12 +462,16 @@ impl ConditionInput {
             let raw = row.try_get_raw(index)?;
             let is_text = sqlx::ValueRef::type_info(&raw).to_string() == "TEXT";
             let bytes: Option<Vec<u8>> = row.try_get(index)?;
-            let value = match bytes.as_ref().map(|bytes| String::from_utf8(bytes.clone())) {
+            let value = match bytes.map(String::from_utf8) {
                 None => None,
                 Some(Ok(text)) if is_text => Some(text),
-                Some(_) => {
+                Some(other) => {
                     input.non_text.push(field.clone());
-                    input.non_text_bytes.push((field.clone(), bytes.unwrap()));
+                    let bytes = match other {
+                        Ok(text) => text.into_bytes(),
+                        Err(error) => error.into_bytes(),
+                    };
+                    input.non_text_bytes.push((field.clone(), bytes));
                     None
                 }
             };
@@ -787,7 +784,6 @@ pub(crate) fn compose_channels_from(initial: bool, view: &ChannelView<'_>) -> Ta
             UnknownConditionProblem::UnownedEntry
         },
     ));
-    evidence.channel_digest = Some(digest::of_view(view));
     condition
 }
 
@@ -1153,7 +1149,6 @@ pub(crate) fn compose_channels(view: &ChannelView<'_>) -> TaskCondition {
     let mut reasons = reasons.into_iter().map(|(_, _, reason)| reason);
 
     let evidence = ConditionEvidence {
-        channel_digest: Some(digest::of_view(view)),
         diagnostic_ids: Vec::new(),
         presentation: Some(ConditionRead::import(view)),
         observations,
@@ -1280,7 +1275,7 @@ mod recovery;
 mod storage;
 #[cfg(any(test, feature = "test-template"))]
 pub mod test_support;
-pub(crate) use storage::{backfill, classify, stored_condition};
+pub(crate) use storage::{backfill, classify, refresh_task_condition, stored_condition};
 pub use storage::{decode, decode_or_unknown, QUARANTINE_REPORT_LIMIT};
 use storage::{encode, set_condition, Stored};
 

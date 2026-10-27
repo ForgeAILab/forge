@@ -2,17 +2,6 @@
 use super::*;
 use crate::{EnqueueTaskStep, TaskRepo, TaskStepRepo};
 
-/// Archived corpora pin every cache byte except the newly added digest.
-/// Decode/encode preserves the producer's field order; corrupt fixtures keep
-/// their raw spelling. Call this before UUID/time normalization or hashing.
-pub fn without_channel_digest(raw: &str) -> String {
-    let Ok(mut condition) = decode(raw) else {
-        return raw.to_owned();
-    };
-    condition.evidence_mut().channel_digest = None;
-    encode(&condition)
-}
-
 pub async fn set_task_condition(
     db: &SqliteDb,
     task_id: &str,

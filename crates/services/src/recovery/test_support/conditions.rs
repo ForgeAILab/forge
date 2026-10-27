@@ -333,7 +333,6 @@ pub(crate) async fn assert_main_snapshot(
         (row.id.clone(), "fixture-task".into()),
         (row.project_id.clone(), "fixture-project".into()),
     ];
-    let condition = db::task_condition::test_support::without_channel_digest(&condition);
     let mut canonical = row.clone();
     canonical.id = "fixture-task".into();
     canonical.condition = serde_json::from_str(&normalize_ids(&condition, &replacements)).unwrap();

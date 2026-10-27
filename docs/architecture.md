@@ -5915,7 +5915,7 @@ Timestamp strings retain their spelling. Copied snapshots keep their original
 channel strings and JSON values without write-time byte or depth limits; strict
 new-value decoding limits copied JSON to 32 container levels.
 
-**Channel digest.** `evidence.channel_digest` is a SHA-256 over length-framed
+**Channel digest.** The nullable `task.condition_digest` column stores a SHA-256 over length-framed
 member names, value tags and raw stored bytes. SQL NULL/missing, JSON null,
 present text and non-text bytes have distinct tags. The four channels are hashed
 in full, before any presentation or evidence truncation. A metadata object is
@@ -5956,13 +5956,24 @@ members never enter the digest. SQL-NULL metadata and an empty object both
 contribute 25 absent members. Malformed, non-object or non-text metadata is
 framed as its entire raw value because it is itself a producer diagnosis.
 
-Dispatcher channel freshness is a digest comparison against the same Task
-snapshot. A missing or mismatching digest triggers recomposition while retaining
-supported Integration/Check witnesses; the sweep repairs the cache. The `stated`
-mark and bounded evidence copies cannot establish freshness. Bounded channel
-copies remain because dispatcher blocking and historical diagnostic presentation
-still read them. Their existing limits and Operations/material rendering stay
-unchanged.
+Every writer that stores `condition_json` also stores its matching digest in the
+same statement or transaction. The digest is separate from the encoded cache,
+whose field order and bytes remain unchanged. No invalidation trigger reads the
+digest column, so stamping it cannot dirty scheduler rows or list revisions.
+`V202610270500__task_condition_digest` adds the column with NULL for existing rows.
+It clears revision-8 progress saved before the column existed, so that old cursor
+cannot skip the newly NULL prefix. Checkpoints written after this migration still
+resume normally; newer revision markers and cursors are preserved.
+
+Dispatcher and hierarchy channel freshness compare the digest against the same
+Task snapshot. A mismatching digest triggers recomposition while retaining
+supported Integration/Check witnesses; the sweep repairs the cache. NULL means
+freshness is unknown: until the walk stamps a row, including one it skipped, the
+pre-digest rule applies (a stated cache, or equal bounded channel and metadata
+copies). A missing digest alone never triggers the lossy witness-only rebuild.
+Once a digest exists, neither `stated` nor bounded evidence establishes freshness.
+Bounded copies still serve blocking and historical diagnostic presentation;
+their existing limits and Operations/material rendering stay unchanged.
 
 **Durable facts and ownership.** Independently owned Integration and Check
 witnesses retain authority in `condition_json`; channel typing does not replace
@@ -6021,12 +6032,18 @@ committed page saves its revision-scoped cursor in the protected
 `task_condition_backfill_cursor` setting. Restart resumes after that page;
 replaying an uncheckpointed page is idempotent. Completing the pass records
 `task_condition_mapping_revision` and clears the cursor atomically. A newer
-recorded revision is neither backfilled nor lowered. Encoding-only repairs retain
-the cache body and add its digest. Repairs do not change Task versions or times,
-create Attention or interruption events, or re-arm incidents. Existing cache-update
-triggers still invalidate list revisions and scheduler dirty generations.
-Completed upgrade passes log counts without creating an invariant operator issue;
-steady passes report an issue only when they repaired a missed producer.
+recorded revision is neither backfilled nor lowered. A NULL row receives a
+stamp-only repair only when its typed condition agrees and it is stated or all
+six bounded channel/metadata copies agree. The stamp writes only
+`condition_digest`, preserving the exact cache bytes, scheduler dirty generations
+and list revisions. Otherwise the walk rewrites the recomposed cache and digest
+together, refreshing stale public evidence even when its typed condition agrees.
+Repairs do not change Task versions or times, create Attention or interruption
+events, or re-arm incidents. Real body repairs retain normal cache invalidation.
+The revision walk has its own progress record and page/completion log, including
+separate stamp and rewrite counts; neither historical rewrites nor stamps enter
+the scheduler sweep's operator pass. A clean sweep lap remains clean even while
+the walk is active. Steady passes report missed producer repairs.
 
 Corrupt/empty caches are restated from channels and durable facts. Original bytes
 are retained as diagnostic text, using base64 for non-UTF-8 data. Recognizably
@@ -6061,8 +6078,8 @@ Ordinary Task/list/board reads do not join the text table.
 
 **Verification.** Archived corpora pin all four channel strings, metadata,
 public/read/offers/Operations projections, material events and canonical Attention
-identities. Cache comparisons remove only `evidence.channel_digest` before the
-existing UUID/time normalization and byte or fingerprint comparison. Fixtures are
+identities. Cache comparisons are exact after the existing UUID/time normalization;
+the separate digest column needs no cache-byte stripping. Fixtures are
 never regenerated to accept a cache-format change. The `db/test-template` feature
 exposes `task_condition::test_support::set_task_condition` through the real claimed
 step for fixtures needing owned witnesses.

@@ -792,6 +792,7 @@ mod retry_projection_tests {
 
     fn test_task() -> db::Task {
         db::Task {
+            condition_digest: None,
             condition: Default::default(),
             id: "task".to_owned(),
             project_id: "project".to_owned(),

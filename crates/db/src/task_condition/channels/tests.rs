@@ -234,9 +234,7 @@ fn legacy_mapping_matches_archived_main_without_strict_decode() {
             non_text_bytes: Vec::new(),
         };
         assert_eq!(
-            crate::task_condition::test_support::without_channel_digest(
-                &serde_json::to_string(&crate::compose_condition(&input)).unwrap()
-            ),
+            serde_json::to_string(&crate::compose_condition(&input)).unwrap(),
             record["expected"].as_str().unwrap(),
             "{}",
             record["name"]

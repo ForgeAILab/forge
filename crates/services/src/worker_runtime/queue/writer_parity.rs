@@ -226,7 +226,6 @@ impl Fixture {
                     raw.replace(id, replacement)
                 })
         };
-        let condition = db::task_condition::test_support::without_channel_digest(&condition);
         let mut canonical = row.clone();
         canonical.id = "fixture-task".into();
         canonical.condition = serde_json::from_str(&normalize(&condition)).unwrap();

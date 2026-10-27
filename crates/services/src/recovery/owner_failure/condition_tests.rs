@@ -233,11 +233,10 @@ async fn large_root_and_200kb_reason_store_main_encoder_bytes_and_full_diagnosti
             .fetch_one(db.pool())
             .await
             .unwrap();
-        assert!(row.condition.channels_match(&legacy));
-        assert_eq!(
-            db::task_condition::test_support::without_channel_digest(&stored).as_bytes(),
-            db::task_condition::test_support::without_channel_digest(&expected).as_bytes()
-        );
+        assert!(row
+            .condition
+            .channels_match(&legacy, row.condition_digest.as_deref()));
+        assert_eq!(stored.as_bytes(), expected.as_bytes());
         assert_eq!(
             row.condition
                 .evidence()

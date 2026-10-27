@@ -547,17 +547,10 @@ impl TaskDispatcher {
         if p.condition_stale {
             // A writer missed its condition sync. This pass already resolved
             // from the legacy fields; repair the stored copy and report it.
-            let repaired = self
-                .db
+            self.db
                 .check_task_conditions_of(std::slice::from_ref(&p.read.task.id))
                 .await?;
-            if !p.condition_encoding_upgrade {
-                self.schedule_state
-                    .lock()
-                    .expect("schedule state")
-                    .sweep
-                    .repairs += repaired;
-            }
+            // The database checker already accounts for these repairs in its pass.
         }
         if !p.read.queue_owned
             && p.read.reviews.is_empty()

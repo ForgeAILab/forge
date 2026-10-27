@@ -61,16 +61,11 @@ async fn evidence_is_bounded_and_large_unrelated_fields_are_not_copied() {
         .fetch_one(db.pool())
         .await
         .unwrap();
-    assert_eq!(
-        decode(&cached)
-            .unwrap()
-            .evidence()
-            .channel_digest
-            .as_ref()
-            .unwrap()
-            .len(),
-        64
-    );
-    let length = test_support::without_channel_digest(&cached).len() as i64;
+    let digest: String = sqlx::query_scalar("SELECT condition_digest FROM task WHERE id='big'")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(digest.len(), 64);
+    let length = cached.len() as i64;
     assert!(length < 2 * EVIDENCE_VALUE_LIMIT as i64, "{length}");
 }

@@ -644,15 +644,35 @@ async fn repair_is_fenced_on_the_row_it_read() {
     let repair = "{\"kind\":\"repair\"}";
     // The Task version moved, or its condition was restated, since the read.
     assert_eq!(
-        db.repair_condition(&t.id, t.version + 1, &stored, repair)
-            .await
-            .unwrap(),
+        db.repair_condition(
+            &t.id,
+            &checks::Repair {
+                version: t.version + 1,
+                stored: stored.clone(),
+                read_digest: t.condition_digest.clone(),
+                expected: repair.into(),
+                digest: ConditionInput::from(&t).channel_digest(),
+                stamp_only: false
+            }
+        )
+        .await
+        .unwrap(),
         0
     );
     assert_eq!(
-        db.repair_condition(&t.id, t.version, b"{\"kind\":\"older\"}", repair)
-            .await
-            .unwrap(),
+        db.repair_condition(
+            &t.id,
+            &checks::Repair {
+                version: t.version,
+                stored: b"{\"kind\":\"older\"}".to_vec(),
+                read_digest: t.condition_digest.clone(),
+                expected: repair.into(),
+                digest: ConditionInput::from(&t).channel_digest(),
+                stamp_only: false
+            }
+        )
+        .await
+        .unwrap(),
         0
     );
     assert!(db.task_condition_violations().await.unwrap().is_empty());
@@ -696,6 +716,9 @@ async fn completed_pass_is_recorded_with_its_own_counts() {
 #[tokio::test]
 async fn stale_mapping_revision_reruns_the_backfill_once() {
     let db = db().await;
+    // Complete the additive digest migration before simulating an older mapping.
+    while db.backfill_task_conditions_if_stale().await.unwrap() {}
+    let db = SqliteDb::new(db.pool().clone());
     for i in 0..(CONDITION_CHECK_PAGE + 20) {
         let t = task(&db, &format!("bf{i:04}")).await;
         if i % 5 == 0 {

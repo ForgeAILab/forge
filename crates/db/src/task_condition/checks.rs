@@ -23,7 +23,7 @@ fn condition_page_select(resuming: bool) -> String {
     // An OR with a nullable cursor makes SQLite scan the index from its
     // beginning on every page. Keep resumed pages as a primary-key seek.
     let predicate = if resuming { "id>?1" } else { "?1 IS NULL" };
-    format!("SELECT {CHANNEL_SELECT},id,version FROM task WHERE {predicate} ORDER BY id LIMIT ?2")
+    format!("SELECT {CHANNEL_SELECT},id,version,condition_digest FROM task WHERE {predicate} ORDER BY id LIMIT ?2")
 }
 
 /// One walk over every Task, first id to last.
@@ -31,6 +31,8 @@ fn condition_page_select(resuming: bool) -> String {
 pub struct ConditionCheckPass {
     pub checked: u64,
     pub repaired: u64,
+    /// Digest-only stamps included in revision-walk progress.
+    pub stamped: u64,
     /// Tasks whose stored condition is a newer build's encoding. They are
     /// read, counted and left byte for byte; nothing here repairs them.
     pub quarantined: u64,
@@ -41,6 +43,7 @@ pub struct ConditionCheckPass {
 impl ConditionCheckPass {
     fn add(&mut self, page: &Page, include_encoding: bool) {
         self.checked += page.checked;
+        self.stamped += page.encoding_repairs;
         self.repaired += page.repaired
             - if include_encoding {
                 0
@@ -84,6 +87,8 @@ pub struct ConditionCheckStatus {
     /// The last completed pass. Operator status reports it only when it
     /// repaired a row; a clean pass is a log line.
     pub last_pass: Option<ConditionCheckPass>,
+    /// Revision-walk work is historical upgrade progress, never operator Attention.
+    pub walk: ConditionCheckPass,
 }
 #[derive(Debug, Default)]
 pub struct ConditionCheckState {
@@ -91,6 +96,7 @@ pub struct ConditionCheckState {
     pub(crate) in_progress: bool,
     pub(crate) status: ConditionCheckStatus,
     pass: ConditionCheckPass,
+    walk: ConditionCheckPass,
     /// Whether the recorded mapping revision is stale: unknown until the
     /// first tick reads it, then true until one pass completes.
     backfill: Option<bool>,
@@ -101,6 +107,14 @@ impl Drop for CheckGuard {
     fn drop(&mut self) {
         self.0.lock().unwrap_or_else(|p| p.into_inner()).in_progress = false;
     }
+}
+pub(super) struct Repair {
+    pub version: i64,
+    pub stored: Vec<u8>,
+    pub read_digest: Option<String>,
+    pub expected: String,
+    pub digest: String,
+    pub stamp_only: bool,
 }
 struct Page {
     checked: u64,
@@ -146,7 +160,7 @@ impl SqliteDb {
         let ids = serde_json::to_string(ids).map_err(|e| DbError::Check(e.to_string()))?;
         let page = self
             .check_condition_rows(
-                &format!("SELECT {CHANNEL_SELECT},id,version FROM task WHERE id IN (SELECT value FROM json_each(?1)) AND ?2 ORDER BY id"),
+                &format!("SELECT {CHANNEL_SELECT},id,version,condition_digest FROM task WHERE id IN (SELECT value FROM json_each(?1)) AND ?2 ORDER BY id"),
                 Some(&ids),
                 1,
             )
@@ -226,15 +240,31 @@ impl SqliteDb {
             state.status.ticks += 1;
             state.status.last_at = Some(crate::now_rfc3339());
             let backfilling = state.backfill == Some(true);
-            state.pass.add(&page, backfilling);
+            if backfilling {
+                state.walk.add(&page, true);
+                state.status.walk = state.walk.clone();
+                tracing::info!(
+                    checked = state.walk.checked,
+                    stamped = page.encoding_repairs,
+                    rewritten = page.repaired - page.encoding_repairs,
+                    "Task condition revision walk page completed"
+                );
+            } else {
+                state.pass.add(&page, false);
+            }
             state.after = page.next.clone();
             let completed = (limit != 0 && page.next.is_none()).then(|| {
-                let mut pass = std::mem::take(&mut state.pass);
+                let mut pass = if backfilling {
+                    std::mem::take(&mut state.walk)
+                } else {
+                    std::mem::take(&mut state.pass)
+                };
                 pass.completed_at = crate::now_rfc3339();
                 pass.report_quarantine(state.status.last_pass.as_ref(), backfilling);
-                if !backfilling {
-                    // Rewriting after a mapping change is the expected
-                    // result of an upgrade, not a missed producer.
+                if backfilling {
+                    state.status.walk = pass.clone();
+                } else {
+                    // Only steady passes publish operator invariant counts.
                     state.status.last_pass = Some(pass.clone());
                 }
                 pass
@@ -252,6 +282,12 @@ impl SqliteDb {
             tracing::info!(
                 checked = pass.checked,
                 repaired = pass.repaired,
+                stamped = pass.stamped,
+                rewritten = if backfilling {
+                    pass.repaired - pass.stamped
+                } else {
+                    pass.repaired
+                },
                 backfill = backfilling,
                 "Task condition invariant pass completed"
             );
@@ -300,7 +336,7 @@ impl SqliteDb {
                 if stale {
                     // The pass that clears the marker must cover every row.
                     state.after = cursor;
-                    state.pass = ConditionCheckPass::default();
+                    state.walk = ConditionCheckPass::default();
                 }
                 // Discovering an upgrade never does row work on this tick.
                 return Ok(stale);
@@ -329,40 +365,40 @@ impl SqliteDb {
     }
     /// One fenced statement: a row whose version or stored condition changed
     /// since the check read it is not written.
-    pub(super) async fn repair_condition(
-        &self,
-        task_id: &str,
-        read_version: i64,
-        read_condition: &[u8],
-        expected: &str,
-    ) -> Result<u64> {
+    pub(super) async fn repair_condition(&self, task_id: &str, repair: &Repair) -> Result<u64> {
         let mut tx = crate::begin_immediate(self.pool()).await?;
-        let current: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task WHERE id=? AND version=? AND CAST(condition_json AS BLOB)=?)")
-            .bind(task_id).bind(read_version).bind(read_condition).fetch_one(&mut *tx).await?;
+        let current: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task WHERE id=? AND version=? AND CAST(condition_json AS BLOB)=? AND condition_digest IS ?)")
+            .bind(task_id).bind(repair.version).bind(&repair.stored).bind(&repair.read_digest).fetch_one(&mut *tx).await?;
         if !current {
             return Ok(0);
         }
-        let condition = decode(expected)?;
         let row = sqlx::query(&format!("SELECT {CHANNEL_SELECT} FROM task WHERE id=?"))
             .bind(task_id)
             .fetch_one(&mut *tx)
             .await?;
-        // Metadata and some channel writes deliberately leave version alone.
-        // Fence those bytes too, under the writer lock, before a repair.
-        if !condition.channels_match(&ConditionInput::from_row(&row)?) {
+        // Fence unversioned channel writes under the writer lock too.
+        if repair.digest != ConditionInput::from_row(&row)?.channel_digest() {
             return Ok(0);
         }
-        let corrupt = matches!(classify(read_condition), Stored::Corrupt(_));
-        if corrupt {
-            recovery::record_raw(&mut tx, task_id, read_condition).await?;
+        if repair.stamp_only {
+            sqlx::query("UPDATE task SET condition_digest=? WHERE id=?")
+                .bind(&repair.digest)
+                .bind(task_id)
+                .execute(&mut *tx)
+                .await?;
+        } else {
+            if matches!(classify(&repair.stored), Stored::Corrupt(_)) {
+                recovery::record_raw(&mut tx, task_id, &repair.stored).await?;
+            }
+            set_condition(
+                &mut tx,
+                task_id,
+                &repair.expected,
+                &repair.digest,
+                Some(repair.version),
+            )
+            .await?;
         }
-        set_condition(
-            &mut tx,
-            task_id,
-            &serde_json::to_string(&condition).map_err(storage::json_error)?,
-            Some(read_version),
-        )
-        .await?;
         tx.commit().await?;
         Ok(1)
     }
@@ -413,32 +449,29 @@ impl SqliteDb {
             let expected = async {
                 let input = ConditionInput::from_row(row)?;
                 let facts = ConditionFacts::load(&mut reader, &id).await?;
-                Ok::<_, DbError>(facts.condition(&input))
+                Ok::<_, DbError>((facts.condition(&input), input.channel_digest()))
             }
             .await;
             match expected {
-                Ok(mut condition) => {
-                    let mut encoding_only = false;
-                    // An encoding-only upgrade preserves the existing cache
-                    // body, including stated presentation and owned witnesses.
-                    if let Stored::Readable(mut prior) = classified {
-                        let missing_digest = prior.evidence().channel_digest.is_none();
-                        if missing_digest && prior.typed() == condition.typed() {
-                            encoding_only = true;
-                            prior.evidence_mut().channel_digest =
-                                condition.evidence().channel_digest.clone();
-                            condition = *prior;
-                        }
-                    }
+                Ok((condition, digest)) => {
+                    let read_digest: Option<String> = row.try_get("condition_digest")?;
+                    let stamp_only = read_digest.is_none()
+                        && matches!(&classified,
+                        Stored::Readable(prior) if prior.can_stamp(&condition));
                     let expected = encode(&condition);
-                    let stored: Vec<u8> = row.try_get(5)?;
-                    if !TaskCondition::stored_agrees(&stored, &condition, &expected) {
+                    if read_digest.as_deref() != Some(digest.as_str())
+                        || !TaskCondition::stored_agrees(&stored, &condition, &expected)
+                    {
                         stale.push((
                             id,
-                            row.try_get::<i64, _>(7)?,
-                            stored,
-                            expected,
-                            encoding_only,
+                            Repair {
+                                version: row.try_get(7)?,
+                                stored,
+                                read_digest,
+                                expected,
+                                digest,
+                                stamp_only,
+                            },
                         ));
                     }
                 }
@@ -450,15 +483,12 @@ impl SqliteDb {
         reader.rollback().await?;
         let mut repaired = 0;
         let mut encoding_repairs = 0;
-        for (id, version, stored, expected, encoding_only) in stale {
+        for (id, repair) in stale {
             // A row written since is left to its own producer and the next pass.
-            match self
-                .repair_condition(&id, version, &stored, &expected)
-                .await
-            {
+            match self.repair_condition(&id, &repair).await {
                 Ok(count) => {
                     repaired += count;
-                    if encoding_only {
+                    if repair.stamp_only {
                         encoding_repairs += count;
                     }
                 }

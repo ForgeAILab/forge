@@ -1318,6 +1318,7 @@ mod tests {
         // a Task stuck in `merging` advertising no way out at all.
         let now = db::now_rfc3339();
         let mut task = Task {
+            condition_digest: None,
             condition: Default::default(),
             id: "task".into(),
             project_id: "project".into(),
@@ -1401,6 +1402,7 @@ mod tests {
     fn blocked_free_task(status: &str) -> Task {
         let now = db::now_rfc3339();
         Task {
+            condition_digest: None,
             condition: Default::default(),
             id: "task".into(),
             project_id: "project".into(),

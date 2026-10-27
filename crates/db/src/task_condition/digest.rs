@@ -11,8 +11,29 @@ impl ConditionInput {
 impl TaskCondition {
     /// Durable Integration/Check witnesses remain in this cache; the digest
     /// fences only the channel inputs, not those independently owned facts.
-    pub fn channels_match(&self, input: &ConditionInput) -> bool {
-        self.evidence().channel_digest.as_deref() == Some(input.channel_digest().as_str())
+    pub fn channels_match(&self, input: &ConditionInput, digest: Option<&str>) -> bool {
+        match digest {
+            Some(digest) => digest == input.channel_digest(),
+            None => {
+                self.evidence().stated
+                    || self.bounded_channels_equal(&compose_channels(&input.view()))
+            }
+        }
+    }
+
+    pub(crate) fn bounded_channels_equal(&self, other: &Self) -> bool {
+        let (a, b) = (self.evidence(), other.evidence());
+        a.error_annotation == b.error_annotation
+            && a.blocked_json == b.blocked_json
+            && a.failed_json == b.failed_json
+            && a.entry_barrier_json == b.entry_barrier_json
+            && a.metadata == b.metadata
+            && a.unparsed_metadata == b.unparsed_metadata
+    }
+
+    pub(crate) fn can_stamp(&self, expected: &Self) -> bool {
+        self.typed() == expected.typed()
+            && (self.evidence().stated || self.bounded_channels_equal(expected))
     }
 }
 

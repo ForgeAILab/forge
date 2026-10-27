@@ -32,6 +32,8 @@ const REDERIVED: &[(&str, &str)] = &[("task", "condition_json"), ("project", "li
 /// in them: each is NULL after the upgrade. A column added without being
 /// named here fails the test, so what it holds on a legacy row is decided.
 const ADDED: &[(&str, &str)] = &[
+    // V202610270500: stamped by the bounded background walk.
+    ("task", "condition_digest"),
     // V202610100820: set only while a step is `suspended`.
     ("task_step", "suspended_until"),
     ("task_step", "awaited_consumer_id"),

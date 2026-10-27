@@ -981,7 +981,10 @@ pub(crate) fn replan_entered(transitions: &[db::TransitionLog], receipt: &str) -
 /// shadows the legacy fields may lag them; the fields decide, as they do for
 /// the Task itself in the dispatcher's snapshot.
 fn decision_condition(child: &Task) -> db::TaskCondition {
-    if child.condition.evidence().stated {
+    if child.condition.channels_match(
+        &db::ConditionInput::from(child),
+        child.condition_digest.as_deref(),
+    ) {
         child.condition.clone()
     } else {
         child.condition.recompose(&db::ConditionInput::from(child))
@@ -1198,6 +1201,7 @@ mod replan_tests {
 
     fn task(id: &str, status: &str, parent: Option<&str>) -> Task {
         Task {
+            condition_digest: None,
             condition: Default::default(),
             id: id.to_owned(),
             project_id: "project".to_owned(),
@@ -1330,6 +1334,37 @@ mod replan_tests {
         assert!(!replan_edge(&workflow, &replan, "in_progress"));
         assert!(!replan_edge(&workflow, &Default::default(), "planning"));
         assert!(!replan_edge(&flat, &replan, "planning"));
+    }
+
+    #[test]
+    fn decision_freshness_uses_digest_and_null_uses_bounded_evidence() {
+        let mut child = parked("child", "2026-10-12T01:00:00Z", "retry_exhausted");
+        let input = db::ConditionInput::from(&child);
+        child.condition = db::compose_condition(&input);
+        let mut stated = serde_json::to_value(&child.condition).unwrap();
+        stated["evidence"]["stated"] = serde_json::json!(true);
+        child.condition = serde_json::from_value(stated).unwrap();
+        child.condition_digest = Some(input.channel_digest());
+        child.error_annotation = None;
+        assert_eq!(
+            decision_condition(&child),
+            child.condition.recompose(&db::ConditionInput::from(&child))
+        );
+        assert_ne!(decision_condition(&child), child.condition);
+        child.condition_digest = None;
+        assert_eq!(
+            decision_condition(&child),
+            child.condition,
+            "NULL stated caches retain the pre-digest fallback"
+        );
+        let mut mapped = serde_json::to_value(&child.condition).unwrap();
+        mapped["evidence"]["stated"] = serde_json::json!(false);
+        child.condition = serde_json::from_value(mapped).unwrap();
+        assert_ne!(
+            decision_condition(&child),
+            child.condition,
+            "NULL mapped caches still compare bounded evidence"
+        );
     }
 
     #[test]
@@ -1550,6 +1585,7 @@ mod tests {
 
     fn task(id: &str, status: &str, parent_task_id: Option<&str>) -> Task {
         Task {
+            condition_digest: None,
             condition: Default::default(),
             id: id.to_owned(),
             project_id: "project".to_owned(),

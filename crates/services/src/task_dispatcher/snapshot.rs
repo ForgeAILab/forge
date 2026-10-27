@@ -22,8 +22,6 @@ pub(super) struct Prepared {
     pub machine_wait: bool,
     /// The stored condition did not match the legacy fields it shadows.
     pub condition_stale: bool,
-    /// Only the cache encoding changed; do not report a missed producer.
-    pub condition_encoding_upgrade: bool,
 }
 /// Snapshot form of `task_hierarchy::effective_role_assignment`, over the rows
 /// the schedule read loaded (the Task's own, and its root's `coder` and
@@ -197,7 +195,8 @@ fn stale_condition(stored: &TaskCondition, task: &db::Task) -> Option<TaskCondit
         None => {}
     }
     let input = db::ConditionInput::from(task);
-    (!stored.channels_match(&input)).then(|| stored.recompose(&input))
+    (!stored.channels_match(&input, task.condition_digest.as_deref()))
+        .then(|| stored.recompose(&input))
 }
 impl TaskDispatcher {
     pub(super) fn prepare_schedule(
@@ -212,9 +211,6 @@ impl TaskDispatcher {
         // fields hold, and leave the stored copy to be repaired.
         let legacy = stale_condition(&r.condition, &r.task);
         let condition_stale = legacy.is_some();
-        let condition_encoding_upgrade = legacy.as_ref().is_some_and(|fresh| {
-            r.condition.evidence().channel_digest.is_none() && r.condition.typed() == fresh.typed()
-        });
         if let Some(legacy) = legacy {
             // Every callee handed this Task reads the same condition this
             // pass resolved from.
@@ -722,7 +718,6 @@ impl TaskDispatcher {
             deadline,
             machine_wait: false,
             condition_stale,
-            condition_encoding_upgrade,
         }
     }
 }
@@ -738,6 +733,7 @@ mod tests {
             "x".repeat(db::task_condition::EVIDENCE_VALUE_LIMIT + 100)
         ));
         let input = db::ConditionInput::from(&task);
+        task.condition_digest = Some(input.channel_digest());
         let mut stored = serde_json::to_value(db::compose_condition(&input)).unwrap();
         stored["evidence"]["stated"] = serde_json::json!(true);
         let stored: TaskCondition = serde_json::from_value(stored).unwrap();
@@ -752,8 +748,8 @@ mod tests {
             fresh.evidence().error_annotation
         );
         assert_ne!(
-            stored.evidence().channel_digest,
-            fresh.evidence().channel_digest
+            task.condition_digest.as_ref().unwrap(),
+            &db::ConditionInput::from(&task).channel_digest()
         );
     }
 
@@ -783,6 +779,175 @@ mod tests {
         assert_eq!(stale_condition(&corrupt, &task), Some(expected));
     }
 
+    #[tokio::test]
+    async fn null_digest_preserves_project_pause_children_and_parent_dispatch_views() {
+        use db::TaskRepo;
+        use std::sync::Arc;
+        let db = Arc::new(crate::recovery::test_support::sqlite_db().await);
+        let (project, _) = crate::recovery::test_support::seed_project_repo(&db).await;
+        let root = crate::recovery::test_support::seed_task(
+            &db,
+            project.clone(),
+            "in_progress".into(),
+            None,
+        )
+        .await;
+        let paused =
+            crate::recovery::test_support::seed_task(&db, project.clone(), "todo".into(), None)
+                .await;
+        let mut tx = db.pool().begin().await.unwrap();
+        for i in 0..2 {
+            sqlx::query("INSERT INTO task(id,project_id,parent_task_id,title,status,subtask_order,created_at,updated_at) VALUES (?,?,?,'child','todo',?,'2026-10-25','2026-10-25')")
+                .bind(db::new_uuid_v4()).bind(&root.project_id).bind(&root.id).bind(i).execute(&mut *tx).await.unwrap();
+        }
+        sqlx::query("UPDATE task SET metadata_json=? WHERE id=?")
+            .bind(serde_json::json!({"coordination_review_pending":true}).to_string())
+            .bind(&root.id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let mut tx = db.pool().begin().await.unwrap();
+        db.produce_condition_in_tx(&mut tx, &root.id, db::ConditionChange::Full)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert!(TaskRepo::get_by_id(&*db, &root.id, false)
+            .await
+            .unwrap()
+            .unwrap()
+            .condition
+            .reasons()
+            .any(|r| matches!(r, ParkReason::Children { remaining, .. } if remaining.len() == 2)));
+        let bus = Arc::new(events::EventBus::new(32));
+        let service = Arc::new(crate::TaskService::new(Arc::clone(&db), Arc::clone(&bus)));
+        let dispatcher = TaskDispatcher::new(Arc::clone(&db), bus, service);
+        let project_row = db::ProjectRepo::get_by_id(&*db, &project)
+            .await
+            .unwrap()
+            .unwrap();
+        let eval = |ids: Vec<String>, project_row: db::Project| {
+            let db = Arc::clone(&db);
+            let dispatcher = &dispatcher;
+            async move {
+                for id in &ids {
+                    let mut outcomes = Vec::new();
+                    for strip in [false, true] {
+                        let mut read = db
+                            .schedule_reads(std::slice::from_ref(id))
+                            .await
+                            .unwrap()
+                            .pop()
+                            .unwrap();
+                        if strip {
+                            read.task.condition_digest = None;
+                            if let Some(parent) = &mut read.parent {
+                                parent.condition_digest = None;
+                            }
+                        }
+                        let expected = read.condition.clone();
+                        let expected_parent = read.parent.as_ref().map(|t| t.condition.clone());
+                        let p = dispatcher.prepare_schedule(read, &project_row, chrono::Utc::now());
+                        assert_eq!(p.read.condition, expected, "upgrade must preserve reasons");
+                        assert_eq!(
+                            p.read.parent.as_ref().map(|t| t.condition.clone()),
+                            expected_parent
+                        );
+                        assert!(
+                            !p.condition_stale,
+                            "missing digest alone is not a missed producer write"
+                        );
+                        let parent_reasons =
+                            p.read.parent.as_ref().map(|t| {
+                                format!("{:?}", t.condition.reasons().collect::<Vec<_>>())
+                            });
+                        let next = super::super::next_step::next_step(
+                            &super::super::next_step::Snapshot {
+                                state: &p.read.task.status,
+                                condition: &p.read.condition,
+                                workflow: &p.workflow,
+                                facts: &p.facts,
+                            },
+                        );
+                        outcomes.push(format!(
+                    "strip={strip} stale={} reasons={:?} parent={parent_reasons:?} next={next:?}",
+                    p.condition_stale,
+                    p.read.condition.reasons().collect::<Vec<_>>()
+                ));
+                    }
+                    eprintln!("PROBE D {id}:\n  {}\n  {}", outcomes[0], outcomes[1]);
+                }
+            }
+        };
+        let child_ids: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM task WHERE parent_task_id=?")
+                .bind(&root.id)
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        let mut first = vec![root.id.clone()];
+        first.extend(child_ids);
+        eval(first, project_row.clone()).await;
+        sqlx::query("UPDATE project SET paused_at=? WHERE id=?")
+            .bind(db::now_rfc3339())
+            .bind(&project)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        db.record_schedule_park(
+            &paused.id,
+            0,
+            &serde_json::json!({"reason":"ProjectPaused", "owner":"User", "action":"ResumeProject"})
+                .to_string(),
+        )
+        .await
+        .unwrap();
+        db.check_task_conditions_of(std::slice::from_ref(&paused.id))
+            .await
+            .unwrap();
+        let project_row = db::ProjectRepo::get_by_id(&*db, &project)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(TaskRepo::get_by_id(&*db, &paused.id, false)
+            .await
+            .unwrap()
+            .unwrap()
+            .condition
+            .reasons()
+            .any(|r| matches!(r, ParkReason::ProjectPaused { .. })));
+        eval(vec![paused.id.clone()], project_row.clone()).await;
+        sqlx::query("UPDATE task SET condition_digest=NULL WHERE id=?")
+            .bind(&root.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::raw_sql("CREATE TRIGGER skip_digest_repair BEFORE UPDATE OF condition_digest ON task BEGIN SELECT RAISE(ABORT,'review-probe skipped repair'); END;")
+            .execute(db.pool()).await.unwrap();
+        db::SystemSettingRepo::set_setting(&*db, db::MAPPING_REVISION_KEY, "7", &db::now_rfc3339())
+            .await
+            .unwrap();
+        while db.backfill_task_conditions_if_stale().await.unwrap() {}
+        let skipped = TaskRepo::get_by_id(&*db, &root.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(skipped.condition_digest.is_none());
+        let read = db
+            .schedule_reads(std::slice::from_ref(&root.id))
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let prepared = dispatcher.prepare_schedule(read, &project_row, chrono::Utc::now());
+        assert!(
+            !prepared.condition_stale,
+            "a skipped row keeps the NULL freshness fallback after the walk"
+        );
+        assert_eq!(prepared.read.condition, skipped.condition);
+        db.complete_condition_pass(0);
+        assert_eq!(db.condition_check_status().last_pass.unwrap().repaired, 0);
+    }
     #[tokio::test]
     async fn channel_digest_detects_raw_sql_missed_syncs_and_the_sweep_repairs_them() {
         use db::TaskRepo;

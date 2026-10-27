@@ -112,9 +112,15 @@ async fn scoped_statement_records_one_occurrence() {
             .unwrap()
             .unwrap();
         assert_eq!(first.condition.typed(), second.condition.typed());
-        set_condition(&mut tx, "once", &second.encoded, Some(second.version))
-            .await
-            .unwrap();
+        set_condition(
+            &mut tx,
+            "once",
+            &second.encoded,
+            &second.input.channel_digest(),
+            Some(second.version),
+        )
+        .await
+        .unwrap();
         produce(&mut tx, "once", ConditionChange::Full)
             .await
             .unwrap();
@@ -277,8 +283,9 @@ async fn additive_upgrade_and_revision_seven_preserve_existing_condition_bytes_a
         let facts = ConditionFacts::load(&mut c, id).await.unwrap();
         let legacy = facts.condition(&ConditionInput::from(&row));
         let raw = encode(&legacy); // Same legacy mapper and encoding as MAIN.
-        sqlx::query("UPDATE task SET condition_json=? WHERE id=?")
+        sqlx::query("UPDATE task SET condition_json=?,condition_digest=? WHERE id=?")
             .bind(&raw)
+            .bind(ConditionInput::from(&row).channel_digest())
             .bind(id)
             .execute(&mut *c)
             .await

@@ -105,6 +105,10 @@ pub(crate) async fn derive(
             .input
             .non_text
             .retain(|field| *field != ConditionField::MetadataJson);
+        snapshot
+            .input
+            .non_text_bytes
+            .retain(|(field, _)| *field != ConditionField::MetadataJson);
     }
     let carried = (!explicit)
         .then(|| write::applied_condition(task_id, &snapshot.stored, snapshot.version))
@@ -230,7 +234,7 @@ pub(crate) async fn derive(
     }
     // An initial state reads the entry barrier differently; only then is the
     // mapping taken again, from the same snapshot.
-    let mut condition = if (facts.initial && !from_statement)
+    let condition = if (facts.initial && !from_statement)
         || matches!(
             statement,
             Some(
@@ -245,7 +249,6 @@ pub(crate) async fn derive(
     } else {
         facts.apply(mapped)
     };
-    condition.evidence_mut().channel_digest = Some(snapshot.input.channel_digest());
     integration::validate(&condition)?;
     check::validate(&condition)?;
     if corruption.is_some() {
@@ -260,7 +263,8 @@ pub(crate) async fn derive(
     let encoded = serde_json::to_string(&condition).map_err(storage::json_error)?;
     Ok(Some(Produced {
         version: snapshot.version,
-        changed: encoded.as_bytes() != snapshot.stored,
+        changed: encoded.as_bytes() != snapshot.stored
+            || snapshot.digest.as_deref() != Some(snapshot.input.channel_digest().as_str()),
         parent: snapshot
             .parent_watches
             .then(|| snapshot.parent.clone())
@@ -281,7 +285,14 @@ pub(crate) async fn produce(
         return Ok(());
     };
     if produced.changed {
-        set_condition(c, task_id, &produced.encoded, Some(produced.version)).await?;
+        set_condition(
+            c,
+            task_id,
+            &produced.encoded,
+            &produced.input.channel_digest(),
+            Some(produced.version),
+        )
+        .await?;
     }
     if let Some(parent) = &produced.parent {
         produce_children(c, parent).await?;
@@ -307,7 +318,14 @@ pub(crate) async fn state(
         return Ok(());
     };
     if produced.changed {
-        set_condition(c, task_id, &produced.encoded, Some(produced.version)).await?;
+        set_condition(
+            c,
+            task_id,
+            &produced.encoded,
+            &produced.input.channel_digest(),
+            Some(produced.version),
+        )
+        .await?;
     }
     if let Some(parent) = &produced.parent {
         produce_children(c, parent).await?;
@@ -319,7 +337,14 @@ pub(crate) async fn state(
 pub(crate) async fn produce_children(c: &mut SqliteConnection, parent_id: &str) -> Result<()> {
     if let Some(produced) = derive(c, parent_id, ConditionChange::Children, None, None).await? {
         if produced.changed {
-            set_condition(c, parent_id, &produced.encoded, Some(produced.version)).await?;
+            set_condition(
+                c,
+                parent_id,
+                &produced.encoded,
+                &produced.input.channel_digest(),
+                Some(produced.version),
+            )
+            .await?;
         }
     }
     Ok(())
@@ -399,12 +424,12 @@ pub(crate) async fn metadata_condition(
     c: &mut SqliteConnection,
     task_id: &str,
     metadata: Option<&str>,
-) -> Result<Option<String>> {
+) -> Result<Option<(String, String)>> {
     Ok(
         derive(c, task_id, ConditionChange::Legacy, Some(metadata), None)
             .await?
             .filter(|produced| produced.changed)
-            .map(|produced| produced.encoded),
+            .map(|produced| (produced.encoded, produced.input.channel_digest())),
     )
 }
 

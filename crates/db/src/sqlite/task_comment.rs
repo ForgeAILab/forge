@@ -157,12 +157,14 @@ impl SqliteDb {
         .await?;
         sqlx::query(
             "UPDATE task
-             SET metadata_json = ?, condition_json = CASE WHEN ? THEN ? ELSE condition_json END, updated_at = ?
+             SET metadata_json = ?, condition_json = CASE WHEN ? THEN ? ELSE condition_json END, condition_digest = CASE WHEN ? THEN ? ELSE condition_digest END, updated_at = ?
              WHERE id = ? AND deleted_at IS NULL",
         )
         .bind(metadata_json.as_deref())
         .bind(condition.is_some())
-        .bind(condition)
+        .bind(condition.as_ref().map(|(body, _)| body))
+        .bind(condition.is_some())
+        .bind(condition.as_ref().map(|(_, digest)| digest))
         .bind(now)
         .bind(root_id)
         .execute(&mut **transaction)
