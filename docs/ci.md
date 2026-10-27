@@ -104,11 +104,6 @@ that feature itself. Agent-host likewise explicitly enables its own
 
 ### Archived condition parity oracle
 
-The `task_condition::checkpoint_tests` steady-check cases distinguish digest-only
-stamps from body rewrites, including typed-equal but byte-different bodies.
-Operator-status condition-check tests also assert that digest-only refreshes
-produce neither a repair warning nor an operator Attention row.
-
 The two condition writer tests compare 16 shapes at the first write, a metadata
 write, and the queue merge against `conditions-main-37309bb9.jsonl` (96 cases).
 Each case initializes its SQLite schema before holding a
@@ -158,6 +153,11 @@ Their test paths use `tests::<topic>::<test>` and
 `check_run::tests::retention::<test>`. Budget and Solo session tests retain
 `budget::tests::<test>` and `session::tests::<test>`. The DB shard still selects
 all targets, and the rest shard still covers Solo.
+
+The `task_condition::checkpoint_tests` steady-check cases distinguish digest-only
+stamps from body rewrites, including typed-equal but byte-different bodies.
+Operator-status condition-check tests also assert that digest-only refreshes
+produce neither a repair warning nor an operator Attention row.
 
 ### Test features and required-features
 
