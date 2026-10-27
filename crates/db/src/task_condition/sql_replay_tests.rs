@@ -43,6 +43,7 @@ pub(super) async fn stored(db: &SqliteDb, id: &str) -> Value {
     .await
     .unwrap();
     let mut result: Value = serde_json::from_str(&raw).unwrap();
+    result["condition"] = json!(result["condition"].as_str().unwrap());
     let diagnostics: Vec<String> = sqlx::query_scalar(
         "SELECT json_object('task_id',task_id,'kind',kind,'source',source,
          'owner_json',owner_json,'text',text,'byte_length',byte_length,'digest',digest,

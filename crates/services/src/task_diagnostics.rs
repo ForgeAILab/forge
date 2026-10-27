@@ -118,7 +118,7 @@ pub fn derive_workflow_health(
             db::ParkReason::WorkflowInvalid { .. }
                 | db::ParkReason::UnknownCondition {
                     source: db::ConditionSource {
-                        field: db::LegacyConditionField::SchedulePark,
+                        field: db::ConditionField::SchedulePark,
                         ..
                     },
                     ..
@@ -1065,7 +1065,7 @@ mod condition_projection_parity {
             s.task.blocked_json = blocked.map(|v| v.to_string());
             s.task.failed_json = failed.map(|v| v.to_string());
             s.task.metadata_json = metadata.map(|v| v.to_string());
-            let mut c = db::map_legacy_condition(&db::LegacyConditionInput::from(&s.task));
+            let mut c = db::compose_condition(&db::ConditionInput::from(&s.task));
             if label == "entering" {
                 c = db::TaskCondition::Entering {
                     state: s.task.status.clone(),

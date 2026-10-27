@@ -29,12 +29,13 @@ Two edits were made when packing, nothing else:
   TABLE` statement and leaves its index empty (a dump of the shadow tables
   cannot be loaded through a plain connection). Nothing in a merge reads it.
 
-`crates/api/tests/model_workflow.rs` (`pre_queue_*`) unpacks one fixture into
-a temporary directory, replaces `root` by that directory in every text file
-(the dump, the manifest, Git's worktree link files), loads the dump and starts
-this build on it the way `RuntimeSupervisor::start` does. `pre_queue_bare_*`
-does the same after deleting every integration attempt and queue row: that is
-what an install that never ran the passive queue stages has.
+The `pre_queue_*` cases in `crates/api/tests/model_workflow/upgrade_cases.rs`
+use the helpers in `crates/api/tests/model_workflow/upgrade.rs` to unpack one
+fixture into a temporary directory, replace `root` by that directory in every
+text file (the dump, the manifest, Git's worktree link files), load the dump and
+start this build on it the way `RuntimeSupervisor::start` does. The
+`pre_queue_bare_*` cases do the same after deleting every integration attempt
+and queue row: that is what an install that never ran the passive queue stages has.
 
 Shapes (design section 5 rows): p01 outcome recorded, Task still merging; p02
 merge intent with and without the merge landed; p04 entry hooks pending; p05

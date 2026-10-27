@@ -155,7 +155,7 @@ pub async fn tell(h: &common::Harness, task: &str, condition: &db::TaskCondition
 pub async fn hold(h: &common::Harness, task: &str) {
     let annotation =
         json!({"type":"manual_stop","blocking_reason":"held","blocked_by":"user"}).to_string();
-    let condition = db::map_legacy_condition(&db::LegacyConditionInput {
+    let condition = db::compose_condition(&db::ConditionInput {
         error_annotation: Some(annotation.clone()),
         ..Default::default()
     });
@@ -180,5 +180,5 @@ pub fn deferred(task: &str, attempt: &str, message: &str) -> db::TaskCondition {
         }),
         ..Default::default()
     }
-    .condition(&db::LegacyConditionInput::default())
+    .condition(&db::ConditionInput::default())
 }

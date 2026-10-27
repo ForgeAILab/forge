@@ -42,6 +42,13 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   of events from moved code now names the child module (for example
   `services_agents::agent_chat_turn_worker::worker_turn`); filters on the
   parent module path still match.
+- Task condition caches are checked against a digest of the stored condition
+  columns, kept in a new `task.condition_digest` column (additive migration
+  V202610270500). A write that changes a condition column without refreshing
+  the cache is now caught even when the change lies past the bounded copies
+  the cache used to compare. After upgrade, a background pass stamps existing
+  Tasks in small batches; it does not change Task versions, Task lists or
+  Attention. Until a Task is stamped, the previous freshness check applies.
 - Convert legacy native sessions in a supervised background pass, one session at
   a time with active-turn skips, bounded scheduling and restart recovery. Lazy
   import remains the fallback on early open; legacy rows remain until the next

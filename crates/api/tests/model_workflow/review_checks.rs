@@ -215,8 +215,7 @@ pub(super) async fn pause_with_two_slots_then_one(
         }
         if !keep_one_slot {
             // The pause is what this case is about. With one slot, the two
-            // Tasks' follow-up runs would also race for it after the resume
-            // (see the ignored case at the end of this file).
+            // Tasks' follow-up runs would also race for it after the resume.
             let cap = &world.live().state.db.server_run_cap;
             cap.set(Some(MODEL_RUN_CAP), MODEL_RUN_CAP, &cap.embedded_machine_id());
         }

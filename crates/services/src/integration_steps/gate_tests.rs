@@ -84,5 +84,3 @@ async fn an_unreadable_task_is_quarantined_and_the_import_continues() {
     let _ = production.stop.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
 }
-
-// ----- custom workflows (D) -----------------------------------------------

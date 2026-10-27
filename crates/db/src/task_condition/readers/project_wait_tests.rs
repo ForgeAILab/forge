@@ -179,7 +179,7 @@ async fn load_pre_upgrade_row(row: &serde_json::Value) -> crate::SqliteDb {
     // Recreate main's creation fact: the initial entry witness uses this time.
     // Keep the fixture's stored JSON bytes untouched, including refusal order.
     sqlx::query(
-        "UPDATE task SET condition_json=?, metadata_json=?, version=?, created_at=? WHERE id=?",
+        "UPDATE task SET condition_digest=NULL, condition_json=?, metadata_json=?, version=?, created_at=? WHERE id=?",
     )
     .bind(row["condition_json"].as_str().unwrap())
     .bind(row["metadata_json"].as_str().unwrap())
@@ -193,7 +193,7 @@ async fn load_pre_upgrade_row(row: &serde_json::Value) -> crate::SqliteDb {
 }
 
 #[tokio::test]
-async fn literal_pre_upgrade_rows_need_no_repairs_or_list_revision_changes() {
+async fn literal_pre_upgrade_rows_get_one_digest_repair_and_keep_their_cache_body() {
     let mut observations = Vec::new();
     for row in pre_upgrade_rows() {
         let db = load_pre_upgrade_row(&row).await;
@@ -222,7 +222,21 @@ async fn literal_pre_upgrade_rows_need_no_repairs_or_list_revision_changes() {
             condition == row["condition_json"].as_str().unwrap(),
             metadata == row["metadata_json"].as_str().unwrap(),
         ));
+        let current = crate::TaskRepo::get_by_id(&db, &id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(current.condition.channels_match(
+            &crate::ConditionInput::from(&current),
+            current.condition_digest.as_deref()
+        ));
+        assert_eq!(db.check_task_conditions_of(&[id]).await.unwrap(), 0);
+        let unchanged: i64 = sqlx::query_scalar("SELECT list_revision FROM project WHERE id='p'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(unchanged, after, "the second check writes nothing");
     }
-    assert_eq!(observations, vec![(0, 0, true, true); 5],
-        "main-written Project, machine, disk and role rows must remain byte-identical after checking");
+    assert_eq!(observations, vec![(1, 0, true, true); 5],
+        "main-written Project, machine, disk and role rows gain only a digest, without cache invalidation");
 }

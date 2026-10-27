@@ -2,8 +2,7 @@
 
 fn projected_actions(snapshot: &super::TaskSnapshot) -> Vec<api_types::Offer> {
     let mut projected = snapshot.clone();
-    projected.task.condition =
-        db::map_legacy_condition(&db::LegacyConditionInput::from(&projected.task));
+    projected.task.condition = db::compose_condition(&db::ConditionInput::from(&projected.task));
     let actual = super::available_actions(&projected);
     let expected = super::legacy::available_actions(&super::legacy::TaskSnapshot::from(&projected));
     assert_eq!(

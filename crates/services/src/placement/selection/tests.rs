@@ -215,6 +215,7 @@ fn context() -> SelectionContext {
         environment_digest: None,
         environment_checks: Vec::new(),
         task: Task {
+            condition_digest: None,
             condition: Default::default(),
             id: "task".to_owned(),
             project_id: "project".to_owned(),

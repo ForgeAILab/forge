@@ -175,7 +175,14 @@ impl SqliteDb {
         let produced = producers::derive(tx, task_id, change, None, Some(statement))
             .await?
             .ok_or(DbError::NotFound)?;
-        set_condition(tx, task_id, &produced.encoded, Some(produced.version)).await?;
+        set_condition(
+            tx,
+            task_id,
+            &produced.encoded,
+            &produced.input.channel_digest(),
+            Some(produced.version),
+        )
+        .await?;
         if let Some(parent) = produced.parent {
             produce_children(tx, &parent).await?;
         }

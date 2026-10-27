@@ -1,4 +1,5 @@
-//! Execution providers, owner launch parameters, turn limits, and log paths.
+//! Execution provider selection and cancellation, owner launch parameters,
+//! outbox ingestion, turn limits, and log paths.
 
 use super::*;
 

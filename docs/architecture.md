@@ -69,7 +69,7 @@ types.
 | `integration_owner.rs` | Server owner admission, Git effects, object transfer, and receipt validation stay in the root; tests live in `integration_owner/tests.rs` |
 | `operator_status.rs` | Status computation stays in the root; payload fixtures live in `operator_status/tests.rs` and condition-check tests in `operator_status/condition_check_tests.rs`, alongside the existing log snapshot child |
 | `placement/selection.rs` | Selection types, filters, and context loading stay in the root; selection, readiness, capacity, and loader tests live in `placement/selection/tests.rs` |
-| `task_service/execution/runner.rs` | Execution launch, running, heartbeat, and settlement stay in the root; provider selection, owner launch parameters, turn limits, and log paths live in `runner/provider.rs`, with tests in `runner/tests.rs` |
+| `task_service/execution/runner.rs` | Execution launch, running, heartbeat, and settlement stay in the root; provider selection and cancellation, owner launch parameters, outbox ingestion, turn limits, and log paths live in `runner/provider.rs`, with tests in `runner/tests.rs` |
 | `project_provisioning.rs` | Provisioning operations, checkpoints, repository registration, and role assignment stay in the root; Charter scaffold execution and exports live in `project_provisioning/scaffold.rs`, with tests in `project_provisioning/tests.rs` |
 | `task_service/governance.rs` | Task governance, capability admission, and workspace leases stay in the root; governance and lease tests live in `governance/tests.rs` |
 
@@ -5905,561 +5905,241 @@ has no per-Project filter for any bus event; this one names nothing but ids
 that read as `404` to a caller who may not see them. The integration steps
 were not edited for it.
 
-### Task condition dual-write foundation
+### Task condition channels, producer and cache repair
 
-`V202610060030__task_condition` adds one private, non-null `condition_json`
-column and an expression index on its tagged enum kind. Stages one and two
-established the shadow and dual-write adapters. Stage four makes its typed
-presentation authoritative for public readers: health, human-readiness,
-exceptions, offers/apply, slots, overview, operations, MCP/native/Solo,
-Attention and environment surfaces. The four condition columns and condition
-metadata remain storage inputs to the single mapper; 3.1 gives their writers
-strict channel types and retains `condition_json` as the cache. They are not
-public-reader inputs. The original
-migration preserves Task versions/timestamps, retained queue intents,
-publication claims and budget receipts, including archived/deleted Tasks and
-malformed historical JSON.
+`db::compose_condition` is the single condition composition algorithm. Its
+`ConditionInput` contains the four stored channels (`error_annotation`,
+`blocked_json`, `failed_json`, `entry_barrier_json`), condition-relevant metadata
+and optional durable facts. `condition_json` caches the resulting typed condition,
+presentation and material blocker. Channel values remain the source of those
+projections; strict channel decoding does not compose a second condition.
 
-The internal `db::TaskCondition` variants are `Clear`, `Entering`, `Running`,
-`Deferred`, `Parked`, `Failed` and `Settled`. Parks carry one primary typed reason,
-ordered secondary reasons, a continuation and bounded legacy evidence. The
-legacy-only fallback derives `Clear`, `Deferred`, `Parked` and `Failed` from the
-five legacy inputs. `Entering`, `Running` and `Settled` require durable
-ownership/workflow witnesses. An entry barrier without a `blocked` status has
-no owner, and legacy refuses to dispatch through it: it parks as a named
-`UnknownCondition`. No custom workflow hooks are retried.
+The internal variants are `Clear`, `Entering`, `Running`, `Deferred`, `Parked`,
+`Failed` and `Settled`. Parks carry a primary typed reason, ordered secondary
+reasons and a continuation. Bare channel composition produces Clear, Deferred,
+Parked or Failed; entering, running and settled states require durable facts.
+Explicit failed-process metadata keeps precedence, then holds and exhausted
+budgets precede ordinary failures. Same-cause annotation/interruption reasons
+deduplicate. Blocking annotations use `db::BLOCKING_ANNOTATION_KINDS` and the
+same JSON acceptance rules as dispatch. Interruption columns block on their
+presence, including malformed values. Entry barriers block outside initial
+admission; unowned barriers get a named unknown diagnosis. Advisory merge/CI
+annotations and unusable deferred timers stay non-parking. A BLOB/invalid UTF-8
+or malformed/non-object channel becomes a named unknown reason; non-text
+annotations and wrongly typed wait keys remain observations where dispatch
+ignores them.
 
-**One mapping, in Rust.** `db::map_legacy_condition` is a pure function of the
-five legacy values and optional durable witness snapshot. The migration's backfill (a Rust post-step in the migration
-transaction), every writer seam and the invariant check call it. There is no
-mapping view and no trigger: an earlier draft compiled the mapping into every
-Task write statement through triggers, which cost about 110 ms per statement
-prepare and 0.6 to 1.2 ms per write. The column default is the stored form of the
-empty mapping. It carries no witnesses, so the first producer to touch such a
-row recomputes it in full.
+Each private copied channel value and each of the 24 evidence metadata fragments
+retains its 4 KiB `EVIDENCE_VALUE_LIMIT` and explicit truncation marker. Stored
+channels keep the full originals. The queued-command continuation carries only
+its intent id: the original command body remains execution/rollback authority and
+is never copied into condition evidence. An annotation is a diagnostic, never an
+action allowlist.
 
-**The mapping parks only what legacy blocks on.** A Task is `Parked`/`Failed`
-only where today's dispatcher and readers treat it as blocked:
-
-- `blocked_json` or `failed_json` present (any value, including malformed);
-- an `error_annotation` whose `type` is one of
-  `db::LEGACY_BLOCKING_ANNOTATION_KINDS`, the same list
-  `task_dispatcher::helpers` uses, parsed the way the dispatcher parses it;
-- an entry barrier of any shape, blocked or not, malformed or not: the active
-  dispatcher, failed-review recovery, the merge-hook sweep and root advance
-  all stop on a non-null barrier;
-- `metadata_json` that is not a JSON object: both dispatcher scans fail
-  `task.metadata()` on it and skip the Task every tick;
-- a hold, or a correctly typed wait recorded in metadata (owner, environment,
-  placement, upgrade, pause, approval, capacity, dispatch refusal, plan
-  settlement).
-
-Any other annotation (`merge_conflict`, `ci_failed`, `executor_failed`,
-`retry_exhausted`, `{}`, untyped or unreadable text) is evidence on a
-non-parking condition, as is a `deferred_dispatch` object that is not a usable
-timer. `agent_timeout` maps to its own typed reason. Explicit failed-process
-metadata keeps precedence; holds and exhausted budgets precede ordinary
-failures. Same-cause annotation/block rows deduplicate. Generic
-`retry_exhausted` keeps an unresolved budget kind until a producer supplies the
-ledger witness. A BLOB or invalid UTF-8 in a legacy column and malformed or
-non-object legacy values become named `UnknownCondition` reasons. Only two
-shapes are non-parking observations, because legacy reads them as absent: a
-wrongly typed wait key (every reader type-checks the value) and a non-text
-annotation. None fails a write or backfill. Unrelated metadata keys stay with
-their owner and invent no park.
-
-**Evidence is bounded.** Each copied legacy value, and each of the 24 condition
-metadata fragments, is capped at `db::EVIDENCE_VALUE_LIMIT` (4 KiB) with a
-truncation marker; the legacy columns keep the full data. Metadata is scanned
-one level deep with values left as raw text, so an unrelated large key is
-skipped, never decoded or re-serialized, and large numbers, lone escapes and
-deep nesting survive in their fragment. Mapping cost is linear in the size of
-the five legacy values.
-
-**Dual write at the writer seams.** Each writer of a legacy condition column,
-or of a durable fact the condition witnesses, writes the shadow in the same
-transaction as its own write. Shadow writes change only `condition_json`: no
-version, timestamp, list/board revision, event, Attention incident or wake.
-The seams, and what each one reads, are in the next section.
-
-Queue intent/claim/receipt **bodies** stay out of condition evidence. A queued
-recovery continuation retains only its intent id; the original command remains
-its execution/rollback authority. Raw legacy annotations are kept only as
-private import evidence, not advertised action lists or new public aliases. No
-condition payload is fed to Attention in stage one, so incident digests and
-consumed wake decisions are unchanged.
-
-### Task condition producers and invariant repair
-
-Stage two is still an internal dual write. The legacy fields stay
-authoritative: no reader, dispatcher, recovery or Attention decision reads the
-condition. The condition must say what legacy does today. A Task legacy holds
-maps to a parking condition (`Parked`, `Failed`); a Task legacy runs maps to a
-non-parking one.
-
-**Witnesses are the facts.** A stored condition carries every durable fact it
-was built from in `evidence.witnesses`, always starting with the entry:
-
-| Witness | Fact | Changes when |
-|---|---|---|
-| `entry` (always) | status epoch, entry transition and its time | status write, entry receipt, reparent |
-| `step` | the pending or claimed `hooks` step of this exact status and epoch | hooks step enqueued, superseded, finished |
-| `execution` | the Task's newest running non-interactive execution, when this entry owns it | a running execution admitted or ended, its config snapshot changed, entry change |
-| `budget` (exhausted conditions only) | ledger kind, window and spent | charge, window reset |
-| `operation` | each unconfirmed remote cancellation fencing the Task | marker, acknowledgement, machine removal, workspace deletion, an execution admitted into a fenced workspace |
-| `child` (while `coordination_review_pending`) | each visible child, its status and whether it is settled | child status, creation, deletion, reparent, reorder, Project workflow edit |
-
-`Settled` records the terminal outcome. A condition without an `entry`
-witness (the column default, an older encoding) carries nothing and is
-recomputed in full.
-
-`Entering` needs a `step` witness, `Running` an `execution` witness,
-`Settled` a terminal state in the Task's effective workflow. Explicit blockers
-win over live workflow work. Interactive sessions are never the witnessed
-execution, and a settled execution is history, not a witness: recording one
-writes no condition. The running execution is read from the running-only
-partial index `idx_execution_running_task`, so no producer walks or
-sorts a Task's execution history.
-
-The entry is the first transition row stamped with the Task's status epoch
-(the engine CAS and board moves stamp it). Without one it is the newest
-unstamped row that changed state: a claim's receipt, or a pre-upgrade entry.
-A same-state row (a recovery marker) is never the entry and carries no epoch,
-so the stranded-hook recovery in `workflow/engine/durable.rs` reads exactly
-what it read before the shadow existed. An execution names the receipt it was
-admitted under (`state_entry_token`); the entry owns it when that receipt is
-the entry or a later receipt of it, stamped with this epoch or unstamped and
-not older than the entry. That is how a claim's and a retry marker's
-executions bind without a stamp.
-
-**Producers state a condition from what their write changed.** A producer
-names the fact family its write can change (`db::ConditionChange`). It reads
-the Task row and that family in one statement, carries every other family from
-the stored condition's witnesses, re-applies the legacy mapping and writes the
-result through the version-fenced `set_condition` write. A budget charge reads
-no execution, a status write reads no ledger, and a Task with neither parent
-nor children reads no other Task. The Project workflow's terminal states are
-parsed once per distinct definition text, not per write.
-
-| Writer | Change | Reads beside the Task row |
-|---|---|---|
-| The six metadata mutators (condition keys only) | `Legacy`, folded into the metadata `UPDATE` | nothing |
-| Repository update, annotation, recovery metadata, entry barrier setters, Review entry budget, create-time metadata, lifecycle hook annotation, queue settlement and loop park, reconnect barrier reset | `Legacy` | nothing |
-| `TaskQuery`, `BulkTaskQuery`, queued `TaskMutation::Sql` | Required explicit `Legacy`, `Entry`, `Human`, or `None`, supplied by the writer independently of its optional statement | per change; `None` skips the producer |
-| Status CAS (repository, claim, board move, workflow engine), transition and recovery-marker insert, reparent | `Entry` | entry receipt, hooks step, the running execution, the workflow text, whether the parent waits on children |
-| Hooks step enqueue, owner preempt that superseded a step, hooks step finish | `Hooks` | the entry's hooks step |
-| Running execution admitted, execution terminal result (both paths), config snapshot update | `Execution` | the running execution |
-| Execution recorded already settled | none | nothing |
-| Ledger charge, window reset | `Budget` | the ledger, only when the condition is exhausted |
-| Remote-cancel marker and acknowledgement, machine removal, workspace deletion | `Operations`, for every Task the workspace fences | the cancellations fencing the Task |
-| Child creation, soft deletion, reparent, both subtask reorder writers | `Children` on the parent | the parent's children, only when its flag is set |
-| Project workflow edit | `Entry` for every Task in the Project; `Children` for flagged coordination roots | per change |
-| Task insert, `sync_condition_in_tx`, backfill, invariant check | `Full` | everything |
-
-A producer that finds a status epoch the stored condition never saw recomputes
-lifecycle facts in full, carrying only independently owned integration lineage,
-so a writer that under-claims cannot leave a stale entry behind a later write.
-
-The workflow engine and the worker's step settlement have already fenced
-their step lease, and state their condition through `SqliteDb::set_condition`
-when the Task's step is current. That strict entry requires the claimed step
-and live lease, rejects an expected-version mismatch, compares all five source
-values and refuses a condition that disagrees with legacy-derived reasons or
-its typed integration witness. It does not re-read those witnesses: verifying them is
-the invariant check's job, so stating a condition costs no fact query. When
-the step is no longer live (the transaction has already settled it), the
-legacy write still stands and the condition is written under the version
-fence alone; a condition the strict entry refuses outright is logged and not
-written. Other writers hold no step (Task creation, bulk clears, admission)
-and use the version fence alone, adding no rejection to a legacy write.
-
-Four writers are authoritative on their own and must never fail for the
-shadow: a ledger charge, an execution's terminal result, a step settlement
-and a remote-cancel marker. There a failed shadow write is logged and left to
-the invariant check.
-
-A new direct SQL writer of a legacy column or of a witnessed fact must call
-the seam; nothing in the schema enforces it. The test safety net is
-`SqliteDb::task_condition_violations()`, the full recompute, which independently reloads lifecycle facts and carries
-only the direct integration statement witness: the writer-family and producer tests and
-the `happy_path`, `e2e` and `remove_machine` api cases assert it is empty.
-
-**Mappings that follow legacy.**
-
-- `coordination_review_pending` with unfinished children parks on them
-  (`Children`); a complete sequence is a deadline-free `Deferred` advance. A
-  child counts as finished when its status is terminal in the inherited
-  subtask workflow or in the Project workflow, as `subtask_is_terminal`
-  decides. A flagged root with no visible child is `Clear` with an
-  observation: legacy dispatches it as an ordinary Task.
-- A pending remote cancellation parks exactly the Tasks
-  `task_has_pending_remote_cancel` fences: the workspace's owner and every
-  Task with an execution in that workspace. `db::remote_cancel::TASK_FENCE` is
-  the one predicate behind the dispatcher refusal, the owner-facing machine
-  list and the condition. The cancelled step's own Task is not parked unless
-  that predicate fences it; a sibling that ran in the shared root workspace is.
-- Environment kind/reason waits without a deadline are `Deferred`
-  observations rechecked by existing dispatch. Advisory merge/CI/dirty-worktree
-  annotations stay non-parking where legacy proceeds.
-
-**The invariant check.** The dispatcher's sweep runs it (see "Task condition
-scheduler and owner matrix"): once per 120 seconds it visits every Task that
-is not settled, in keyset pages behind the dispatch pass, reads each page on a
-reader connection, recomputes each Task in full and compares.
-It takes the writer only for a row that differs, with one statement fenced on
-the Task version and the condition text it read, so a row written since is
-left to its own producer. A row that cannot be recomputed is logged and
-passed over. It writes only `condition_json`: never workflow state, version,
-time, event or wake. Errors log and defer without stopping dispatch.
-
-An entry barrier parks in every state but an initial one: the scheduler
-admits a Task from an initial state without reading the barrier, so there it
-is evidence and an observation, and the `entry` witness records `initial`.
-
-`db::MAPPING_REVISION` versions the mapping and the stored encoding. The
-revision last backfilled is recorded under the protected `system_setting` key
-`task_condition_mapping_revision` (hidden from, and not writable through, the
-admin settings API). The migration that creates the column records it after
-its own backfill. When it differs at the first tick (a database migrated by an
-earlier binary, or a later mapping change), the backfill is re-run over every
-Task, settled ones included, in slices of at most 250 ms per tick, off the
-startup path, and the revision is recorded when one pass completes. Bump the
-constant with every mapping or encoding change.
-
-Every completed pass logs its checked and repaired counts. Operator status
-reports a `task_condition_invariant` entry in `recent_errors`, severity
-`attention`, only while the last completed steady-state pass repaired at
-least one row: that means a producer missed its write. A clean pass, and the
-rewrite after a mapping change, add no entry.
-
-**Cost.** Measured in a release build against `d6445863` with
-`crates/db/tests/suite/task_condition_write_cost.rs` and
-`crates/db/tests/suite/task_condition_producer_cost.rs`, interleaved on one machine:
-
-| Path | `d6445863` | this change | change |
-|---|---:|---:|---:|
-| ordinary metadata (`mutate_metadata`, unrelated key) | 97 µs | 95 µs | −2% |
-| `mutate_metadata`, condition key | 97 µs | 108 µs | +12% |
-| `TaskQuery`, SQL-computed metadata | 105 µs | 105 µs | 0% |
-| `update_status`, root | 234 µs | 259 µs | +11% |
-| `update_status`, child | 256 µs | 281 µs | +10% |
-| `budget::charge`, root | 108 µs | 120 µs | +11% |
-| `budget::charge`, child | 109 µs | 119 µs | +10% |
-| execution recorded settled, root | 129 µs | 130 µs | 0% |
-| execution recorded settled, child | 146 µs | 144 µs | −2% |
-| entry hooks step: enqueue, claim, finish (three transactions) | 422 µs | 478 µs | +13% |
-
-Medians of eight interleaved runs of three rounds each. Tasks carry 40 logged
-transitions and 10 executions, growing by 200 executions per round; the
-Project workflow is the 16 KB definition API-created Projects store. With a
-`{}` workflow every row is within one point of these except the hooks step,
-which is +17% there; its minimum over the runs is +18% under both.
-
-There are no mapping triggers.
-
-`material_blocker(condition)` is the interruption and requires-intervention
-flag the `task.interruption_changed` event states, captured before evidence
-truncation and stripped by `db::strip_attention_delivery_metadata`, the rule
-the incident digest applies (so the reporting execution is not part of a
-blocker's identity). Witnesses, tags and bookkeeping never enter it. Tests
-compare it with the event, and with the canonical digest of incidents the
-Attention service really materializes for every blocker shape. Attention
-still consumes its original events, so rollout re-arms no incident. Stage
-three owns the total reconciler and dirty-set cutover.
-
-### Task condition public readers (stage four)
-
-The stored condition now carries a normalized typed presentation captured by its
-producer before import-evidence truncation. Runtime public readers consume this
-presentation and typed reasons, not private raw evidence or migrated metadata.
-`ConditionChange::Human` refreshes Review and assignment changes in the same
-transaction; entry, execution, hooks and workflow changes refresh their current
-human-work facts. Generic human intervention remains distinct from approval
-eligibility. A pending entry owns its checks and suppresses obsolete human waits.
-List and detail project the same wait; health can overlay a live interactive run
-without changing the Task condition or its blocker.
-
-`V202610070507__task_condition_readers` rederives every existing condition inside
-its migration transaction (mapping revision 4), replaces the list-revision trigger
-and retry-time partial index, and preserves all Task/history/Attention/queue/budget
-data. It clears only the retired dispatcher bridge, retaining its diagnosis in a
-park when needed. Condition-only changes advance `project.list_revision`; ETag
-projection version 2 prevents an old list validator from surviving the wire cutover.
-The clock-sensitive probe uses `idx_task_condition_retry_project` and the condition
-recorded retry/deferred-wait flag, including a timer co-occurring with another primary reason.
-
-REST and forge-ctl Task JSON replace `error_annotation`, `blocked`, `failed` with
-`api_types::TaskCondition`; MCP and native Task values use the same DTO. It excludes
-raw import evidence, metadata and witnesses. Named health, exception, human wait
-and offers stay. Entry owners show `Entering`; observer parks show `Needs Owner`.
-Failed Review history after a newer entry or live continuation is not a current
-exception. An undecodable stored condition returns a typed unknown diagnosis: corrupt or empty values are restated from the legacy columns, a recognisably newer encoding is quarantined (see "Undecodable stored condition"); private historical Task receipts import their condition at the archive boundary. Normalized diagnostic strings are bounded to 1,024 bytes and arrays to
-16 entries; condition storage retains full originals.
-
-`task.interruption_changed` retains its type and carries `condition` plus the typed
-`material_blocker`. The old payload decodes only in `DomainEvent::task_material_blocker`
-at the immutable archive boundary. New condition/step identities, Task versions,
-timestamps, reporting execution IDs and offer changes never enter incident identity.
-Unchanged open incidents do not create a new incident or wake during upgrade.
-Held, entry-owned, in-flight, capacity and retry-timer conditions are not autonomous
-repair incidents. Admitted `OwnerOffline` retains an active slot; `ReviewNeedsOwner`
-retains a parked slot. No scheduler decision or sweep policy changes.
-
-The four condition columns remain condition storage as writers convert to typed
-channel values. `map_legacy_condition` remains the single producer of the
-`condition_json` cache, preserving typed presentation and material identity.
-Storage retains full originals beyond the presentation bounds.
-
-### Task condition statements and diagnostic text (3.1, in progress)
-
-3.1 keeps the four condition columns and condition metadata keys as storage and
-converts their writers to typed values in place. Converted writers construct
-strict Rust channel values and bind their serialization; `map_legacy_condition`
-remains the single producer, with `condition_json` as its cache. Historical and
-unknown shapes retain the existing lenient mapping. This checkpoint retains
-`task_diagnostic_text` and full source text capture without deleting or
-rewriting existing Task data.
-
-The converted writers are workspace-owner reset and executor failure.
-`db::task_condition::channels` covers 16 observed fresh annotation shapes and
-all 24 condition metadata values. The shapes are Blocking, Hold, TimedBlock,
+**Typed storage.** New writers construct the strict Rust values in
+`db::task_condition::channels` and bind their serialization. Historical rows,
+restores and unknown shapes use the same lenient producer, including its named
+unknown diagnoses. Annotation shapes include Blocking, Hold, TimedBlock,
 RecoveryExecution, RemoteCancel, Message, Reason, ReviewCandidate, ReviewPark,
 Detected, DetectedState, Budget, StepFailure, PlacementRefusal, PlanWait and
-UpgradeDispatch. Historical and merge-onto-existing values can have other shapes.
-Strict shapes cover new writes, queue overlays and queued-action restores.
-Restores try the strict shape first and fall back to the existing `Value` edit
-for anything it rejects; stored-row reads and `map_legacy_condition` stay lenient.
-`ErrorAnnotation` selects by field set, since multiple shapes share a failure
-kind, and retains one replacing step
-overlay. Unknown fields and tags are rejected, including in closed nested
-objects; missing and null stay distinct. `plan_settlement_wait` and interruption
-kind `integration_admission_failed` are stored tags outside `FailureKind`.
-The queue's kindless interruption has a required nullable reason.
+UpgradeDispatch. Field sets distinguish shapes sharing a failure tag. Closed
+fields reject unknown tags and members; missing and explicit null remain distinct.
+Interruption kind and time may be absent, and kindless workflow-loop interruptions
+retain their required nullable reason. Metadata codecs select by key without adding
+a wire tag; scalar values stay scalars and `planning_state_entry_token` retains null.
+Queued-action restores try the strict shape first and fall back to the existing
+`Value` edit for anything it rejects; stored-row reads stay lenient.
 DetectedState, PlacementRefusal, PlanWait and UpgradeDispatch also carry an
 optional String `blocking_reason` for queued-action restore; fresh writers omit
 it, and the queue preserves it when adding a step-failure overlay.
 The `placement_refusal` metadata marker shares PlacementRefusal's annotation
 shape, so its decoder also accepts this field; production marker writers omit it.
 
-Storage encoding follows each main writer: `json!`/`Value` sorts object keys;
-`TaskBlockingAnnotation` uses declaration order, and demo message literals put
-`type` first. Only Blocking and Message accept that type-first encoding.
-An overlay sorts the whole combined value, including nested objects. Timestamp
-fields remain strings with their original spelling. SQL `json_set` preserves
-member positions and appends absent keys; preserve those patches and bind the
-original raw bytes for exact fences rather than re-rendering a typed value.
-Copied stored snapshots use infallible `CopiedJson`/`CopiedConditionObject`
-construction without size or depth limits at write time. Only decoding new
-copied values limits nesting to 32 container levels; there is no byte limit or
-truncation. Fresh superseded snapshots use closed fields with opaque saved
-channel strings; carried superseded objects retain their original JSON value.
-Known hooks and interruption details remain closed; assignment guidance fields
-are reader/legacy-only. Route attempts retain `candidate_key`/`outcome` strings.
-Metadata codecs select by key without a new wire tag; scalars stay scalars and
-`planning_state_entry_token` retains the explicit null its producer writes.
+Storage preserves each writer's bytes. Value-built JSON sorts keys; blocking
+annotation structs retain declaration order, and message literals can put `type`
+first. A step-failure overlay sorts the combined value. SQL `json_set` patches
+preserve member order and exact raw strings remain the input to equality fences.
+Timestamp strings retain their spelling. Copied snapshots keep their original
+channel strings and JSON values without write-time byte or depth limits; strict
+new-value decoding limits copied JSON to 32 container levels.
 
-Reset retains the alphabetical field order of its former `json!` object;
-executor failure retains `TaskBlockingAnnotation` declaration order. The queue's
-step-failure overlay still sorts the combined object, as it did before. Both
-writers use the repository status-write transaction, which explicitly produces
-`ConditionChange::Entry`. SQL adapters also require an explicit change; SQL text
-is never classified to select a condition reload.
+**Channel digest.** The nullable `task.condition_digest` column stores a SHA-256 over length-framed
+member names, value tags and raw stored bytes. SQL NULL/missing, JSON null,
+present text and non-text bytes have distinct tags. The four channels are hashed
+in full, before any presentation or evidence truncation. A metadata object is
+scanned into raw fragments without decoding and reserializing its values. Exactly
+these 25 members contribute, in the order shown:
 
-The parity reference is pinned to main `37309bb9`, including fixes #120–#122.
-Archived-main fixtures cover the legacy columns, cache bytes, public projection,
-offers, failure kind, Operations reason and interruption-event dedupe across a
-subsequent unconverted metadata write and the real queue overlay. Canonical
-Attention digests are compared for all 96 snapshots, including the 400-child
-root, using the production Attention projector. The exact placement-clear fence
-retains its match against pre-upgrade annotation bytes. Each case holds
-`db::test_clock::freeze` (available with `db/test-template`), so `now_rfc3339()`
-returns a fixed microsecond sequence on that thread and the comparison is exact
-on every platform.
+```text
+awaiting_human
+awaiting_human_marker_id
+awaiting_human_reason
+coordination_review_pending
+coordination_review_pending_id
+daemon_upgrade_refusal
+deferred_dispatch
+dispatch_disposition
+environment_wait
+executor_unavailable_execution_id
+last_execution_failure_at
+last_execution_failure_execution_id
+last_workflow_guard_execution_id
+last_workflow_guard_name
+last_workflow_guard_reason
+last_workflow_guard_rejection_at
+owner_wait
+paused_integration
+paused_integration_generation
+placement_refusal
+plan_settlement_wait
+planning_completed_at
+planning_execution_id
+planning_state_entry_token
+queued_recovery
+```
 
-The additional writer corpus is pinned to main `94609411` and generated only
-against that archived production source. It retains exact legacy-column and
-`condition_json` strings, plus one SHA-256 per snapshot of the canonical JSON
-for read/public projections, offers and the interruption-event dedupe key.
-The existing UUID and wall-clock normalizations remain in place; the two
-wall-clock normalizers live in their calling tests. Shared writer support stays
-in `worker_runtime/queue/writer_parity.rs`; queue, owner-failure and
-executor-failure cases extend their existing `condition_tests` modules.
-Services metadata writers derive each set mutation's key from
-`ConditionMetadataValue::key()`. Executor-unavailable writers take a vector of
-`ExecutorRouteAttempt` from both local and remote producers; its stored array
-and sorted interruption JSON retain main's bytes.
+The first 24 also feed bounded evidence and presentation; `queued_recovery`
+selects the queued-command continuation and presence flag. Unrelated metadata
+members never enter the digest. SQL-NULL metadata and an empty object both
+contribute 25 absent members. Malformed, non-object or non-text metadata is
+framed as its entire raw value because it is itself a producer diagnosis.
 
-Stored condition
-bytes, public projections, offers, failure kinds, Operations text and Attention
-digests retain main `6120c133` behavior, including corruption repair, except for
-duplicate lifecycle facts on coordination roots. Integration/Check statements
-now accept coordination roots whose stored condition already carries the current
-`Children` reason or the `coordination_review_pending` observation for a root
-without visible children.
-The facts overlay adds each identical reason or observation only once, including
-a `Children` reason already used as the primary park. The resulting stored typed
-condition and public projection agree with the legacy mapping of the same columns
-and facts. The strict witness check is unchanged; holds and failures remain in
-place.
+Every writer that stores `condition_json` also stores its matching digest in the
+same statement or transaction. The digest is separate from the encoded cache,
+whose field order and bytes remain unchanged. No invalidation trigger reads the
+digest column, so stamping it cannot dirty scheduler rows or list revisions.
+Returned Tasks refresh both cache fields after the writer's final condition
+producer, including recovery receipts and execution admission. Private Task
+snapshots in mutation replies, command receipts and move results serialize the
+stored digest with the condition, so replay preserves the original pair even
+after the live row changes. Older snapshots without a digest retain NULL;
+replay never guesses a digest from their channels or reads it from a newer row.
+REST and MCP Task representations use their public DTOs and omit this internal
+field. Historical migration replay before the digest column exists writes only
+`condition_json` under the same version fence.
+`V202610270500__task_condition_digest` adds the column with NULL for existing rows.
+It clears revision-8 progress saved before the column existed, so that old cursor
+cannot skip the newly NULL prefix. Checkpoints written after this migration still
+resume normally; newer revision markers and cursors are preserved.
 
-**Typed write contract.** `ConditionStatement` includes explicit `Preserve`,
-Hold/Release and the independently owned integration/check statements.
-Integration and check ownership still require their original claimed-step seam.
-The unused owner records, identity/edit/replacement/restore contracts and second
-owner composer have been removed. No tagged release contained these contracts or
-could queue their statement kinds. Released mutation payloads remain decodable
-and replayable under the missing-change rule below.
+Dispatcher and hierarchy channel freshness compare the digest against the same
+Task snapshot. A mismatching digest triggers recomposition while retaining
+supported Integration/Check witnesses; the sweep repairs the cache. NULL means
+freshness is unknown: until the walk stamps a row, including one it skipped, the
+pre-digest rule applies (a stated cache, or equal bounded channel and metadata
+copies). A missing digest alone never triggers the lossy witness-only rebuild.
+Once a digest exists, neither `stated` nor bounded evidence establishes freshness.
+Bounded copies still serve blocking and historical diagnostic presentation;
+their existing limits and Operations/material rendering stay unchanged.
 
-Converted writers still shipping at this checkpoint:
+**Durable facts and ownership.** Independently owned Integration and Check
+witnesses retain authority in `condition_json`; channel typing does not replace
+them. Other witnesses describe facts loaded under the writer's transaction:
 
-| Writer | Statement | Owns | Carries |
-|---|---|---|---|
-| `TaskService::hold_waiting_task` (owner Hold on a Task with no run) | `Hold { actor, reason, at }` | `Held`, the diagnostic, the interruption; drops failure, queued command, retry timer, dispatch refusal, environment wait, owner wait | entry block, placement denial, daemon-upgrade refusal, Project pause, human decision, plan settlement wait |
-| `TaskService::release_to_dispatch_queue` (owner Release of a waiting hold) | `Release` | clears diagnostic, interruption, failure | everything else, including a recorded retry timer |
+| Witness | Fact | Refresh trigger |
+|---|---|---|
+| Entry | status epoch, entry transition, time, initial/human/review flags | status, entry receipt, parentage, workflow |
+| Step | pending or claimed hooks step of the exact entry | hooks enqueue, supersede or finish |
+| Execution | newest running non-interactive execution owned by the entry | run admission/result, binding or entry |
+| Budget | exhausted ledger kind, window and spent | charge or reset |
+| Operation | unconfirmed remote cancellation fencing this Task | cancellation, acknowledgement, machine/workspace change |
+| Child | visible child's status and settledness while the root waits | child creation/status/deletion/order, workflow |
 
-The hold's legacy annotation and operator text remain one rendering of the same
-typed fields (`ConditionStatement::hold_operator_text`), byte for byte what the
-annotation held before. Other hold paths, including stopping a running execution
-and releasing a stopped run, still use the mapping.
+A condition without an Entry witness reloads lifecycle facts. `Entering` requires
+a Step witness, `Running` an Execution witness, and `Settled` a terminal workflow
+state. Explicit blockers precede live workflow work. Interactive and already-ended
+executions are history, not running witnesses. Running execution lookup uses
+`idx_execution_running_task`, without walking execution history. Same-state audit
+rows do not replace the status entry. Entry barriers do not block admission from
+an initial state. Pending remote cancellations use `db::remote_cancel::TASK_FENCE`
+for the workspace owner and every Task with an execution in that workspace.
 
-A scoped statement applies once per Task mutation; subsequent recomputations
-preserve its result rather than recording another text occurrence. Preserve
-removes previously projected lifecycle facts before applying the current facts.
-A pending recompute cache is fenced by the exact input version and condition digest;
-a newer stored condition is preserved instead of being overwritten by that cache.
+**Write seam.** Every `TaskQuery`, `BulkTaskQuery` and new queued SQL mutation
+carries an explicit `ConditionChange`; SQL text never chooses a reload. Content
+writes name `None`, including when the cache is corrupt. Channel/metadata writes
+name `Legacy` (the stored fact-family discriminator), human assignment/Review
+writes name `Human`, lifecycle writes name `Entry`, and hooks, execution, budget,
+operation and child writers name their respective families. The producer carries
+unaffected witnesses and reloads the named family. A new status epoch forces a
+lifecycle reload. `Full` reloads all fact families. Released SQL lacking `change`
+also reloads `Full`, without inspecting SQL text.
 
-`Conditioned<T>` requires a condition with the write input. The durable
-`TaskMutation::Conditioned` envelope keeps it with the mutation, and
-`TaskMutation::StatedSql` keeps explicit fact-family and statement inputs with
-SQL and binds. Every `TaskQuery` and `BulkTaskQuery` constructor requires and
-stores a `ConditionChange`, separately from its optional `ConditionStatement`.
-`TaskQuery::stated` and `BulkTaskQuery::stated` require both. New `Sql` mutations
-require a `change` field as well; `ConditionChange::None` explicitly skips the
-producer for content-only SQL, including any repair of an already corrupt cache.
-The adapters carry the value unchanged through direct writes, bulk splitting
-and durable replay. There is no SQL-text classifier. A Project workflow edit
-restates `Entry` for every Task in the Project and `Children` for flagged
-coordination roots. The workflow-edit scan reads stored row metadata to find
-those roots.
+`ConditionStatement` supports Preserve, Hold/Release and owned Integration/Check
+statements. Hold and Release construct the same operator text as their annotation
+writes. Integration/Check ownership changes require the claimed Task step and its
+live lease. `set_condition` checks the expected version, all source columns and
+agreement with typed witnesses. It does not reread those witnesses; the invariant
+check verifies them independently. A settled-step writer uses the version fence.
+Ledger charges, execution results, step settlements and remote-cancel markers
+remain authoritative if their best-effort cache write fails. No cache write adds
+a Task version, workflow transition, domain event or Attention item.
 
-`task_mutation::decode_released_sql_change` handles the missing `change` field
-in released `TaskMutation::Sql` payloads by returning `Full`, reloading every fact
-family without inspecting SQL. A consistent cache retains main
-`13bc2ae1` cache bytes, Task version, list revision, scheduler dirty generation,
-events and diagnostics. An inconsistent (corrupt or stale) cache is rewritten
-during replay to the state main replay followed by its background
-`check_task_conditions_of` reaches, including diagnostics and revisions.
-Recoverable corruption adds one raw-text diagnostic occurrence; a stale but
-decodable cache needs no diagnostic. A changed cache adds one list revision and
-one dirty generation. This earlier repair is an accepted change in timing.
-Newer encodings retain the existing quarantine rule. The archived-main SQL
-fixture covers all former classifier families and
-literal released content, assignee-clear and blocked payloads on consistent and
-corrupt rows.
-The common adapter carries the statement to the writer's existing transaction.
-Its version fence runs inside that transaction before the write. Inline edits
-retain their expected version; queued edits retain the existing accepted-command
-rebasing policy and then check the selected version in the transaction. Existing
-lease, Project, assignment, SQL ownership and epoch predicates remain in place.
+**Repair.** The invariant check compares channel digests and independently
+recomputed durable witnesses/projections. It reads off the writer, then repairs
+only differing rows. The write fence includes Task version, exact cached bytes
+and the current channel digest, since channel/metadata writes can leave version
+unchanged. A concurrent write leaves repair to its producer or the next sweep.
+The steady sweep visits open Tasks every 120 seconds. A failed row is logged
+without stored text and skipped; it cannot stop later rows.
 
-Native aggregate signatures such as `UpdateTask`, `UpdateTaskStatus`, metadata,
-entry, placement and operator methods have not all switched at this checkpoint.
-Each aggregate's gate must require the typed envelope/parameter and update all
-callers exposed by the compiler. Historical Sql, update, queued rollback and Task
-receipt encodings remain decodable and replayable. Writers are being converted
-to typed channel values in the retained condition columns; `map_legacy_condition`
-remains the producer of `condition_json`.
+`MAPPING_REVISION` is 8. The revision walk includes every Task, including settled,
+archived and deleted rows, in keyset pages of at most 50. The discovery tick reads
+only settings; later ticks work in 250 ms slices, yielding between pages. Each
+committed page saves its revision-scoped cursor in the protected
+`task_condition_backfill_cursor` setting. Restart resumes after that page;
+replaying an uncheckpointed page is idempotent. Completing the pass records
+`task_condition_mapping_revision` and clears the cursor atomically. A newer
+recorded revision is neither backfilled nor lowered. A NULL row receives a
+stamp-only repair only when its typed condition agrees and it is stated or all
+six bounded channel/metadata copies agree. The stamp writes only
+`condition_digest`, preserving the exact cache bytes, scheduler dirty generations
+and list revisions. Otherwise the walk rewrites the recomposed cache and digest
+together, refreshing stale public evidence even when its typed condition agrees.
+Repairs do not change Task versions or times, create Attention or interruption
+events, or re-arm incidents. Real body repairs retain normal cache invalidation.
+The revision walk has its own progress record and page/completion log, including
+separate stamp and rewrite counts; neither historical rewrites nor stamps enter
+the scheduler sweep's operator pass. A clean sweep lap remains clean even while
+the walk is active. Steady passes report missed producer repairs.
 
-The workspace-owner reset annotation and missing review-candidate park retain
-their base repository writes. Their active two-write equivalence tests are unit A
-conversion targets, including retry/budget exhaustion, historical timeout, kind-less
-workflow loops and Deferred retries. They capture new diagnostic text after the
-legacy commit on a best-effort basis; capture failure leaves the full legacy text
-and the base write outcome intact. Waiting Hold/Release and integration/check
-statements remain in use. Other S caller files and aggregates A–E still need their own
-conversion. Unconverted writers continue to map legacy after their write, so an
-intermediate gate does not silently change their intent. The mapping remains the
-independent per-writer oracle while dual write continues. Existing Hold/Release
-and Integration/Check statements edit the stored condition as on main.
-Stated rows compare by their typed condition, as on main. Unstated rows compare
-exact stored bytes, including all legacy evidence copies. Typed/public causes
-and material Attention inputs agree immediately and after an ordinary legacy
-producer writes the same Task. The mapping revision remains 7: this additive checkpoint does not
-schedule a new upgrade walk or re-encode healthy existing Task rows.
+Corrupt/empty caches are restated from channels and durable facts. Original bytes
+are retained as diagnostic text, using base64 for non-UTF-8 data. Recognizably
+newer encodings remain quarantined byte for byte. Statements refuse the transaction
+with `TaskConditionQuarantined` (HTTP 409 `task_condition_quarantined`); ordinary
+channel writers may proceed with their cache producer skipped. Completed passes
+count quarantines and retain the first 20 ids without repeating unchanged warnings.
 
-**Diagnostic text.** `V202610250745__task_diagnostic_text` adds
-`task_diagnostic_text`, with a Task FK `ON DELETE CASCADE`. Project deletion thus
-removes the text with its Tasks. Each record has kind, writer-family source,
-typed owning reason/witness, text, original byte length and SHA-256, creation
-and last-seen times and occurrence count. Identical `(task, kind, digest)` writes
-reuse the id, increment the count and update last_seen. The first occurrence's
-source and owning reason/witness remain recorded when later owners supply identical
-text. Records are never pruned while the Task lives. Each text entry is capped at 1 MiB on a UTF-8 boundary, with the explicit
-`… [truncated]` marker; length and digest describe the original source.
+**Readers and material identity.** REST, MCP and forge-ctl expose
+`api_types::TaskCondition`, omitting cache digests, raw evidence and witnesses.
+Public readers use the typed presentation captured before evidence truncation.
+Diagnostic strings remain bounded to 1,024 bytes and arrays to 16 entries. There
+is no whole-record condition ceiling; complete witnesses and collections survive.
+Operations retains its existing operator-reason JSON bounds and 16 KiB document
+limit without cutting valid JSON mid-document.
 
-`record_task_diagnostic_text_in_tx` shares the caller's transaction. Typed Hold
-statements pass their full source text before applying the existing presentation
-limits. Capture does not add references to ordinary statement encodings. Superseded
-text remains independently readable after a clear. The DB-only
-`task_diagnostic_text` / `task_diagnostic_texts` methods support on-demand detail
-reads. Pages order by `(created_at, id)`, use an opaque tuple cursor, fetch
-`limit + 1`, and return `items`, `next_cursor` and `has_more`. Ordinary Task/list/board
-reads do not join the text table. Later writer conversions must supply their own
-full text. Existing messages and saved/superseded text remain in condition storage;
-`map_legacy_condition` continues to produce `condition_json` from the channels.
+`material_blocker(condition)` contains the interruption and intervention flag used
+by `task.interruption_changed`. Delivery metadata is stripped before incident
+identity is computed. Task versions, condition digests, timestamps, witnesses,
+reporting execution ids and offers never enter that identity. Attention consumes
+the existing immutable events; a cache repair does not publish another event.
 
-**Whole-record ceiling.** There is no whole-record size ceiling on
-`condition_json` yet. The stored condition keeps complete witnesses and
-collections and the existing per-string presentation limits. Full diagnostic
-text is captured separately without compacting the stored condition.
+**Diagnostic text.** `task_diagnostic_text` retains full writer text separately,
+with Task cascade deletion, kind, source, owning witness, original length and
+SHA-256, first/last times and occurrence count. Identical `(task, kind, digest)`
+writes reuse the first source/owner and increment occurrence count. Entries cap
+stored text at 1 MiB on a UTF-8 boundary with an explicit truncation marker; length
+and digest describe the original text. Capture shares the writer transaction;
+clearing a condition retains its diagnostic history. Detail pages order by
+`(created_at,id)`, use opaque cursors and return `items`, `next_cursor`, `has_more`.
+Ordinary Task/list/board reads do not join the text table.
 
-Operations retains its existing operator-reason document: strings within JSON are
-bounded, the whole document has its existing 16 KiB limit, and valid JSON is never
-cut mid-document. The 1,024-byte cut applies to presentation strings, not to that
-encoded document. Normal reads retain the base projection ordering and limits.
-
-**Unreadable condition.** Corrupt/empty storage is distinct from a recognizable
-newer encoding. While legacy storage is written, corruption is rebuilt from the
-legacy mapping plus durable facts in the same writer transaction or within one
-check sweep, as before this checkpoint. Every statement family uses that fallback
-on corruption; its text is retained without applying an edit over an empty
-condition. Checks retain main's strict
-comparison: unstated rows compare byte for byte, stated rows by typed value.
-Original bytes are also retained as diagnostic text (base64 for non-UTF-8 bytes),
-without adding diagnostic ids or any other field to the stored condition.
-The dispatcher still resolves corrupt rows from legacy fields until that repair
-lands; it and the check use the same oracle. Each failed recomputation or repair is
-logged without stored text and skipped, so the cursor and revision marker advance
-past a bad row.
-
-A recognizable newer tag or an unreadable row under a newer recorded mapping
-revision remains quarantined byte for byte. Statements refuse the entire transaction with
-`DbError::TaskConditionQuarantined`, mapped through
-`ServiceError::TaskConditionQuarantined` to HTTP 409
-`task_condition_quarantined`; the legacy annotation and version bump roll back.
-A legacy writer that states nothing still lands with its producer skipped.
-Each completed check pass counts quarantined Tasks and retains the first 20 ids.
-Warnings name the count and ids, without repeating an unchanged set; backfill
-warns the same way. Operator status reports the count and ids. A newer recorded
-mapping revision is neither backfilled nor lowered. The exit is a build that
-understands that encoding.
-
-**Final production-read boundary (Q4).** After all writers/readers close, the
-source guard permits exactly the historical migration Rust post-step backfills
-(`migration.rs`, `task_condition::backfill`), the integration importer's evidence
-snapshot, and the four notification triggers in
-`V202610030200__notify_hooks_consumers.sql`. Current unconverted readers are
-not extra exceptions. Command/claim/receipt keys (`queued_recovery`, publication
-claim/cleanup, terminal settlement and lead-input execution identity) remain
-durable intent until their owning units move them into existing command,
-checkpoint or operation records; none becomes condition evidence.
-
-**Fixtures.** The DB `test-template` feature exposes one typed
-`task_condition::test_support::set_task_condition` setter through the real
-claimed-step seam. Services re-exports it from `task_actions::test_support`.
-Existing pure snapshot fixtures and external legacy fixtures still need their
-scheduled fixture conversion; this helper accepts no legacy blobs or metadata
-bag.
+**Verification.** Archived corpora pin all four channel strings, metadata,
+public/read/offers/Operations projections, material events and canonical Attention
+identities. Cache comparisons are exact after the existing UUID/time normalization;
+the separate digest column needs no cache-byte stripping. Fixtures are
+never regenerated to accept a cache-format change. The `db/test-template` feature
+exposes `task_condition::test_support::set_task_condition` through the real claimed
+step for fixtures needing owned witnesses.
 
 ### Integration ownership and Task conditions
 
@@ -6959,7 +6639,7 @@ in for a removed assignment. A parked implementation failure names the missing
 coder/worker assignment; assignment remains the ordinary role API and Cancel
 remains available. Retry is offered again when an assigned Agent can take it.
 
-Annotations record conditions and evidence, never an action allowlist. Old JSON `recovery_actions` keys are ignored, including unknown historical strings. Historical queued commands are translated at the stored-data boundary from current snapshot facts; their original payload is retained. A superseded or unrepresentable intent restores its condition for an explicit new command. No schema migration is required. The annotation, blocked, failed and entry-barrier columns remain private condition storage. Writers are being converted to typed channel values; `map_legacy_condition` remains the producer of `condition_json`.
+Annotations record conditions and evidence, never an action allowlist. Old JSON `recovery_actions` keys are ignored, including unknown historical strings. Historical queued commands are translated at the stored-data boundary from current snapshot facts; their original payload is retained. A superseded or unrepresentable intent restores its condition for an explicit new command. No schema migration is required. See "Task condition channels, producer and cache repair" for condition storage and composition.
 
 Recovery commits a queued intent with the saved condition. The dispatcher consumes it through normal admission and waits quietly for capacity, a paused Project/Agent or a reachable workspace owner. Permanent refusals and malformed/stale intents remove the marker and atomically restore the condition with the error, fenced by Task version and marker identity. Fresh retries use the role prompt and review-bound admission; send-back continuations use the review-fix prompt. Restart applies its reset immediately and retains its restart/unblocked events. A shared in-process wake resumes the existing loop after command commits and terminal executions. Gate decisions still transition through the workflow engine; their worker dispatch is deferred and queued, preserving the worker thread on send-back. No new polling worker is introduced. Session launches remain separate Task-adjacent operations. `hold` parks workflow Task work. `release` is the owner's decision on the run the hold stopped: when no Agent can take the Task at that moment (the Agent or the Project is paused) the release clears the hold and marks that stopped run resumable (`resume_policy = auto`), so the dispatcher starts the role again as soon as the Agent is available instead of treating the stopped run as one that still needs a decision. Only that run is marked: the Task's latest non-interactive run, and only when the user stopped it (`cancelled` with `stop_reason = user_cancelled`). A run that failed or was stopped for any other reason (executor failure, timeout, stall, lost machine) keeps `resume_policy = manual` and its own recovery, and the mark is undone when the release loses its version race. Stopping a specific execution or side session uses the execution `/stop` resource, including when both run together.
 
@@ -9969,11 +9649,11 @@ the durable dirty set and the first lap runs behind it. After a mapping
 revision change the backfill covers every Task once, settled ones included,
 in its own bounded slices.
 
-**Failures stay with their Task.** The legacy fields stay authoritative: when
-a stored condition does not match the legacy fields read in the same snapshot
-(a writer missed its sync), the pass resolves from the legacy fields and
-repairs the stored copy. A Task whose stored condition cannot be decoded is quarantined as a named
-unknown park; its raw condition is preserved for a server that understands it.
+**Failures stay with their Task.** A missing or mismatching channel digest makes
+the pass recompose from the channels read in the same snapshot, retaining owned
+Integration/Check witnesses, and repair the cache. Corrupt/empty caches use that
+same fallback; a recognizable newer encoding is quarantined as a named unknown
+park with its raw bytes preserved for a server that understands it.
 A Task whose reconciliation fails is logged, counted and retried at the scan
 interval; the pass continues, and only a pass that completed records the
 commit generation it saw.
@@ -10035,15 +9715,9 @@ load test with a machine cap and a Project limit, failed-Review recovery and
 wakes. The only differences accepted are the fixture's `@`-lines, each naming
 one of the three allowed changes.
 
-**Condition storage.** The four condition columns remain storage as their writers
-convert to typed channel values; `map_legacy_condition` remains the producer of
-`condition_json`. Any Task table rebuild must preserve scheduler triggers and
-indexes, dirty generations, parks and waits, queue receipts and immutable events.
-
-Stage four must compose these owner results into the public condition DTO and
-switch all projections together, replace the visible park annotation with the
-condition's own park, preserve the material-blocker digest and slot
-classification, regenerate bindings and document the single public beta break.
+Condition storage, composition and repair are described in "Task condition channels,
+producer and cache repair". Any Task table rebuild must preserve scheduler triggers
+and indexes, dirty generations, parks and waits, queue receipts and immutable events.
 
 ### Checks: the final state (3.3)
 

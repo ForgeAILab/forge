@@ -34,6 +34,9 @@ pub struct Task {
     pub updated_at: String,
     #[serde(default)]
     pub condition: crate::TaskCondition,
+    /// Stored cache freshness, retained with the condition in private receipts.
+    #[serde(default)]
+    pub condition_digest: Option<String>,
 }
 /// Decoder for private stored Task receipts written before condition became public.
 /// Live REST/MCP serializers always use their dedicated DTOs.
@@ -68,6 +71,8 @@ struct TaskArchive {
     pub updated_at: String,
     #[serde(default)]
     pub condition: Option<crate::TaskCondition>,
+    #[serde(default)]
+    pub condition_digest: Option<String>,
 }
 impl From<TaskArchive> for Task {
     fn from(archive: TaskArchive) -> Self {
@@ -101,10 +106,10 @@ impl From<TaskArchive> for Task {
             created_at: archive.created_at,
             updated_at: archive.updated_at,
             condition: crate::TaskCondition::default(),
+            condition_digest: archive.condition_digest,
         };
-        task.condition = condition.unwrap_or_else(|| {
-            crate::map_legacy_condition(&crate::LegacyConditionInput::from(&task))
-        });
+        task.condition = condition
+            .unwrap_or_else(|| crate::compose_condition(&crate::ConditionInput::from(&task)));
         task
     }
 }

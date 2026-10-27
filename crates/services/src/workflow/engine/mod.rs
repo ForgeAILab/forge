@@ -1341,6 +1341,7 @@ pub(crate) mod resolve_workflow_tests {
     pub(crate) fn task(parent_task_id: Option<String>, status: &str) -> db::Task {
         let now = now_rfc3339();
         db::Task {
+            condition_digest: None,
             condition: Default::default(),
             id: new_uuid_v4(),
             project_id: new_uuid_v4(),

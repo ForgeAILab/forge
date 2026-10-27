@@ -296,3 +296,7 @@ async fn concurrent_takeover_of_an_expired_running_lease_has_one_winner_and_is_u
     assert_eq!(stored.version, running.version + 1);
     db.pool().close().await;
 }
+
+const AFTER: &str = "2026-10-08T00:01:01Z";
+
+const AFTER_UNTIL: &str = "2026-10-08T00:02:00Z";

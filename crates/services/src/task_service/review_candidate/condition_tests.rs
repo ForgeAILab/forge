@@ -75,10 +75,10 @@ async fn missing_candidate_real_writer_equals_legacy_oracle() {
         let facts = db::ConditionFacts::load(&mut connection, &task.id)
             .await
             .unwrap();
-        let mut legacy = db::LegacyConditionInput::from(&row);
+        let mut legacy = db::ConditionInput::from(&row);
         drop(connection);
         legacy.facts = Some(facts);
-        let mapped = db::map_legacy_condition(&legacy);
+        let mapped = db::compose_condition(&legacy);
         db::task_writer::in_task_step(step, async {
             let mut tx = db.pool().begin().await.unwrap();
             db.produce_condition_in_tx(&mut tx, &task.id, db::ConditionChange::Legacy)
@@ -308,6 +308,6 @@ async fn healthy_service_retry_hold_release_and_board_move_never_park_unreadable
 }
 
 fn assert_readable(task: &Task) {
-    assert!(!task.condition.reasons().any(|r| matches!(r, db::ParkReason::UnknownCondition { source, .. } if source.field == db::LegacyConditionField::ConditionJson)), "{:?}", task.condition);
+    assert!(!task.condition.reasons().any(|r| matches!(r, db::ParkReason::UnknownCondition { source, .. } if source.field == db::ConditionField::ConditionJson)), "{:?}", task.condition);
     assert!(db::task_condition::decode(&serde_json::to_string(&task.condition).unwrap()).is_ok());
 }

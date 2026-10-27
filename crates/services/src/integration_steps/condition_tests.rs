@@ -119,15 +119,15 @@ impl Root {
         let after = self.task().await;
         assert_eq!(after.version, before.version);
         assert_eq!(
-            db::LegacyConditionInput::from(&after),
-            db::LegacyConditionInput::from(before)
+            db::ConditionInput::from(&after),
+            db::ConditionInput::from(before)
         );
         let mut c = self.db.pool().acquire().await.unwrap();
         let facts = db::ConditionFacts::load(&mut c, "root").await.unwrap();
         drop(c);
-        let mut input = db::LegacyConditionInput::from(&after);
+        let mut input = db::ConditionInput::from(&after);
         input.facts = Some(facts);
-        let expected = db::map_legacy_condition(&input);
+        let expected = db::compose_condition(&input);
         assert_eq!(after.condition.typed(), expected.typed());
         if visible_children {
             assert_eq!(
@@ -153,7 +153,7 @@ impl Root {
         } else {
             let observation = db::ParkReason::UnknownCondition {
                 source: db::ConditionSource {
-                    field: db::LegacyConditionField::MetadataJson,
+                    field: db::ConditionField::MetadataJson,
                     key: Some("coordination_review_pending".into()),
                 },
                 problem: db::UnknownConditionProblem::UnownedEntry,

@@ -897,10 +897,10 @@ async fn set_condition_checks_the_stated_condition_against_legacy_only() {
     let t = task(&db, "stated").await;
     let step = claim(&db, &t.id).await;
     crate::task_writer::in_task_step(step, async {
-        let input = LegacyConditionInput::from(&t);
+        let input = ConditionInput::from(&t);
         let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
         let facts = ConditionFacts::load(&mut tx, &t.id).await.unwrap();
-        let stated = facts.apply(map_legacy_condition(&input));
+        let stated = facts.apply(compose_condition(&input));
         db.set_condition(&mut tx, &t.id, t.version, &input, &stated)
             .await
             .unwrap();
@@ -911,8 +911,8 @@ async fn set_condition_checks_the_stated_condition_against_legacy_only() {
         let mut stale = facts.clone();
         stale.epoch += 1;
         for refused in [
-            other.apply(map_legacy_condition(&input)),
-            stale.apply(map_legacy_condition(&input)),
+            other.apply(compose_condition(&input)),
+            stale.apply(compose_condition(&input)),
             facts.apply(TaskCondition::Parked {
                 primary: ParkReason::Held {
                     actor: "user".into(),
@@ -974,7 +974,7 @@ async fn stated_condition_follows_the_legacy_write_with_or_without_a_live_lease(
             .execute(&mut *tx)
             .await
             .unwrap();
-        let input = LegacyConditionInput::default();
+        let input = ConditionInput::default();
         let facts = ConditionFacts::load(&mut tx, &t.id).await.unwrap();
         assert!(matches!(
             db.set_condition(
@@ -982,7 +982,7 @@ async fn stated_condition_follows_the_legacy_write_with_or_without_a_live_lease(
                 &t.id,
                 t.version,
                 &input,
-                &facts.apply(map_legacy_condition(&input))
+                &facts.apply(compose_condition(&input))
             )
             .await,
             Err(DbError::VersionConflict)

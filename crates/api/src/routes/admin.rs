@@ -179,6 +179,19 @@ fn is_protected_setting_key(key: &str) -> bool {
         key,
         "bootstrap_completed"
             | db::MAPPING_REVISION_KEY
+            | "task_condition_backfill_cursor"
             | services::check_runner::policy::VALUE_REVISION_SALT_KEY
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_protected_setting_key;
+
+    #[test]
+    fn condition_repair_settings_are_private() {
+        assert!(is_protected_setting_key(db::MAPPING_REVISION_KEY));
+        assert!(is_protected_setting_key("task_condition_backfill_cursor"));
+        assert!(!is_protected_setting_key("ordinary_setting"));
+    }
 }

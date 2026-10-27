@@ -98,7 +98,7 @@ fn from_barrier(reason: &ParkReason) -> bool {
         | ParkReason::UnknownCondition { source, .. } => source,
         _ => return false,
     };
-    source.field == db::LegacyConditionField::EntryBarrierJson
+    source.field == db::ConditionField::EntryBarrierJson
 }
 /// `barrier_holds` is false where the base scheduler never read the entry
 /// barrier: admission from an initial state, and a gate that cascades past an
@@ -139,7 +139,7 @@ fn blocking(c: &TaskCondition, barrier_holds: bool) -> bool {
                 p,
                 ParkReason::UnknownCondition {
                     source: db::ConditionSource {
-                        field: db::LegacyConditionField::SchedulePark,
+                        field: db::ConditionField::SchedulePark,
                         ..
                     },
                     ..
@@ -174,13 +174,11 @@ fn earlier(deadline: &mut Option<String>, time: Option<DateTime<Utc>>, now: Date
     }
 }
 fn stale_condition(stored: &TaskCondition, task: &db::Task) -> Option<TaskCondition> {
-    // A writer stated this condition in the transaction of its write:
-    // it is not a copy of the legacy fields and cannot lag them.
     let unreadable = stored.reasons().find_map(|reason| match reason {
         ParkReason::UnknownCondition {
             source:
                 db::ConditionSource {
-                    field: db::LegacyConditionField::ConditionJson,
+                    field: db::ConditionField::ConditionJson,
                     ..
                 },
             problem,
@@ -193,25 +191,12 @@ fn stale_condition(stored: &TaskCondition, task: &db::Task) -> Option<TaskCondit
         Some(db::UnknownConditionProblem::UnknownKind) => return None,
         // Corrupt or empty: the legacy fields are intact, so resolve
         // from them and let the check restate the stored copy.
-        Some(_) => {
-            return Some(db::map_legacy_condition(&db::LegacyConditionInput::from(
-                task,
-            )))
-        }
+        Some(_) => return Some(db::compose_condition(&db::ConditionInput::from(task))),
         None => {}
     }
-    if stored.evidence().stated {
-        return None;
-    }
-    let legacy = stored.restate_legacy(&db::LegacyConditionInput::from(task));
-    let (stored, fresh) = (stored.evidence(), legacy.evidence());
-    (stored.error_annotation != fresh.error_annotation
-        || stored.blocked_json != fresh.blocked_json
-        || stored.failed_json != fresh.failed_json
-        || stored.entry_barrier_json != fresh.entry_barrier_json
-        || stored.metadata != fresh.metadata
-        || stored.unparsed_metadata != fresh.unparsed_metadata)
-        .then_some(legacy)
+    let input = db::ConditionInput::from(task);
+    (!stored.channels_match(&input, task.condition_digest.as_deref()))
+        .then(|| stored.recompose(&input))
 }
 impl TaskDispatcher {
     pub(super) fn prepare_schedule(
@@ -741,28 +726,240 @@ impl TaskDispatcher {
 mod tests {
     use super::*;
     #[test]
+    fn digest_checks_stated_rows_and_bytes_beyond_the_evidence_limit() {
+        let mut task = crate::task_actions::test_support::snapshot("todo", None).task;
+        task.error_annotation = Some(format!(
+            "{}a",
+            "x".repeat(db::task_condition::EVIDENCE_VALUE_LIMIT + 100)
+        ));
+        let input = db::ConditionInput::from(&task);
+        task.condition_digest = Some(input.channel_digest());
+        let mut stored = serde_json::to_value(db::compose_condition(&input)).unwrap();
+        stored["evidence"]["stated"] = serde_json::json!(true);
+        let stored: TaskCondition = serde_json::from_value(stored).unwrap();
+        assert!(stale_condition(&stored, &task).is_none());
+        let raw = task.error_annotation.as_mut().unwrap();
+        raw.pop();
+        raw.push('b');
+        let fresh =
+            stale_condition(&stored, &task).expect("a stated cache can miss a raw write too");
+        assert_eq!(
+            stored.evidence().error_annotation,
+            fresh.evidence().error_annotation
+        );
+        assert_ne!(
+            task.condition_digest.as_ref().unwrap(),
+            &db::ConditionInput::from(&task).channel_digest()
+        );
+    }
+
+    #[test]
+    fn unrelated_metadata_does_not_stale_the_dispatcher_cache() {
+        let mut task = crate::task_actions::test_support::snapshot("todo", None).task;
+        task.metadata_json = None;
+        let stored = db::compose_condition(&db::ConditionInput::from(&task));
+        task.metadata_json = Some(r#"{"unrelated":123}"#.into());
+        assert!(stale_condition(&stored, &task).is_none());
+        task.metadata_json = Some(r#"{"awaiting_human":false}"#.into());
+        let stored = db::compose_condition(&db::ConditionInput::from(&task));
+        task.metadata_json =
+            Some(r#"{"unrelated":{"large":"payload"}, "awaiting_human":false}"#.into());
+        assert!(stale_condition(&stored, &task).is_none());
+    }
+    #[test]
     fn corrupt_rows_use_the_legacy_oracle() {
         let mut task = crate::task_actions::test_support::snapshot(
             "todo",
             Some(api_types::FailureKind::WorkspaceError),
         )
         .task;
-        task.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&task));
+        task.condition = db::compose_condition(&db::ConditionInput::from(&task));
         let corrupt = db::task_condition::decode_or_unknown("{}");
-        let expected = db::map_legacy_condition(&db::LegacyConditionInput::from(&task));
+        let expected = db::compose_condition(&db::ConditionInput::from(&task));
         assert_eq!(stale_condition(&corrupt, &task), Some(expected));
     }
 
     #[tokio::test]
-    async fn legacy_evidence_detects_missed_syncs_in_each_legacy_input() {
+    async fn null_digest_preserves_project_pause_children_and_parent_dispatch_views() {
+        use db::TaskRepo;
+        use std::sync::Arc;
+        let db = Arc::new(crate::recovery::test_support::sqlite_db().await);
+        let (project, _) = crate::recovery::test_support::seed_project_repo(&db).await;
+        let root = crate::recovery::test_support::seed_task(
+            &db,
+            project.clone(),
+            "in_progress".into(),
+            None,
+        )
+        .await;
+        let paused =
+            crate::recovery::test_support::seed_task(&db, project.clone(), "todo".into(), None)
+                .await;
+        let mut tx = db.pool().begin().await.unwrap();
+        for i in 0..2 {
+            sqlx::query("INSERT INTO task(id,project_id,parent_task_id,title,status,subtask_order,created_at,updated_at) VALUES (?,?,?,'child','todo',?,'2026-10-25','2026-10-25')")
+                .bind(db::new_uuid_v4()).bind(&root.project_id).bind(&root.id).bind(i).execute(&mut *tx).await.unwrap();
+        }
+        sqlx::query("UPDATE task SET metadata_json=? WHERE id=?")
+            .bind(serde_json::json!({"coordination_review_pending":true}).to_string())
+            .bind(&root.id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let mut tx = db.pool().begin().await.unwrap();
+        db.produce_condition_in_tx(&mut tx, &root.id, db::ConditionChange::Full)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert!(TaskRepo::get_by_id(&*db, &root.id, false)
+            .await
+            .unwrap()
+            .unwrap()
+            .condition
+            .reasons()
+            .any(|r| matches!(r, ParkReason::Children { remaining, .. } if remaining.len() == 2)));
+        let bus = Arc::new(events::EventBus::new(32));
+        let service = Arc::new(crate::TaskService::new(Arc::clone(&db), Arc::clone(&bus)));
+        let dispatcher = TaskDispatcher::new(Arc::clone(&db), bus, service);
+        let project_row = db::ProjectRepo::get_by_id(&*db, &project)
+            .await
+            .unwrap()
+            .unwrap();
+        let eval = |ids: Vec<String>, project_row: db::Project| {
+            let db = Arc::clone(&db);
+            let dispatcher = &dispatcher;
+            async move {
+                for id in &ids {
+                    let mut outcomes = Vec::new();
+                    for strip in [false, true] {
+                        let mut read = db
+                            .schedule_reads(std::slice::from_ref(id))
+                            .await
+                            .unwrap()
+                            .pop()
+                            .unwrap();
+                        if strip {
+                            read.task.condition_digest = None;
+                            if let Some(parent) = &mut read.parent {
+                                parent.condition_digest = None;
+                            }
+                        }
+                        let expected = read.condition.clone();
+                        let expected_parent = read.parent.as_ref().map(|t| t.condition.clone());
+                        let p = dispatcher.prepare_schedule(read, &project_row, chrono::Utc::now());
+                        assert_eq!(p.read.condition, expected, "upgrade must preserve reasons");
+                        assert_eq!(
+                            p.read.parent.as_ref().map(|t| t.condition.clone()),
+                            expected_parent
+                        );
+                        assert!(
+                            !p.condition_stale,
+                            "missing digest alone is not a missed producer write"
+                        );
+                        let parent_reasons =
+                            p.read.parent.as_ref().map(|t| {
+                                format!("{:?}", t.condition.reasons().collect::<Vec<_>>())
+                            });
+                        let next = super::super::next_step::next_step(
+                            &super::super::next_step::Snapshot {
+                                state: &p.read.task.status,
+                                condition: &p.read.condition,
+                                workflow: &p.workflow,
+                                facts: &p.facts,
+                            },
+                        );
+                        outcomes.push(format!(
+                    "strip={strip} stale={} reasons={:?} parent={parent_reasons:?} next={next:?}",
+                    p.condition_stale,
+                    p.read.condition.reasons().collect::<Vec<_>>()
+                ));
+                    }
+                    eprintln!("PROBE D {id}:\n  {}\n  {}", outcomes[0], outcomes[1]);
+                }
+            }
+        };
+        let child_ids: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM task WHERE parent_task_id=?")
+                .bind(&root.id)
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        let mut first = vec![root.id.clone()];
+        first.extend(child_ids);
+        eval(first, project_row.clone()).await;
+        sqlx::query("UPDATE project SET paused_at=? WHERE id=?")
+            .bind(db::now_rfc3339())
+            .bind(&project)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        db.record_schedule_park(
+            &paused.id,
+            0,
+            &serde_json::json!({"reason":"ProjectPaused", "owner":"User", "action":"ResumeProject"})
+                .to_string(),
+        )
+        .await
+        .unwrap();
+        db.check_task_conditions_of(std::slice::from_ref(&paused.id))
+            .await
+            .unwrap();
+        let project_row = db::ProjectRepo::get_by_id(&*db, &project)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(TaskRepo::get_by_id(&*db, &paused.id, false)
+            .await
+            .unwrap()
+            .unwrap()
+            .condition
+            .reasons()
+            .any(|r| matches!(r, ParkReason::ProjectPaused { .. })));
+        eval(vec![paused.id.clone()], project_row.clone()).await;
+        sqlx::query("UPDATE task SET condition_digest=NULL WHERE id=?")
+            .bind(&root.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::raw_sql("CREATE TRIGGER skip_digest_repair BEFORE UPDATE OF condition_digest ON task BEGIN SELECT RAISE(ABORT,'review-probe skipped repair'); END;")
+            .execute(db.pool()).await.unwrap();
+        db::SystemSettingRepo::set_setting(&*db, db::MAPPING_REVISION_KEY, "7", &db::now_rfc3339())
+            .await
+            .unwrap();
+        while db.backfill_task_conditions_if_stale().await.unwrap() {}
+        let skipped = TaskRepo::get_by_id(&*db, &root.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(skipped.condition_digest.is_none());
+        let read = db
+            .schedule_reads(std::slice::from_ref(&root.id))
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let prepared = dispatcher.prepare_schedule(read, &project_row, chrono::Utc::now());
+        assert!(
+            !prepared.condition_stale,
+            "a skipped row keeps the NULL freshness fallback after the walk"
+        );
+        assert_eq!(prepared.read.condition, skipped.condition);
+        db.complete_condition_pass(0);
+        assert_eq!(db.condition_check_status().last_pass.unwrap().repaired, 0);
+    }
+    #[tokio::test]
+    async fn channel_digest_detects_raw_sql_missed_syncs_and_the_sweep_repairs_them() {
         use db::TaskRepo;
         let db = crate::recovery::test_support::sqlite_db().await;
         let (project, _) = crate::recovery::test_support::seed_project_repo(&db).await;
         let task =
             crate::recovery::test_support::seed_task(&db, project, "in_progress".into(), None)
                 .await;
+        let prefix = "x".repeat(db::task_condition::EVIDENCE_VALUE_LIMIT + 100);
         let annotation =
-            serde_json::json!({"type":"workspace_error", "blocking_reason":"old"}).to_string();
+            serde_json::json!({"type":"workspace_error", "blocking_reason":format!("{prefix}a")})
+                .to_string();
         let metadata = serde_json::json!({"coordination_review_pending":true}).to_string();
         let mut tx = db.pool().begin().await.unwrap();
         for i in 0..400 {
@@ -803,6 +1000,8 @@ mod tests {
             sqlx::query(&format!("UPDATE task SET {field}=? WHERE id=?"))
                 .bind(if field == "metadata_json" {
                     serde_json::json!({"coordination_review_pending":true, "awaiting_human":false}).to_string()
+                } else if field == "error_annotation" {
+                    serde_json::json!({"type":"workspace_error", "blocking_reason":format!("{prefix}b")}).to_string()
                 } else {
                     serde_json::json!({"kind":"manual_stop","type":"manual_stop","reason":"new hold"}).to_string()
                 })
@@ -813,10 +1012,17 @@ mod tests {
                 .unwrap();
             let restated =
                 stale_condition(&stored, &changed).unwrap_or_else(|| panic!("missed {field} sync"));
+            if field == "error_annotation" {
+                assert_eq!(
+                    stored.evidence().error_annotation,
+                    restated.evidence().error_annotation,
+                    "the missed raw write differs only beyond the bounded evidence copy"
+                );
+            }
             assert_eq!(
                 restated.public(),
                 stored
-                    .restate_legacy(&db::LegacyConditionInput::from(&changed))
+                    .recompose(&db::ConditionInput::from(&changed))
                     .public()
             );
             assert!(blocking(&restated, true), "{field}");
@@ -860,8 +1066,8 @@ mod tests {
     #[test]
     fn integration_restatement_preserves_lineage_and_new_legacy_holds() {
         for condition in crate::task_actions::tests::integration_conditions() {
-            let input = db::LegacyConditionInput { error_annotation: Some(serde_json::json!({"type":"manual_stop","blocking_reason":"new hold","blocked_by":"user"}).to_string()), ..Default::default() };
-            let restated = condition.restate_legacy(&input);
+            let input = db::ConditionInput { error_annotation: Some(serde_json::json!({"type":"manual_stop","blocking_reason":"new hold","blocked_by":"user"}).to_string()), ..Default::default() };
+            let restated = condition.recompose(&input);
             assert_eq!(
                 restated.integration_reason(),
                 condition.integration_reason()

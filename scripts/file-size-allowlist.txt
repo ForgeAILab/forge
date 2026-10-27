@@ -2,10 +2,9 @@
 # Never raise or add entries; split files instead.
 # After shrinking/deleting files: python3 scripts/check-file-sizes.py --update
 # Maintainers only: --init recreates the one-time baseline, never to accept growth.
-2193 crates/db/src/task_condition/tests.rs
+2130 crates/db/src/task_condition/tests.rs
 3907 crates/services-agents/tests/suite/native_scope_composition.rs
 10968 crates/services/src/task_dispatcher/tests.rs
 2036 crates/services/src/task_dispatcher/tests/equivalence.rs
 2342 crates/services/src/task_dispatcher/tests/lead_check.rs
 2541 crates/services/src/task_dispatcher/tests/lead_operations.rs
-2227 crates/services/src/workflow/dispatch/tests.rs

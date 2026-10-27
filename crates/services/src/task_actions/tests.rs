@@ -2,8 +2,7 @@
 
 fn projected_actions(snapshot: &super::TaskSnapshot) -> Vec<api_types::Offer> {
     let mut projected = snapshot.clone();
-    projected.task.condition =
-        db::map_legacy_condition(&db::LegacyConditionInput::from(&projected.task));
+    projected.task.condition = db::compose_condition(&db::ConditionInput::from(&projected.task));
     super::available_actions(&projected)
 }
 
@@ -136,7 +135,7 @@ pub(crate) fn integration_conditions() -> Vec<db::TaskCondition> {
                 integration: Some(reason),
                 ..Default::default()
             }
-            .condition(&db::LegacyConditionInput::default())
+            .condition(&db::ConditionInput::default())
         })
         .collect()
 }
@@ -162,7 +161,7 @@ pub(crate) fn check_conditions() -> Vec<db::TaskCondition> {
             )),
             ..Default::default()
         }
-        .condition(&db::LegacyConditionInput::default())
+        .condition(&db::ConditionInput::default())
     })
     .collect()
 }
@@ -232,7 +231,7 @@ fn integration_waits_offer_hold_and_cancel_without_agent_recovery() {
         );
         // A user hold remains an ordinary releaseable primary, with
         // integration waiting as an independent secondary reason.
-        let mut held = db::map_legacy_condition(&db::LegacyConditionInput {
+        let mut held = db::compose_condition(&db::ConditionInput {
             error_annotation: Some(
                 json!({"type":"manual_stop","blocking_reason":"held","blocked_by":"user"})
                     .to_string(),
@@ -250,16 +249,16 @@ fn integration_waits_offer_hold_and_cancel_without_agent_recovery() {
         assert!(!offers.iter().any(|offer| offer.action.verb() == "retry"));
         // Integration is secondary to an entry blocker, whose offers
         // remain exactly the same as without integration ownership.
-        let input = db::LegacyConditionInput {
+        let input = db::ConditionInput {
             entry_barrier_json: Some(
                 json!({"state":"merging","status":"blocked","blocking_reason":"other owner"})
                     .to_string(),
             ),
             ..Default::default()
         };
-        snapshot.task.condition = db::map_legacy_condition(&input);
+        snapshot.task.condition = db::compose_condition(&input);
         let expected = available_actions(&snapshot);
-        snapshot.task.condition = condition.restate_legacy(&input);
+        snapshot.task.condition = condition.recompose(&input);
         assert_eq!(available_actions(&snapshot), expected);
     }
 }
@@ -690,7 +689,7 @@ fn workflow_loop_keeps_failure_kind_and_offers() {
     old.task.blocked_json = Some(
         r#"{"reason":"loop","blocked_at":"2026-10-01T00:00:00Z","source":"workflow_loop"}"#.into(),
     );
-    old.task.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&old.task));
+    old.task.condition = db::compose_condition(&db::ConditionInput::from(&old.task));
     let offers = available_actions(&old);
     assert_eq!(
         offers,

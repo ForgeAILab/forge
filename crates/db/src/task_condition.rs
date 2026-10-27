@@ -1,7 +1,7 @@
-//! Typed Task conditions. Legacy mapping remains authoritative for legacy
-//! writers; integration ownership is stated directly under the Task-step lease.
+//! Typed Task conditions composed from stored channels and durable witnesses.
+//! Integration/check ownership is stated directly under the Task-step lease.
 //!
-//! [`map_legacy_condition`] is the single deterministic mapping: a pure Rust
+//! [`compose_condition`] is the single deterministic mapping: a pure Rust
 //! function used by the migration backfill, the writer seams and the invariant
 //! check. No SQL trigger or view evaluates it, so no Task write statement
 //! carries the mapping. No queue intent, publication claim or settlement
@@ -97,7 +97,7 @@ pub struct ConditionEvidence {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum LegacyConditionField {
+pub enum ConditionField {
     ErrorAnnotation,
     BlockedJson,
     FailedJson,
@@ -110,7 +110,7 @@ pub enum LegacyConditionField {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConditionSource {
-    pub field: LegacyConditionField,
+    pub field: ConditionField,
     pub key: Option<String>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -330,20 +330,20 @@ impl TaskCondition {
         evidence.unparsed_metadata = None;
         typed
     }
-    /// Whether the stored text `stored` says what `expected` says. A stated
-    /// condition is compared by what it states, not by the legacy copies it
-    /// does not carry.
+    /// Compare the typed body and durable projections. Callers independently
+    /// fence channel freshness with the row's digest, or validate bounded
+    /// evidence before stamping a pre-digest row.
     pub(crate) fn stored_agrees(stored: &[u8], expected: &Self, encoded: &str) -> bool {
         stored == encoded.as_bytes()
             || serde_json::from_slice::<Self>(stored)
-                .is_ok_and(|stored| stored.evidence().stated && stored.typed() == expected.typed())
+                .is_ok_and(|stored| stored.typed() == expected.typed())
     }
 }
 
 /// The `error_annotation.type` values today's dispatcher refuses to dispatch
 /// through. `services::task_dispatcher` reads this same list, so the mapping
 /// and the dispatcher cannot drift. Any other annotation is informational.
-pub const LEGACY_BLOCKING_ANNOTATION_KINDS: &[&str] = &[
+pub const BLOCKING_ANNOTATION_KINDS: &[&str] = &[
     "manual_stop",
     "workflow_loop",
     "cascade_failed",
@@ -361,7 +361,7 @@ pub const LEGACY_BLOCKING_ANNOTATION_KINDS: &[&str] = &[
 /// Revision of the mapping and of the stored encoding. A database whose
 /// recorded revision differs is recomputed once in the background, off the
 /// startup path. Bump it with every change to either.
-pub const MAPPING_REVISION: i64 = 7;
+pub const MAPPING_REVISION: i64 = 8;
 /// Protected `system_setting` key recording the revision last backfilled.
 pub const MAPPING_REVISION_KEY: &str = "task_condition_mapping_revision";
 
@@ -411,7 +411,7 @@ const OBJECT_METADATA_KEYS: [&str; 8] = [
 /// A snapshot fence must include metadata: several existing metadata writers
 /// intentionally leave Task.version unchanged. No timestamp enters the map.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct LegacyConditionInput {
+pub struct ConditionInput {
     /// Optional durable facts, captured in the writer's transaction. A bare
     /// legacy input remains the import fallback.
     pub facts: Option<ConditionFacts>,
@@ -422,9 +422,12 @@ pub struct LegacyConditionInput {
     pub metadata_json: Option<String>,
     /// Columns holding a BLOB or invalid UTF-8 instead of text. Their value
     /// above is `None`; they map to `UnknownCondition(NonText)`.
-    pub non_text: Vec<LegacyConditionField>,
+    pub non_text: Vec<ConditionField>,
+    /// Preserve hostile stored bytes for freshness checks, even when the
+    /// lenient reader can only report NonText.
+    pub non_text_bytes: Vec<(ConditionField, Vec<u8>)>,
 }
-impl From<&Task> for LegacyConditionInput {
+impl From<&Task> for ConditionInput {
     fn from(task: &Task) -> Self {
         Self {
             error_annotation: task.error_annotation.clone(),
@@ -433,75 +436,83 @@ impl From<&Task> for LegacyConditionInput {
             entry_barrier_json: task.entry_barrier_json.clone(),
             metadata_json: task.metadata_json.clone(),
             non_text: Vec::new(),
+            non_text_bytes: Vec::new(),
             facts: None,
         }
     }
 }
 
-const LEGACY_FIELDS: [LegacyConditionField; 5] = [
-    LegacyConditionField::ErrorAnnotation,
-    LegacyConditionField::BlockedJson,
-    LegacyConditionField::FailedJson,
-    LegacyConditionField::EntryBarrierJson,
-    LegacyConditionField::MetadataJson,
+const CHANNEL_FIELDS: [ConditionField; 5] = [
+    ConditionField::ErrorAnnotation,
+    ConditionField::BlockedJson,
+    ConditionField::FailedJson,
+    ConditionField::EntryBarrierJson,
+    ConditionField::MetadataJson,
 ];
 /// The five legacy columns of one row, read without assuming they hold text.
-const LEGACY_SELECT: &str =
+const CHANNEL_SELECT: &str =
     "error_annotation,blocked_json,failed_json,entry_barrier_json,metadata_json,condition_json";
 
-impl LegacyConditionInput {
+impl ConditionInput {
     /// Never fails on a hostile value: a BLOB or invalid UTF-8 is recorded in
     /// `non_text` instead of aborting the read.
     fn from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Self> {
         let mut input = Self::default();
-        for (index, field) in LEGACY_FIELDS.iter().enumerate() {
+        for (index, field) in CHANNEL_FIELDS.iter().enumerate() {
             let raw = row.try_get_raw(index)?;
             let is_text = sqlx::ValueRef::type_info(&raw).to_string() == "TEXT";
             let bytes: Option<Vec<u8>> = row.try_get(index)?;
             let value = match bytes.map(String::from_utf8) {
                 None => None,
                 Some(Ok(text)) if is_text => Some(text),
-                Some(_) => {
+                Some(other) => {
                     input.non_text.push(field.clone());
+                    let bytes = match other {
+                        Ok(text) => text.into_bytes(),
+                        Err(error) => error.into_bytes(),
+                    };
+                    input.non_text_bytes.push((field.clone(), bytes));
                     None
                 }
             };
             *match field {
-                LegacyConditionField::ErrorAnnotation => &mut input.error_annotation,
-                LegacyConditionField::BlockedJson => &mut input.blocked_json,
-                LegacyConditionField::FailedJson => &mut input.failed_json,
-                LegacyConditionField::EntryBarrierJson => &mut input.entry_barrier_json,
-                LegacyConditionField::MetadataJson => &mut input.metadata_json,
-                LegacyConditionField::PendingRemoteCancel
-                | LegacyConditionField::SchedulePark
-                | LegacyConditionField::ConditionJson => {
+                ConditionField::ErrorAnnotation => &mut input.error_annotation,
+                ConditionField::BlockedJson => &mut input.blocked_json,
+                ConditionField::FailedJson => &mut input.failed_json,
+                ConditionField::EntryBarrierJson => &mut input.entry_barrier_json,
+                ConditionField::MetadataJson => &mut input.metadata_json,
+                ConditionField::PendingRemoteCancel
+                | ConditionField::SchedulePark
+                | ConditionField::ConditionJson => {
                     unreachable!("durable sources are not legacy columns")
                 }
             } = value;
         }
         Ok(input)
     }
-    fn view(&self) -> LegacyView<'_> {
-        LegacyView {
+    fn view(&self) -> ChannelView<'_> {
+        ChannelView {
             error_annotation: self.error_annotation.as_deref(),
             blocked_json: self.blocked_json.as_deref(),
             failed_json: self.failed_json.as_deref(),
             entry_barrier_json: self.entry_barrier_json.as_deref(),
             metadata_json: self.metadata_json.as_deref(),
             non_text: &self.non_text,
+            non_text_bytes: &self.non_text_bytes,
         }
     }
 }
 
 /// Borrowed mapping input.
 #[derive(Clone, Copy)]
-pub(crate) struct LegacyView<'a> {
+pub(crate) struct ChannelView<'a> {
     pub error_annotation: Option<&'a str>,
     pub blocked_json: Option<&'a str>,
     pub failed_json: Option<&'a str>,
     pub entry_barrier_json: Option<&'a str>,
     pub metadata_json: Option<&'a str>,
-    pub non_text: &'a [LegacyConditionField],
+    pub non_text: &'a [ConditionField],
+    pub non_text_bytes: &'a [(ConditionField, Vec<u8>)],
 }
 /// One level of a JSON object. Values stay raw text, so an unrelated large
 /// key is skipped by the scanner and never decoded or re-serialized, and
@@ -601,7 +612,7 @@ fn bounded(raw: &str) -> String {
 
 /// Whether today's dispatcher blocks on this annotation: it must parse as
 /// JSON (with the dispatcher's own decoder) and carry a blocking `type`.
-pub fn legacy_annotation_blocks(error_annotation: Option<&str>) -> bool {
+pub fn annotation_blocks_dispatch(error_annotation: Option<&str>) -> bool {
     let Some(raw) = error_annotation else {
         return false;
     };
@@ -610,21 +621,21 @@ pub fn legacy_annotation_blocks(error_annotation: Option<&str>) -> bool {
         .is_some_and(|fields| annotation_blocks(raw, &fields))
 }
 fn annotation_blocks(raw: &str, fields: &Fields<'_>) -> bool {
-    text(fields, "type").is_some_and(|kind| LEGACY_BLOCKING_ANNOTATION_KINDS.contains(&kind.as_str()))
+    text(fields, "type").is_some_and(|kind| BLOCKING_ANNOTATION_KINDS.contains(&kind.as_str()))
         // The cheap scan above accepts documents the dispatcher's decoder
         // rejects (out-of-range numbers, lone surrogates, nesting past 128).
         // Confirm with that decoder; only a blocking annotation pays for it.
         && serde_json::from_str::<serde_json::Value>(raw).is_ok()
 }
 
-fn source(field: &LegacyConditionField, key: Option<&str>) -> ConditionSource {
+fn source(field: &ConditionField, key: Option<&str>) -> ConditionSource {
     ConditionSource {
         field: field.clone(),
         key: key.map(str::to_owned),
     }
 }
 fn unknown(
-    field: &LegacyConditionField,
+    field: &ConditionField,
     key: Option<&str>,
     problem: UnknownConditionProblem,
 ) -> ParkReason {
@@ -639,7 +650,7 @@ fn unknown(
 fn interruption_reasons(
     out: &mut Vec<(u16, ParkReason)>,
     base: u16,
-    field: LegacyConditionField,
+    field: ConditionField,
     column: &Column<'_>,
 ) {
     let fields = match column {
@@ -735,10 +746,10 @@ fn interruption_reasons(
 /// Map an immutable legacy snapshot. Pure: no database, clock or ownership
 /// table is read. `Running`/`Entering`/`Settled` need durable witnesses absent
 /// from these five inputs; the stage-one mapping never fabricates them.
-pub fn map_legacy_condition(input: &LegacyConditionInput) -> TaskCondition {
+pub fn compose_condition(input: &ConditionInput) -> TaskCondition {
     match &input.facts {
         Some(facts) => facts.condition(input),
-        None => map_view(&input.view()),
+        None => compose_channels(&input.view()),
     }
 }
 
@@ -746,20 +757,18 @@ pub fn map_legacy_condition(input: &LegacyConditionInput) -> TaskCondition {
 /// scheduler admits from an initial state without reading the entry barrier,
 /// so there the barrier is evidence and a diagnosis, never a park: condition
 /// and dispatcher agree that the Task is dispatched.
-pub(crate) fn map_view_from(initial: bool, view: &LegacyView<'_>) -> TaskCondition {
-    let barrier_non_text = view
-        .non_text
-        .contains(&LegacyConditionField::EntryBarrierJson);
+pub(crate) fn compose_channels_from(initial: bool, view: &ChannelView<'_>) -> TaskCondition {
+    let barrier_non_text = view.non_text.contains(&ConditionField::EntryBarrierJson);
     if !initial || (view.entry_barrier_json.is_none() && !barrier_non_text) {
-        return map_view(view);
+        return compose_channels(view);
     }
     let non_text: Vec<_> = view
         .non_text
         .iter()
-        .filter(|field| **field != LegacyConditionField::EntryBarrierJson)
+        .filter(|field| **field != ConditionField::EntryBarrierJson)
         .cloned()
         .collect();
-    let mut condition = map_view(&LegacyView {
+    let mut condition = compose_channels(&ChannelView {
         entry_barrier_json: None,
         non_text: &non_text,
         ..*view
@@ -767,7 +776,7 @@ pub(crate) fn map_view_from(initial: bool, view: &LegacyView<'_>) -> TaskConditi
     let evidence = condition.evidence_mut();
     evidence.entry_barrier_json = view.entry_barrier_json.map(bounded);
     evidence.observations.push(unknown(
-        &LegacyConditionField::EntryBarrierJson,
+        &ConditionField::EntryBarrierJson,
         None,
         if barrier_non_text {
             UnknownConditionProblem::NonText
@@ -778,8 +787,8 @@ pub(crate) fn map_view_from(initial: bool, view: &LegacyView<'_>) -> TaskConditi
     condition
 }
 
-pub(crate) fn map_view(view: &LegacyView<'_>) -> TaskCondition {
-    use LegacyConditionField as Field;
+pub(crate) fn compose_channels(view: &ChannelView<'_>) -> TaskCondition {
+    use ConditionField as Field;
     use UnknownConditionProblem as Problem;
     let non_text = |field: Field| view.non_text.contains(&field);
     let annotation = Column::read(view.error_annotation, non_text(Field::ErrorAnnotation));
@@ -1144,7 +1153,7 @@ pub(crate) fn map_view(view: &LegacyView<'_>) -> TaskCondition {
         presentation: Some(ConditionRead::import(view)),
         observations,
         witnesses: Vec::new(),
-        material: legacy_material_blocker(
+        material: channel_material_blocker(
             view.error_annotation,
             view.blocked_json,
             view.failed_json,
@@ -1261,11 +1270,12 @@ pub(crate) fn map_view(view: &LegacyView<'_>) -> TaskCondition {
     }
 }
 
+mod digest;
 mod recovery;
 mod storage;
 #[cfg(any(test, feature = "test-template"))]
 pub mod test_support;
-pub(crate) use storage::{backfill, classify, stored_condition};
+pub(crate) use storage::{backfill, classify, refresh_task_condition, stored_condition};
 pub use storage::{decode, decode_or_unknown, QUARANTINE_REPORT_LIMIT};
 use storage::{encode, set_condition, Stored};
 
@@ -1287,7 +1297,7 @@ pub use checks::{
 mod facts;
 mod producers;
 mod statements;
-use facts::legacy_material_blocker;
+use facts::channel_material_blocker;
 pub use facts::{material_blocker, ConditionFacts, ConditionWitness, MaterialBlocker};
 pub use producers::ConditionChange;
 pub(crate) use producers::{

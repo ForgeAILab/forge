@@ -578,3 +578,21 @@ async fn test_unsatisfied_dependencies_empty_when_done() {
         .expect("unsatisfied dependencies list")
         .is_empty());
 }
+
+async fn seed_child(
+    db: &SqliteDb,
+    project_id: &str,
+    root: &str,
+    order: i64,
+    title: &str,
+) -> String {
+    let id = seed_task(db, project_id, None, "todo".into(), title).await;
+    sqlx::query("UPDATE task SET parent_task_id=?, subtask_order=? WHERE id=?")
+        .bind(root)
+        .bind(order)
+        .bind(&id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    id
+}

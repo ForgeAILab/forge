@@ -404,14 +404,14 @@ async fn assert_stated_as_the_legacy_mapping(
 ) -> db::TaskCondition {
     let row = reload(fixture).await;
     let mut connection = fixture.db.pool().acquire().await.unwrap();
-    let mut input = db::LegacyConditionInput::from(&row);
+    let mut input = db::ConditionInput::from(&row);
     input.facts = Some(
         db::ConditionFacts::load(&mut connection, &row.id)
             .await
             .unwrap(),
     );
     drop(connection);
-    let mapped = db::map_legacy_condition(&input);
+    let mapped = db::compose_condition(&input);
     let stored = row.condition.clone();
     let evidence = stored.evidence();
     assert!(evidence.stated, "{context}: {stored:?}");
