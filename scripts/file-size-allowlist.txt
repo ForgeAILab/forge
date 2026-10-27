@@ -7,14 +7,10 @@
 2124 crates/services-agents/tests/suite/direct_command_classification.rs
 3907 crates/services-agents/tests/suite/native_scope_composition.rs
 4144 crates/services-agents/tests/suite/wake_turn_consumer.rs
-3541 crates/services/src/integration_steps/gate_tests.rs
-5222 crates/services/src/integration_steps/tests.rs
-3329 crates/services/src/integration_worker/tests.rs
 10968 crates/services/src/task_dispatcher/tests.rs
 2036 crates/services/src/task_dispatcher/tests/equivalence.rs
 2342 crates/services/src/task_dispatcher/tests/lead_check.rs
 2541 crates/services/src/task_dispatcher/tests/lead_operations.rs
-10128 crates/services/src/task_service/tests/service_tests/cases/executions.rs
 4897 crates/services/src/workflow/actions/tests.rs
 2227 crates/services/src/workflow/dispatch/tests.rs
 5427 crates/services/src/workflow/engine/tests.rs
