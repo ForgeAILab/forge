@@ -2,11 +2,7 @@
 # Never raise or add entries; split files instead.
 # After shrinking/deleting files: python3 scripts/check-file-sizes.py --update
 # Maintainers only: --init recreates the one-time baseline, never to accept growth.
-2494 crates/db/src/budget.rs
-2654 crates/db/src/check_run/tests.rs
 2193 crates/db/src/task_condition/tests.rs
-12529 crates/db/src/tests.rs
-2931 crates/forge-solo/src/session.rs
 4376 crates/services-agents/tests/suite/attention_service.rs
 2124 crates/services-agents/tests/suite/direct_command_classification.rs
 3907 crates/services-agents/tests/suite/native_scope_composition.rs

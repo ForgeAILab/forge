@@ -130,6 +130,15 @@ normalization, byte fingerprints, and canonical Attention incident digests.
 Expected records must come from the harness running against the archived main
 source, never from the branch being checked.
 
+The DB unit-test roots `src/tests.rs` and `src/check_run/tests.rs` register
+sibling topic modules under `src/tests/` and `src/check_run/tests/`.
+Shared fixtures live in each directory's `helpers.rs`, which registers no tests.
+Their test paths use `tests::<topic>::<test>` and
+`check_run::tests::<topic>::<test>`; existing check retention paths remain
+`check_run::tests::retention::<test>`. Budget and Solo session tests retain
+`budget::tests::<test>` and `session::tests::<test>`. The DB shard still selects
+all targets, and the rest shard still covers Solo.
+
 ### Test features and required-features
 
 `forge-agent-host`, `services` and `db` do not dev-depend on themselves.

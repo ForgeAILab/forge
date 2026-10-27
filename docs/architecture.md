@@ -99,12 +99,13 @@ continue through the roots, and inherent methods remain on their original types.
 | Root | Implementation and test children |
 |---|---|
 | `forge-solo/src/bootstrap.rs` | Contract types, orchestration, and shared validation stay in the root; `bootstrap/agents.rs` owns registration and candidate selection; `bootstrap/project.rs` owns owner, repository, chat, and binding reconciliation; tests live in `bootstrap/tests.rs` |
+| `forge-solo/src/session.rs` | Contract types, validation, and snapshot projection stay in the root; `session/service.rs` owns the re-exported `SoloSessionService` and its reads and commands; tests live in `session/tests.rs` |
 | `forge-solo/src/app.rs` | Presentation and command types stay in the root; `app/reducer.rs` owns state construction, reduction, and navigation; tests live in `app/tests.rs` |
 | `forge-solo/src/ui_bridge.rs` | Controller reduction and input translation stay in the root; `ui_bridge/projection.rs` maps backend snapshots to app state, with public helpers re-exported by the root; tests live in `ui_bridge/tests.rs` |
 | `forge-client/src/daemon_persistence.rs` | Journal types and persistence stay in the root; tests live in `daemon_persistence/tests.rs` |
 | `forge-client/src/daemon_workspace.rs` | Dispatch, registry state, shared validation, and process helpers stay in the root; `daemon_workspace/locations.rs` owns repository verification and provisioning; `daemon_workspace/execution.rs` owns preparation, commands, reads, and diffs; `daemon_workspace/mutations.rs` owns merge, reset, and cleanup; existing children and test modules retain their paths |
 
-Tests retain the `bootstrap::tests::`, `app::tests::`, `ui_bridge::tests::`,
+Tests retain the `bootstrap::tests::`, `session::tests::`, `app::tests::`, `ui_bridge::tests::`,
 `daemon_persistence::tests::`, and `daemon_workspace::tests::` prefixes.
 
 The same layout applies to these agent, API route, and database modules:
@@ -116,6 +117,7 @@ The same layout applies to these agent, API route, and database modules:
 | `db/src/sqlite/orchestration/charters.rs` | Charter reads, revisions, and approval records stay in the root; atomic approval application lives in `charters/apply_approval.rs`, re-exported at its original scope |
 | `api/src/routes/project_overview.rs` | The Overview handler, the next-action input type, and the projection row-decoding and error helpers stay in the root; canonical record loading lives in `project_overview/projections.rs`, next-action selection in `project_overview/next_action.rs`, and the existing test modules in `project_overview/{classify_status_tests,next_action_parity_tests}.rs` |
 | `api/src/routes/milestones.rs` | Milestone lifecycle, readiness, release, and shared authorization helpers stay in the root; definition revision routes live in `milestones/definitions.rs`, manual check routes in `milestones/checks.rs`, and authorization timestamp tests in `milestones/tests.rs`; moved handlers are re-exported through the root |
+| `db/src/budget.rs` | Policy types, limits, and projection stay in the root; `budget/ledger.rs` owns transactional charges and receipts, `budget/review.rs` owns review windows and recovery, and `budget/repair_no_change.rs` owns the unchanged-HEAD guard; operations are re-exported through the root and existing test prefixes are retained |
 | `db/src/integration_queue/fencing.rs` | Attempt ownership and effect receipt production code stays in the root; effect, concurrent claim, and takeover tests live in `fencing/{tests,concurrency_tests,takeover_tests}.rs` |
 
 These API and fencing test modules retain their original module prefixes, and
