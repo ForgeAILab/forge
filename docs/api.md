@@ -739,7 +739,9 @@ account during pre-Project Genesis), and authenticated principal. Reusing the
 same client key in another Project or account is an independent mutation, while
 a replay in the same scope returns the original result. Project access is
 checked before replay lookup, so an idempotency key cannot be used to probe a
-foreign Charter, milestone check, or Document approval.
+foreign Charter, milestone check, or Document approval. Manual check result and
+waiver event keys use that same principal scope, so different writers may reuse
+the same client key within a Project.
 
 ### Project Charters, Documents, Decisions, and effective state
 
@@ -806,6 +808,11 @@ Those older receipts also cannot distinguish retries changing only between
 `blocked`, `unavailable`, and `pending`.
 Authorization display names are recovered from older events when available;
 rows without an event retain the existing null display name reconstruction.
+Replay looks up the scoped event first. A legacy unscoped manual-result event
+supplies details only when its `result_id` matches the stored result; a legacy
+event for another result is treated as absent. A scoped event that disagrees
+with its result remains an internal error. Legacy waiver events replay only
+for their original user.
 Waiver replay returns the stored original response body, including any historical
 policy fields. The policy pair has three replay shapes:
 
