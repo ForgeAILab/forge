@@ -593,6 +593,12 @@ workspace protocol tests use topic files beside a small module root; shared
 fixtures live in each directory's `helpers.rs`. Migration and acceptance fixture
 includes still resolve to the original files.
 
+Workflow engine and action unit tests also use this layout, as do the
+`services-agents` integration modules `attention_service`, `wake_turn_consumer`,
+and `direct_command_classification`. Their integration target remains `main`;
+the module filters still select every topic, and individual test paths gain
+one topic segment. Existing workflow engine child modules retain their paths.
+
 To prove a consolidation preserves tests, record combined stdout and stderr
 before moving files, repeat after the change, and compare the names. The
 checker preserves unit names and normalizes only the old binary name into the
