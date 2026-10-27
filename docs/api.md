@@ -788,14 +788,26 @@ or milestone with 400 `bad_request`. Manual result writes return 409
 check changes before its result is committed; either failure rolls back the
 result and its event.
 
-Exact retries of committed manual Pass/Fail results and waivers return 200 from
+Exact retries of committed manual results and waivers return 200 from
 the stored receipt, including its original ID and timestamps, without appending
 another result, Decision, or event. Reusing the key with a different body returns
-409 `idempotency_conflict`. Replay still requires Project access and compares the
+409 `idempotency_conflict`, subject to the legacy status limitation below.
+Replay still requires Project access and compares the
 stored request and authorization provenance; it does not revalidate against a
 later Charter or milestone definition. Manual responses are reconstructed from
-the stored result; waiver replay returns the stored original response body,
-including any historical policy fields. The policy pair has three replay shapes:
+the stored result and its recorded event, preserving the original authorization
+display name, API status, and result digest. The event's `result_status` retains
+the submitted API status; the result row's outcome and the event's `status` still
+map both `blocked` and `unavailable` to `missing`. This replay metadata is outside
+the digested source manifest, so result digest inputs are unchanged. Older events
+without `result_status` keep the existing outcome reconstruction (`missing`
+replays as `blocked`); their original `unavailable` status cannot be recovered.
+Those older receipts also cannot distinguish retries changing only between
+`blocked`, `unavailable`, and `pending`.
+Authorization display names are recovered from older events when available;
+rows without an event retain the existing null display name reconstruction.
+Waiver replay returns the stored original response body, including any historical
+policy fields. The policy pair has three replay shapes:
 
 - Both `governing_policy_revision` and `governing_policy_digest` absent (v0.9+
   and new receipts): replay with 200.

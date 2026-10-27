@@ -2,6 +2,17 @@
 
 use super::*;
 
+#[derive(Deserialize)]
+struct ManualResultReplayDetails {
+    project_id: String,
+    milestone_id: String,
+    check_id: String,
+    result_id: String,
+    authorization: AuthorizationProvenance,
+    #[serde(default)]
+    result_status: Option<api_types::AcceptanceCheckResultStatus>,
+}
+
 async fn replay_milestone_check_result(
     state: &AppState,
     project_id: &str,
@@ -113,14 +124,51 @@ async fn replay_milestone_check_result(
         || existing_definition != request.definition_revision_id
         || existing_governing_revision_ids != request.governing_revision_ids
         || existing_charter_revision_id.as_deref() != requested_charter_revision_id;
-    if mismatch {
-        return Err(ApiError::conflict_with_code(
+    let idempotency_conflict = || {
+        ApiError::conflict_with_code(
             "idempotency_conflict",
             "the manual check idempotency key was already used for a different result",
-        ));
+        )
+    };
+    if mismatch {
+        return Err(idempotency_conflict());
     }
 
-    Ok(Some(validation_result_from_read(&existing, project_id)?))
+    let event = DomainEventRepo::get_event_by_dedupe(
+        &*state.db,
+        &format!(
+            "milestone.check.recorded:{project_id}:{}",
+            request.mutation.idempotency_key
+        ),
+    )
+    .await
+    .map_err(ApiError::project_artifact_mutation)?;
+    let details: Option<ManualResultReplayDetails> = event
+        .map(|event| serde_json::from_str(&event.payload_json))
+        .transpose()
+        .map_err(|_| ApiError::internal("persisted manual check event is invalid"))?;
+    if details.as_ref().is_some_and(|details| {
+        details.authorization != request.mutation.authorization
+            || details
+                .result_status
+                .is_some_and(|status| status != request.status)
+    }) {
+        return Err(idempotency_conflict());
+    }
+    let result_id = existing.id().map_err(ApiError::project_artifact_mutation)?;
+    if details.as_ref().is_some_and(|details| {
+        details.project_id != project_id
+            || details.milestone_id != milestone_id
+            || details.check_id != check_id
+            || details.result_id != result_id
+    }) {
+        return Err(ApiError::internal(
+            "persisted manual check event disagrees with its result",
+        ));
+    }
+    let result = validation_result_from_read(&existing, project_id, details.as_ref())?;
+
+    Ok(Some(result))
 }
 
 pub async fn record_milestone_check(
@@ -348,6 +396,8 @@ pub async fn record_milestone_check(
                 "check_id": check_id,
                 "result_id": result_id,
                 "status": outcome,
+                // The source manifest is digested; keep the original API status outside it.
+                "result_status": request.status,
                 "authorization": request.mutation.authorization.clone(),
                 "governing_revision_ids": request.governing_revision_ids.clone(),
             })
@@ -834,6 +884,7 @@ fn stored_governing_policy_matches(manifest: &serde_json::Value) -> bool {
 fn validation_result_from_read(
     row: &db::MilestoneManualResultRead,
     project_id: &str,
+    details: Option<&ManualResultReplayDetails>,
 ) -> ApiResult<ValidationResult> {
     let id: String = row.id().map_err(ApiError::project_artifact_mutation)?;
     let check_id: String = row
@@ -871,6 +922,21 @@ fn validation_result_from_read(
             )));
         }
     };
+    let status = details
+        .and_then(|details| details.result_status)
+        .unwrap_or(status);
+    if details.is_some_and(|details| details.result_status.is_some())
+        && (check_result_outcome(status) != outcome
+            || matches!(
+                status,
+                api_types::AcceptanceCheckResultStatus::Pending
+                    | api_types::AcceptanceCheckResultStatus::Waived
+            ))
+    {
+        return Err(ApiError::internal(
+            "persisted manual check event status disagrees with its result",
+        ));
+    }
     let source_manifest: serde_json::Value = serde_json::from_str(
         &row.source_manifest_json()
             .map_err(ApiError::project_artifact_mutation)?,
@@ -954,7 +1020,11 @@ fn validation_result_from_read(
         .authorization_occurred_at()
         .map_err(ApiError::project_artifact_mutation)?;
     let authorization = AuthorizationProvenance {
-        principal: principal.clone(),
+        principal: PrincipalRef {
+            display_name: details
+                .and_then(|details| details.authorization.principal.display_name.clone()),
+            ..principal.clone()
+        },
         authorization_basis: row
             .authorization_basis()
             .map_err(ApiError::project_artifact_mutation)?,
@@ -964,6 +1034,11 @@ fn validation_result_from_read(
             .map_err(ApiError::project_artifact_mutation)?,
         occurred_at: authorization_occurred_at,
     };
+    if details.is_some_and(|details| details.authorization != authorization) {
+        return Err(ApiError::internal(
+            "persisted manual check event authorization disagrees with its result",
+        ));
+    }
     if principal.kind != PrincipalKind::User
         || principal.id.trim().is_empty()
         || row

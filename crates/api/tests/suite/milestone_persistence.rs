@@ -136,6 +136,13 @@ async fn seed_legacy_receipt(
     let now = db::now_rfc3339();
     let authorization: api_types::AuthorizationProvenance =
         serde_json::from_value(request["mutation"]["authorization"].clone()).unwrap();
+    let outcome = match request["status"].as_str() {
+        Some("pass") => "passed",
+        Some("fail") => "failed",
+        Some("stale") => "stale",
+        Some("blocked" | "unavailable") | None => "missing",
+        other => panic!("unsupported legacy fixture status: {other:?}"),
+    };
     let mut tx = db::begin_immediate(pool).await.unwrap();
     let response = if waive {
         let mut affected = json!({
@@ -198,7 +205,7 @@ async fn seed_legacy_receipt(
             hex::encode("test-user-id"),
         );
         sqlx::query("INSERT INTO project_milestone_check_result (id, project_id, milestone_id, check_id, definition_revision_id, outcome, source_kind, source_manifest_json, input_digest, governing_charter_revision_id, principal_type, principal_id, authorization_basis, authorization_action, authorization_occurred_at, expected_version, explicit_event, idempotency_key, created_at) VALUES ('legacy-receipt', ?, 'milestone', 'check', 'revision', ?, 'manual', ?, 'input', 'charter-revision', 'user', 'test-user-id', ?, ?, ?, 1, ?, ?, ?)")
-            .bind(project).bind(if request["status"] == "pass" { "passed" } else { "failed" })
+            .bind(project).bind(outcome)
             .bind(manifest.to_string())
             .bind(&authorization.authorization_basis).bind(&authorization.action)
             .bind(&authorization.occurred_at).bind(&authorization.event_id)
@@ -220,7 +227,8 @@ async fn seed_legacy_receipt(
         json!({
             "id": "legacy-receipt", "project_id": project, "check_id": "check",
             "status": request["status"], "result": request["result"],
-            "principal": authorization.principal, "authorization": authorization,
+            "principal": {"kind": "user", "id": "test-user-id", "display_name": null},
+            "authorization": authorization,
             "input_digest": "input", "governing_revision_ids": request["governing_revision_ids"],
             "expected_version": 1, "event_id": authorization.event_id,
             "evaluated_at": now, "result_digest": digest,
@@ -234,13 +242,18 @@ async fn seed_legacy_receipt(
     let event_payload = if waive {
         response.clone()
     } else {
-        json!({
+        let mut payload = json!({
             "project_id": project, "milestone_id": "milestone", "check_id": "check",
             "result_id": "legacy-receipt",
-            "status": if request["status"] == "pass" { "passed" } else { "failed" },
+            "status": outcome,
             "authorization": authorization,
             "governing_revision_ids": request["governing_revision_ids"],
-        })
+        });
+        payload
+            .as_object_mut()
+            .unwrap()
+            .extend(policy_fields.as_object().unwrap().clone());
+        payload
     };
     db::DomainEventRepo::append_event_in_tx(
         &*harness.state.db,
@@ -307,6 +320,19 @@ async fn assert_committed_check_replays(waive: bool, receipt: ReceiptShape, stat
     } else {
         seed_legacy_receipt(&harness, &project, waive, &request, &policy_fields).await
     };
+    if !waive && matches!(receipt, ReceiptShape::ReleasePolicy) {
+        let payload: String = sqlx::query_scalar(
+            "SELECT payload_json FROM domain_event WHERE event_type = 'milestone.check.recorded'",
+        )
+        .fetch_one(harness.state.db.pool())
+        .await
+        .unwrap();
+        let payload: Value = serde_json::from_str(&payload).unwrap();
+        for field in ["governing_policy_revision", "governing_policy_digest"] {
+            assert_eq!(payload[field], policy_fields[field]);
+        }
+        assert!(payload.get("result_status").is_none());
+    }
     let replay: Value = common::json_request(
         &harness.app,
         Method::POST,
@@ -399,8 +425,361 @@ async fn assert_committed_check_replays(waive: bool, receipt: ReceiptShape, stat
 
 #[tokio::test]
 async fn committed_manual_result_replays_without_a_second_row_or_event() {
-    for status in ["pass", "fail"] {
+    for status in ["pass", "fail", "blocked", "stale", "unavailable"] {
         assert_committed_check_replays(false, ReceiptShape::New, status).await;
+    }
+}
+
+async fn assert_manual_response_replays(status: &str, display_name: Option<&str>) {
+    let (_root, harness, project) = fixture().await;
+    seed_milestone(&harness, &project, true).await;
+    let url = format!("/api/v1/projects/{project}/milestones/milestone/checks/check/result");
+    let mut request = check_request(false);
+    request["status"] = json!(status);
+    request["mutation"]["authorization"]["principal"]["display_name"] = json!(display_name);
+    let first: Value = common::json_request(
+        &harness.app,
+        Method::POST,
+        &url,
+        request.clone(),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(first["status"], status);
+    assert_eq!(
+        first["authorization"]["principal"]["display_name"],
+        json!(display_name),
+    );
+    let replay: Value = common::json_request(
+        &harness.app,
+        Method::POST,
+        &url,
+        request.clone(),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(replay, first);
+
+    let (outcome, manifest): (String, String) =
+        sqlx::query_as("SELECT outcome, source_manifest_json FROM project_milestone_check_result")
+            .fetch_one(harness.state.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        outcome,
+        if status == "unavailable" {
+            "missing"
+        } else {
+            "passed"
+        }
+    );
+    let event: String = sqlx::query_scalar(
+        "SELECT payload_json FROM domain_event WHERE event_type = 'milestone.check.recorded'",
+    )
+    .fetch_one(harness.state.db.pool())
+    .await
+    .unwrap();
+    let event: Value = serde_json::from_str(&event).unwrap();
+    assert_eq!(event["status"], outcome);
+    assert_eq!(event["result_status"], first["status"]);
+    let manifest: Value = serde_json::from_str(&manifest).unwrap();
+    assert_eq!(
+        manifest,
+        json!({
+            "result": request["result"],
+            "governing_revision_ids": request["governing_revision_ids"],
+            "check_definition_revision_id": request["definition_revision_id"],
+        })
+    );
+    let digest = api_types::canonical_digest_with_schema(
+        services::MILESTONE_READINESS_DIGEST_SCHEMA_VERSION,
+        &json!({
+            "id": first["id"], "check_id": first["check_id"],
+            "status": first["status"], "result": first["result"],
+            "input_digest": first["input_digest"],
+            "governing_revision_ids": first["governing_revision_ids"],
+            "authorization": first["authorization"], "evaluated_at": first["evaluated_at"],
+            "source_manifest": manifest,
+        }),
+    )
+    .unwrap();
+    assert_eq!(first["result_digest"], digest);
+
+    for field in ["status", "display_name"] {
+        let mut changed = request.clone();
+        if field == "status" {
+            changed["status"] = json!("blocked");
+        } else {
+            changed["mutation"]["authorization"]["principal"]["display_name"] =
+                json!("Different reviewer");
+        }
+        let conflict: Value = common::json_request(
+            &harness.app,
+            Method::POST,
+            &url,
+            changed,
+            StatusCode::CONFLICT,
+        )
+        .await;
+        assert_command_error(
+            conflict,
+            "idempotency_conflict",
+            "the manual check idempotency key was already used for a different result",
+        );
+    }
+}
+
+#[tokio::test]
+async fn committed_manual_response_replays_display_name() {
+    assert_manual_response_replays("pass", Some("Manual check reviewer")).await;
+}
+
+#[tokio::test]
+async fn committed_manual_response_replays_unavailable() {
+    assert_manual_response_replays("unavailable", None).await;
+}
+
+#[tokio::test]
+async fn legacy_manual_response_replays_stored_display_name_and_rejects_changed_name() {
+    let (_root, harness, project) = fixture().await;
+    seed_milestone(&harness, &project, true).await;
+    let mut request = check_request(false);
+    request["mutation"]["authorization"]["principal"]["display_name"] = json!("Original reviewer");
+    let first = seed_legacy_receipt(&harness, &project, false, &request, &json!({})).await;
+    let replay: Value = common::json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{project}/milestones/milestone/checks/check/result"),
+        request.clone(),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(replay, first);
+    request["mutation"]["authorization"]["principal"]["display_name"] = json!("Different reviewer");
+    let conflict: Value = common::json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{project}/milestones/milestone/checks/check/result"),
+        request,
+        StatusCode::CONFLICT,
+    )
+    .await;
+    assert_command_error(
+        conflict,
+        "idempotency_conflict",
+        "the manual check idempotency key was already used for a different result",
+    );
+}
+
+#[tokio::test]
+async fn legacy_missing_outcome_keeps_blocked_reconstruction() {
+    let (_root, harness, project) = fixture().await;
+    seed_milestone(&harness, &project, true).await;
+    let mut request = check_request(false);
+    request["status"] = json!("blocked");
+    let expected = seed_legacy_receipt(&harness, &project, false, &request, &json!({})).await;
+    for status in ["blocked", "unavailable", "pending"] {
+        request["status"] = json!(status);
+        let replay: Value = common::json_request(
+            &harness.app,
+            Method::POST,
+            &format!("/api/v1/projects/{project}/milestones/milestone/checks/check/result"),
+            request.clone(),
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(replay, expected);
+    }
+}
+
+#[tokio::test]
+async fn manual_result_without_event_keeps_row_only_reconstruction() {
+    let (_root, harness, project) = fixture().await;
+    seed_milestone(&harness, &project, true).await;
+    let mut request = check_request(false);
+    request["mutation"]["authorization"]["principal"]["display_name"] = json!("Original reviewer");
+    let mut expected = seed_legacy_receipt(&harness, &project, false, &request, &json!({})).await;
+    let pool = harness.state.db.pool();
+    sqlx::query("DELETE FROM domain_event WHERE event_type = 'milestone.check.recorded'")
+        .execute(pool)
+        .await
+        .unwrap();
+    let manifest: String = sqlx::query_scalar(
+        "SELECT source_manifest_json FROM project_milestone_check_result WHERE id = 'legacy-receipt'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    expected["authorization"]["principal"]["display_name"] = Value::Null;
+    expected["result_digest"] = json!(api_types::canonical_digest_with_schema(
+        services::MILESTONE_READINESS_DIGEST_SCHEMA_VERSION,
+        &json!({
+            "id": expected["id"], "check_id": expected["check_id"],
+            "status": expected["status"], "result": expected["result"],
+            "input_digest": expected["input_digest"],
+            "governing_revision_ids": expected["governing_revision_ids"],
+            "authorization": expected["authorization"], "evaluated_at": expected["evaluated_at"],
+            "source_manifest": serde_json::from_str::<Value>(&manifest).unwrap(),
+        }),
+    )
+    .unwrap());
+    let replay: Value = common::json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{project}/milestones/milestone/checks/check/result"),
+        request,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(replay, expected);
+    let results: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM project_milestone_check_result")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM domain_event WHERE event_type = 'milestone.check.recorded'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(results, 1);
+    assert_eq!(events, 0);
+}
+
+#[tokio::test]
+async fn manual_replay_refuses_unparseable_event_payload() {
+    let (_root, harness, project) = fixture().await;
+    seed_milestone(&harness, &project, true).await;
+    let request = check_request(false);
+    seed_legacy_receipt(&harness, &project, false, &request, &json!({})).await;
+    sqlx::query("UPDATE domain_event SET payload_json = json_remove(payload_json, '$.authorization') WHERE event_type = 'milestone.check.recorded'")
+        .execute(harness.state.db.pool()).await.unwrap();
+    // HEAD decodes the event; main (79f2191b) ignored it and returned 200.
+    let error: Value = common::json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{project}/milestones/milestone/checks/check/result"),
+        request,
+        StatusCode::INTERNAL_SERVER_ERROR,
+    )
+    .await;
+    assert_command_error(
+        error,
+        "internal_error",
+        "persisted manual check event is invalid",
+    );
+}
+
+#[tokio::test]
+async fn manual_replay_event_conflict_precedes_unneeded_column_decoding() {
+    let (_root, harness, project) = fixture().await;
+    seed_milestone(&harness, &project, true).await;
+    let url = format!("/api/v1/projects/{project}/milestones/milestone/checks/check/result");
+    let mut request = check_request(false);
+    request["status"] = json!("unavailable");
+    request["mutation"]["authorization"]["principal"]["display_name"] = json!("Original reviewer");
+    let _: Value = common::json_request(
+        &harness.app,
+        Method::POST,
+        &url,
+        request.clone(),
+        StatusCode::OK,
+    )
+    .await;
+    // Permit deliberate corruption of the append-only result in this isolated database.
+    sqlx::query("DROP TRIGGER project_milestone_check_result_immutable_update")
+        .execute(harness.state.db.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE project_milestone_check_result SET created_at = CAST(created_at AS BLOB)")
+        .execute(harness.state.db.pool())
+        .await
+        .unwrap();
+    assert_database_error(
+        common::json_request(
+            &harness.app,
+            Method::POST,
+            &url,
+            request.clone(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+        .await,
+    );
+    for field in ["display_name", "status"] {
+        let mut changed = request.clone();
+        if field == "display_name" {
+            changed["mutation"]["authorization"]["principal"]["display_name"] =
+                json!("Different reviewer");
+        } else {
+            changed["status"] = json!("blocked");
+        }
+        let conflict: Value = common::json_request(
+            &harness.app,
+            Method::POST,
+            &url,
+            changed,
+            StatusCode::CONFLICT,
+        )
+        .await;
+        assert_command_error(
+            conflict,
+            "idempotency_conflict",
+            "the manual check idempotency key was already used for a different result",
+        );
+    }
+}
+
+#[tokio::test]
+async fn manual_replay_refuses_event_details_that_disagree_with_row_or_request() {
+    let (_root, harness, project) = fixture().await;
+    seed_milestone(&harness, &project, true).await;
+    let url = format!("/api/v1/projects/{project}/milestones/milestone/checks/check/result");
+    let request = check_request(false);
+    let _: Value = common::json_request(
+        &harness.app,
+        Method::POST,
+        &url,
+        request.clone(),
+        StatusCode::OK,
+    )
+    .await;
+    let payload: String = sqlx::query_scalar(
+        "SELECT payload_json FROM domain_event WHERE event_type = 'milestone.check.recorded'",
+    )
+    .fetch_one(harness.state.db.pool())
+    .await
+    .unwrap();
+    let payload: Value = serde_json::from_str(&payload).unwrap();
+    for (pointer, value, status, code, message) in [
+        (
+            "/result_id",
+            json!("other-result"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "persisted manual check event disagrees with its result",
+        ),
+        (
+            "/result_status",
+            json!("unavailable"),
+            StatusCode::CONFLICT,
+            "idempotency_conflict",
+            "the manual check idempotency key was already used for a different result",
+        ),
+        (
+            "/authorization/principal/id",
+            json!("other-user"),
+            StatusCode::CONFLICT,
+            "idempotency_conflict",
+            "the manual check idempotency key was already used for a different result",
+        ),
+    ] {
+        let mut corrupted = payload.clone();
+        *corrupted.pointer_mut(pointer).unwrap() = value;
+        sqlx::query("UPDATE domain_event SET payload_json = ? WHERE event_type = 'milestone.check.recorded'")
+            .bind(corrupted.to_string()).execute(harness.state.db.pool()).await.unwrap();
+        let error: Value =
+            common::json_request(&harness.app, Method::POST, &url, request.clone(), status).await;
+        assert_command_error(error, code, message);
     }
 }
 
