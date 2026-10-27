@@ -3,6 +3,9 @@
 
 mod common;
 
+#[path = "suite/milestone_persistence.rs"]
+mod milestone_persistence;
+
 #[path = "suite/integration_quarantine.rs"]
 mod integration_quarantine;
 

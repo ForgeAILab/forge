@@ -11,18 +11,21 @@ async fn replay_milestone_check_result(
     storage_idempotency_key: &str,
     request: &RecordMilestoneCheckRequest,
 ) -> ApiResult<Option<ValidationResult>> {
-    let Some(existing) =
-        sqlx::query("SELECT * FROM project_milestone_check_result WHERE idempotency_key = ?")
-            .bind(storage_idempotency_key)
-            .fetch_optional(state.db.pool())
-            .await?
+    let Some(existing) = state
+        .db
+        .milestone_manual_result_replay(storage_idempotency_key)
+        .await
+        .map_err(ApiError::project_artifact_mutation)?
     else {
         return Ok(None);
     };
 
-    let existing_manifest: serde_json::Value =
-        serde_json::from_str(&existing.try_get::<String, _>("source_manifest_json")?)
-            .map_err(|_| ApiError::internal("persisted manual check result is invalid"))?;
+    let existing_manifest: serde_json::Value = serde_json::from_str(
+        &existing
+            .source_manifest_json()
+            .map_err(ApiError::project_artifact_mutation)?,
+    )
+    .map_err(|_| ApiError::internal("persisted manual check result is invalid"))?;
     let existing_result = existing_manifest
         .get("result")
         .and_then(serde_json::Value::as_str)
@@ -42,31 +45,69 @@ async fn replay_milestone_check_result(
         .ok_or_else(|| {
             ApiError::internal("persisted manual check governing revisions are missing")
         })?;
-    let existing_charter_revision_id =
-        existing.try_get::<Option<String>, _>("governing_charter_revision_id")?;
+    let existing_charter_revision_id = existing
+        .governing_charter_revision_id()
+        .map_err(ApiError::project_artifact_mutation)?;
     let requested_charter_revision_id = request.governing_revision_ids.first().map(String::as_str);
 
     let mismatch = request.check_id != check_id
         || request.mutation.authorization.principal.kind != PrincipalKind::User
         || request.mutation.authorization.principal.id != user_id
-        || existing.try_get::<String, _>("project_id")? != project_id
-        || existing.try_get::<String, _>("milestone_id")? != milestone_id
-        || existing.try_get::<String, _>("check_id")? != check_id
-        || existing.try_get::<String, _>("source_kind")? != "manual"
-        || existing.try_get::<String, _>("definition_revision_id")?
+        || existing
+            .project_id()
+            .map_err(ApiError::project_artifact_mutation)?
+            != project_id
+        || existing
+            .milestone_id()
+            .map_err(ApiError::project_artifact_mutation)?
+            != milestone_id
+        || existing
+            .check_id()
+            .map_err(ApiError::project_artifact_mutation)?
+            != check_id
+        || existing
+            .source_kind()
+            .map_err(ApiError::project_artifact_mutation)?
+            != "manual"
+        || existing
+            .definition_revision_id()
+            .map_err(ApiError::project_artifact_mutation)?
             != request.definition_revision_id
-        || existing.try_get::<String, _>("outcome")? != check_result_outcome(request.status)
-        || existing.try_get::<String, _>("principal_type")? != "user"
-        || existing.try_get::<String, _>("principal_id")? != user_id
-        || existing.try_get::<String, _>("input_digest")? != request.input_digest
-        || existing.try_get::<i64, _>("expected_version")? != request.mutation.expected_version
-        || existing.try_get::<String, _>("authorization_basis")?
+        || existing
+            .outcome()
+            .map_err(ApiError::project_artifact_mutation)?
+            != check_result_outcome(request.status)
+        || existing
+            .principal_type()
+            .map_err(ApiError::project_artifact_mutation)?
+            != "user"
+        || existing
+            .principal_id()
+            .map_err(ApiError::project_artifact_mutation)?
+            != user_id
+        || existing
+            .input_digest()
+            .map_err(ApiError::project_artifact_mutation)?
+            != request.input_digest
+        || existing
+            .expected_version()
+            .map_err(ApiError::project_artifact_mutation)?
+            != request.mutation.expected_version
+        || existing
+            .authorization_basis()
+            .map_err(ApiError::project_artifact_mutation)?
             != request.mutation.authorization.authorization_basis
-        || existing.try_get::<String, _>("authorization_action")?
+        || existing
+            .authorization_action()
+            .map_err(ApiError::project_artifact_mutation)?
             != request.mutation.authorization.action
-        || existing.try_get::<String, _>("explicit_event")?
+        || existing
+            .explicit_event()
+            .map_err(ApiError::project_artifact_mutation)?
             != request.mutation.authorization.event_id
-        || existing.try_get::<String, _>("authorization_occurred_at")?
+        || existing
+            .authorization_occurred_at()
+            .map_err(ApiError::project_artifact_mutation)?
             != request.mutation.authorization.occurred_at
         || existing_result != request.result
         || existing_definition != request.definition_revision_id
@@ -79,7 +120,7 @@ async fn replay_milestone_check_result(
         ));
     }
 
-    Ok(Some(validation_result_from_row(&existing, project_id)?))
+    Ok(Some(validation_result_from_read(&existing, project_id)?))
 }
 
 pub async fn record_milestone_check(
@@ -150,24 +191,21 @@ pub async fn record_milestone_check(
         ));
     }
     let mut tx = db::begin_immediate(state.db.pool()).await?;
-    let check = sqlx::query(
-        "SELECT c.version, c.definition_revision_id, c.source_kind,
-                m.current_definition_revision_id, r.author_id
-         FROM project_milestone_check c
-         JOIN project_milestone m ON m.id = c.milestone_id AND m.project_id = c.project_id
-         LEFT JOIN project_milestone_revision r ON r.id = c.definition_revision_id
-         WHERE c.id = ? AND c.project_id = ? AND c.milestone_id = ?",
-    )
-    .bind(&check_id)
-    .bind(&project_id)
-    .bind(&milestone_id)
-    .fetch_optional(&mut *tx)
-    .await?
-    .ok_or_else(|| ApiError::not_found("milestone_check", check_id.clone()))?;
-    let check_version: i64 = check.try_get("version")?;
-    let check_definition_revision_id: String = check.try_get("definition_revision_id")?;
+    let check = state
+        .db
+        .milestone_manual_check_target_in_tx(&mut tx, &check_id, &project_id, &milestone_id)
+        .await
+        .map_err(ApiError::project_artifact_mutation)?
+        .ok_or_else(|| ApiError::not_found("milestone_check", check_id.clone()))?;
+    let check_version: i64 = check
+        .version()
+        .map_err(ApiError::project_artifact_mutation)?;
+    let check_definition_revision_id: String = check
+        .definition_revision_id()
+        .map_err(ApiError::project_artifact_mutation)?;
     let current_definition_revision_id: String = check
-        .try_get::<Option<String>, _>("current_definition_revision_id")?
+        .current_definition_revision_id()
+        .map_err(ApiError::project_artifact_mutation)?
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| {
             ApiError::conflict_with_code(
@@ -175,9 +213,12 @@ pub async fn record_milestone_check(
                 "manual acceptance requires the milestone's current definition revision",
             )
         })?;
-    let source_kind: String = check.try_get("source_kind")?;
+    let source_kind: String = check
+        .source_kind()
+        .map_err(ApiError::project_artifact_mutation)?;
     let author_id: String = check
-        .try_get::<Option<String>, _>("author_id")?
+        .author_id()
+        .map_err(ApiError::project_artifact_mutation)?
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| {
             ApiError::conflict_with_code(
@@ -208,14 +249,12 @@ pub async fn record_milestone_check(
             "the acceptance check belongs to a superseded milestone definition revision",
         ));
     }
-    let governance =
-        sqlx::query("SELECT p.current_charter_revision_id FROM project p WHERE p.id = ? LIMIT 1")
-            .bind(&project_id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or_else(|| ApiError::not_found("project", &project_id))?;
-    let governing_charter_revision_id: String = governance
-        .try_get::<Option<String>, _>("current_charter_revision_id")?
+    let governing_charter_revision_id: String = state
+        .db
+        .milestone_check_charter_in_tx(&mut tx, &project_id)
+        .await
+        .map_err(ApiError::project_artifact_mutation)?
+        .ok_or_else(|| ApiError::not_found("project", &project_id))?
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| {
             ApiError::conflict_with_code(
@@ -245,60 +284,45 @@ pub async fn record_milestone_check(
         "governing_revision_ids": request.governing_revision_ids.clone(),
         "check_definition_revision_id": check_definition_revision_id.clone(),
     });
-    let inserted = sqlx::query(
-        "INSERT INTO project_milestone_check_result (
-            id, project_id, milestone_id, check_id, definition_revision_id,
-            outcome, source_kind, source_manifest_json, input_digest,
-            governing_charter_revision_id,
-            principal_type, principal_id, authorization_basis, authorization_action,
-            expected_version, explicit_event, authorization_occurred_at,
-            idempotency_key, created_at
-         ) VALUES (?, ?, ?, ?, ?, ?, 'manual', ?, ?, ?, 'user', ?, ?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind(&result_id)
-    .bind(&project_id)
-    .bind(&milestone_id)
-    .bind(&check_id)
-    .bind(&check_definition_revision_id)
-    .bind(outcome)
-    .bind(source_manifest.to_string())
-    .bind(&input_digest)
-    .bind(&governing_charter_revision_id)
-    .bind(&user.user_id)
-    .bind(&request.mutation.authorization.authorization_basis)
-    .bind(&request.mutation.authorization.action)
-    .bind(request.mutation.expected_version)
-    .bind(&request.mutation.authorization.event_id)
-    .bind(&request.mutation.authorization.occurred_at)
-    .bind(&storage_idempotency_key)
-    .bind(&created_at)
-    .execute(&mut *tx)
-    .await;
-    if let Err(error) = inserted {
-        if error.to_string().to_ascii_lowercase().contains("unique") {
-            return Err(ApiError::conflict_with_code(
+    state
+        .db
+        .record_manual_milestone_result_in_tx(
+            &mut tx,
+            &db::CreateProjectMilestoneCheckResult {
+                id: result_id.clone(),
+                project_id: project_id.clone(),
+                milestone_id: milestone_id.clone(),
+                check_id: check_id.clone(),
+                definition_revision_id: check_definition_revision_id.clone(),
+                outcome: outcome.to_owned(),
+                source_kind: "manual".to_owned(),
+                source_manifest_json: source_manifest.to_string(),
+                input_digest: input_digest.clone(),
+                governing_charter_revision_id: Some(governing_charter_revision_id.clone()),
+                principal_type: "user".to_owned(),
+                principal_id: user.user_id.clone(),
+                authorization_basis: request.mutation.authorization.authorization_basis.clone(),
+                authorization_action: request.mutation.authorization.action.clone(),
+                expected_version: request.mutation.expected_version,
+                explicit_event: request.mutation.authorization.event_id.clone(),
+                authorization_occurred_at: request.mutation.authorization.occurred_at.clone(),
+                idempotency_key: storage_idempotency_key.clone(),
+                created_at: created_at.clone(),
+            },
+            check_version,
+        )
+        .await
+        .map_err(|error| match error {
+            db::DbError::IdempotencyConflict => ApiError::conflict_with_code(
                 "idempotency_in_progress",
                 "another manual check result is being committed; retry with the same key",
-            ));
-        }
-        return Err(error.into());
-    }
-    let updated = sqlx::query(
-        "UPDATE project_milestone_check SET current_result_id = ?, version = version + 1,
-         updated_at = ? WHERE id = ? AND version = ?",
-    )
-    .bind(&result_id)
-    .bind(&created_at)
-    .bind(&check_id)
-    .bind(check_version)
-    .execute(&mut *tx)
-    .await?;
-    if updated.rows_affected() != 1 {
-        return Err(ApiError::conflict_with_code(
-            "version_conflict",
-            "the acceptance check changed before its result was committed",
-        ));
-    }
+            ),
+            db::DbError::VersionConflict => ApiError::conflict_with_code(
+                "version_conflict",
+                "the acceptance check changed before its result was committed",
+            ),
+            error => ApiError::project_artifact_mutation(error),
+        })?;
     let event = DomainEventRepo::append_event_in_tx(
         &*state.db,
         &mut tx,
@@ -413,40 +437,63 @@ async fn replay_milestone_check_waiver(
         .and_then(serde_json::Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| ApiError::internal("persisted milestone waiver policy digest is missing"))?;
-    let decision = sqlx::query(
-        "SELECT state, decision_class, rationale, selected_outcome,
-                principal_type, principal_id, authority_basis,
-                authorization_action, explicit_event,
-                authorization_occurred_at, charter_revision_id,
-                affected_records_json
-         FROM project_decision WHERE id = ? AND project_id = ?",
-    )
-    .bind(waiver_id)
-    .bind(project_id)
-    .fetch_optional(state.db.pool())
-    .await?;
+    let decision = state
+        .db
+        .project_decision_command_source(waiver_id, project_id)
+        .await
+        .map_err(ApiError::project_artifact_mutation)?;
     let decision_matches = if let Some(decision) = decision {
-        let affected: serde_json::Value =
-            serde_json::from_str(&decision.try_get::<String, _>("affected_records_json")?)
-                .map_err(|_| ApiError::internal("persisted waiver decision records are invalid"))?;
-        let decision_state = decision.try_get::<String, _>("state")?;
+        let affected: serde_json::Value = serde_json::from_str(
+            &decision
+                .affected_records_json()
+                .map_err(ApiError::project_artifact_mutation)?,
+        )
+        .map_err(|_| ApiError::internal("persisted waiver decision records are invalid"))?;
+        let decision_state = decision
+            .state()
+            .map_err(ApiError::project_artifact_mutation)?;
         matches!(
             decision_state.as_str(),
             "active" | "superseded" | "invalidated"
-        ) && decision.try_get::<String, _>("decision_class")? == "waiver"
-            && decision.try_get::<String, _>("rationale")? == request.reason
-            && decision.try_get::<String, _>("selected_outcome")? == "waived"
-            && decision.try_get::<String, _>("principal_type")? == "user"
-            && decision.try_get::<String, _>("principal_id")? == user_id
-            && decision.try_get::<String, _>("authority_basis")?
+        ) && decision
+            .decision_class()
+            .map_err(ApiError::project_artifact_mutation)?
+            == "waiver"
+            && decision
+                .rationale()
+                .map_err(ApiError::project_artifact_mutation)?
+                == request.reason
+            && decision
+                .selected_outcome()
+                .map_err(ApiError::project_artifact_mutation)?
+                == "waived"
+            && decision
+                .principal_type()
+                .map_err(ApiError::project_artifact_mutation)?
+                == "user"
+            && decision
+                .principal_id()
+                .map_err(ApiError::project_artifact_mutation)?
+                == user_id
+            && decision
+                .authority_basis()
+                .map_err(ApiError::project_artifact_mutation)?
                 == request.mutation.authorization.authorization_basis
-            && decision.try_get::<String, _>("authorization_action")?
+            && decision
+                .authorization_action()
+                .map_err(ApiError::project_artifact_mutation)?
                 == request.mutation.authorization.action
-            && decision.try_get::<String, _>("explicit_event")?
+            && decision
+                .explicit_event()
+                .map_err(ApiError::project_artifact_mutation)?
                 == request.mutation.authorization.event_id
-            && decision.try_get::<String, _>("authorization_occurred_at")?
+            && decision
+                .authorization_occurred_at()
+                .map_err(ApiError::project_artifact_mutation)?
                 == request.mutation.authorization.occurred_at
-            && decision.try_get::<String, _>("charter_revision_id")?
+            && decision
+                .required_charter_revision_id()
+                .map_err(ApiError::project_artifact_mutation)?
                 == request
                     .governing_revision_ids
                     .first()
@@ -601,22 +648,18 @@ pub async fn waive_milestone_check(
         ));
     }
     let mut tx = db::begin_immediate(state.db.pool()).await?;
-    let check_row = sqlx::query(
-        "SELECT c.version, m.current_definition_revision_id, r.author_id
-         FROM project_milestone_check c
-         JOIN project_milestone m
-           ON m.id = c.milestone_id AND m.project_id = c.project_id
-         JOIN project_milestone_revision r ON r.id = c.definition_revision_id
-         WHERE c.id = ? AND c.project_id = ? AND c.milestone_id = ?
-           AND c.definition_revision_id = ? AND c.version = ?",
-    )
-    .bind(&check_id)
-    .bind(&project_id)
-    .bind(&milestone_id)
-    .bind(&request.definition_revision_id)
-    .bind(request.mutation.expected_version)
-    .fetch_optional(&mut *tx)
-    .await?;
+    let check_row = state
+        .db
+        .milestone_waiver_check_target_in_tx(
+            &mut tx,
+            &check_id,
+            &project_id,
+            &milestone_id,
+            &request.definition_revision_id,
+            request.mutation.expected_version,
+        )
+        .await
+        .map_err(ApiError::project_artifact_mutation)?;
     let Some(check_row) = check_row else {
         return Err(ApiError::conflict_with_code(
             "version_conflict",
@@ -624,7 +667,8 @@ pub async fn waive_milestone_check(
         ));
     };
     let author_id: String = check_row
-        .try_get::<Option<String>, _>("author_id")?
+        .author_id()
+        .map_err(ApiError::project_artifact_mutation)?
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| {
             ApiError::conflict_with_code(
@@ -633,7 +677,8 @@ pub async fn waive_milestone_check(
             )
         })?;
     let current_definition_revision_id: String = check_row
-        .try_get::<Option<String>, _>("current_definition_revision_id")?
+        .current_definition_revision_id()
+        .map_err(ApiError::project_artifact_mutation)?
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| {
             ApiError::conflict_with_code(
@@ -653,14 +698,12 @@ pub async fn waive_milestone_check(
             "the definition author cannot waive its own acceptance check",
         ));
     }
-    let governance =
-        sqlx::query("SELECT p.current_charter_revision_id FROM project p WHERE p.id = ? LIMIT 1")
-            .bind(&project_id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or_else(|| ApiError::not_found("project", &project_id))?;
-    let waiver_charter_revision_id: String = governance
-        .try_get::<Option<String>, _>("current_charter_revision_id")?
+    let waiver_charter_revision_id: String = state
+        .db
+        .milestone_check_charter_in_tx(&mut tx, &project_id)
+        .await
+        .map_err(ApiError::project_artifact_mutation)?
+        .ok_or_else(|| ApiError::not_found("project", &project_id))?
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| {
             ApiError::conflict_with_code(
@@ -724,39 +767,35 @@ pub async fn waive_milestone_check(
     }
     // A waiver is an immutable effective Project Decision.  Readiness uses
     // only these user-authored decisions and never a caller-supplied waiver id.
-    sqlx::query(
-        "INSERT INTO project_decision (
-            id, project_id, state, decision_class, question, context_json,
-            selected_outcome, rationale, principal_type, principal_id,
-            authority_basis, authorization_action, explicit_event,
-            authorization_occurred_at, charter_revision_id,
-            source_refs_json, affected_records_json, created_at
-         ) VALUES (?, ?, 'active', 'waiver', ?, '{}', 'waived', ?, 'user', ?, ?, ?, ?, ?, ?, '[]', ?, ?)",
-    )
-    .bind(&waiver_id)
-    .bind(&project_id)
-    .bind(format!("Waive milestone check {check_id}"))
-    .bind(&request.reason)
-    .bind(&user.user_id)
-    .bind(&request.mutation.authorization.authorization_basis)
-    .bind(&request.mutation.authorization.action)
-    .bind(&request.mutation.authorization.event_id)
-    .bind(&request.mutation.authorization.occurred_at)
-    .bind(&waiver_charter_revision_id)
-    .bind(
-        serde_json::json!({
-            "milestone_id": milestone_id,
-            "check_id": check_id,
-            "definition_revision_id": request.definition_revision_id.clone(),
-            "input_digest": request.input_digest.clone(),
-            "expected_version": request.mutation.expected_version,
-            "governing_revision_ids": request.governing_revision_ids.clone(),
-        })
-        .to_string(),
-    )
-    .bind(&created_at)
-    .execute(&mut *tx)
-    .await?;
+    state
+        .db
+        .insert_milestone_waiver_decision_in_tx(
+            &mut tx,
+            db::InsertMilestoneWaiverDecisionInput {
+                waiver_id: &waiver_id,
+                project_id: &project_id,
+                check_id: &check_id,
+                reason: &request.reason,
+                user_id: &user.user_id,
+                authorization_basis: &request.mutation.authorization.authorization_basis,
+                authorization_action: &request.mutation.authorization.action,
+                explicit_event: &request.mutation.authorization.event_id,
+                authorization_occurred_at: &request.mutation.authorization.occurred_at,
+                charter_revision_id: &waiver_charter_revision_id,
+                affected_records_json: &serde_json::json!({
+                    "milestone_id": milestone_id,
+                    "check_id": check_id,
+                    "definition_revision_id": request.definition_revision_id.clone(),
+                    "input_digest": request.input_digest.clone(),
+                    "expected_version": request.mutation.expected_version,
+                    "governing_revision_ids": request.governing_revision_ids.clone(),
+                })
+                .to_string(),
+                created_at: &created_at,
+            },
+        )
+        .await
+        .map_err(ApiError::project_artifact_mutation)?;
     tx.commit().await?;
     Ok(Json(serde_json::json!({
         "waiver_id": waiver_id,
@@ -786,19 +825,27 @@ fn check_result_outcome(value: api_types::AcceptanceCheckResultStatus) -> &'stat
     }
 }
 
-fn validation_result_from_row(
-    row: &sqlx::sqlite::SqliteRow,
+fn validation_result_from_read(
+    row: &db::MilestoneManualResultRead,
     project_id: &str,
 ) -> ApiResult<ValidationResult> {
-    let id: String = row.try_get("id")?;
-    let check_id: String = row.try_get("check_id")?;
-    if row.try_get::<String, _>("source_kind")? != "manual" {
+    let id: String = row.id().map_err(ApiError::project_artifact_mutation)?;
+    let check_id: String = row
+        .check_id()
+        .map_err(ApiError::project_artifact_mutation)?;
+    if row
+        .source_kind()
+        .map_err(ApiError::project_artifact_mutation)?
+        != "manual"
+    {
         return Err(ApiError::internal(
             "persisted manual check has an unsupported source kind",
         ));
     }
-    let outcome: String = row.try_get("outcome")?;
-    let evaluated_at: String = row.try_get("created_at")?;
+    let outcome: String = row.outcome().map_err(ApiError::project_artifact_mutation)?;
+    let evaluated_at: String = row
+        .created_at()
+        .map_err(ApiError::project_artifact_mutation)?;
     let status = match outcome.as_str() {
         "passed" => api_types::AcceptanceCheckResultStatus::Pass,
         "failed" => api_types::AcceptanceCheckResultStatus::Fail,
@@ -818,9 +865,11 @@ fn validation_result_from_row(
             )));
         }
     };
-    let source_manifest: serde_json::Value =
-        serde_json::from_str(&row.try_get::<String, _>("source_manifest_json")?)
-            .map_err(|_| ApiError::internal("persisted manual check result is invalid"))?;
+    let source_manifest: serde_json::Value = serde_json::from_str(
+        &row.source_manifest_json()
+            .map_err(ApiError::project_artifact_mutation)?,
+    )
+    .map_err(|_| ApiError::internal("persisted manual check result is invalid"))?;
     let result = source_manifest
         .get("result")
         .and_then(serde_json::Value::as_str)
@@ -845,8 +894,9 @@ fn validation_result_from_row(
             "persisted manual check governing revisions are incomplete",
         ));
     }
-    let persisted_charter_revision_id: Option<String> =
-        row.try_get("governing_charter_revision_id")?;
+    let persisted_charter_revision_id: Option<String> = row
+        .governing_charter_revision_id()
+        .map_err(ApiError::project_artifact_mutation)?;
     if governing_revision_ids.first().map(String::as_str)
         != persisted_charter_revision_id.as_deref()
     {
@@ -857,7 +907,11 @@ fn validation_result_from_row(
     if source_manifest
         .get("check_definition_revision_id")
         .and_then(serde_json::Value::as_str)
-        != Some(row.try_get::<String, _>("definition_revision_id")?.as_str())
+        != Some(
+            row.definition_revision_id()
+                .map_err(ApiError::project_artifact_mutation)?
+                .as_str(),
+        )
         || source_manifest
             .get("governing_policy_revision")
             .and_then(serde_json::Value::as_str)
@@ -872,7 +926,11 @@ fn validation_result_from_row(
         ));
     }
     let principal = PrincipalRef {
-        kind: match row.try_get::<String, _>("principal_type")?.as_str() {
+        kind: match row
+            .principal_type()
+            .map_err(ApiError::project_artifact_mutation)?
+            .as_str()
+        {
             "user" => PrincipalKind::User,
             "agent" => PrincipalKind::Agent,
             "worker" => PrincipalKind::Worker,
@@ -885,22 +943,39 @@ fn validation_result_from_row(
                 )));
             }
         },
-        id: row.try_get("principal_id")?,
+        id: row
+            .principal_id()
+            .map_err(ApiError::project_artifact_mutation)?,
         display_name: None,
     };
-    let authorization_action: String = row.try_get("authorization_action")?;
-    let authorization_occurred_at: String = row.try_get("authorization_occurred_at")?;
+    let authorization_action: String = row
+        .authorization_action()
+        .map_err(ApiError::project_artifact_mutation)?;
+    let authorization_occurred_at: String = row
+        .authorization_occurred_at()
+        .map_err(ApiError::project_artifact_mutation)?;
     let authorization = AuthorizationProvenance {
         principal: principal.clone(),
-        authorization_basis: row.try_get("authorization_basis")?,
+        authorization_basis: row
+            .authorization_basis()
+            .map_err(ApiError::project_artifact_mutation)?,
         action: authorization_action,
-        event_id: row.try_get("explicit_event")?,
+        event_id: row
+            .explicit_event()
+            .map_err(ApiError::project_artifact_mutation)?,
         occurred_at: authorization_occurred_at,
     };
     if principal.kind != PrincipalKind::User
         || principal.id.trim().is_empty()
-        || row.try_get::<String, _>("input_digest")?.trim().is_empty()
-        || row.try_get::<i64, _>("expected_version")? <= 0
+        || row
+            .input_digest()
+            .map_err(ApiError::project_artifact_mutation)?
+            .trim()
+            .is_empty()
+        || row
+            .expected_version()
+            .map_err(ApiError::project_artifact_mutation)?
+            <= 0
     {
         return Err(ApiError::internal(
             "persisted manual check target provenance is invalid",
@@ -915,7 +990,11 @@ fn validation_result_from_row(
             "persisted manual check authorization provenance is invalid",
         ));
     }
-    if authorization.event_id != row.try_get::<String, _>("explicit_event")? {
+    if authorization.event_id
+        != row
+            .explicit_event()
+            .map_err(ApiError::project_artifact_mutation)?
+    {
         return Err(ApiError::internal(
             "persisted manual check authorization event disagrees with its result",
         ));
@@ -927,7 +1006,7 @@ fn validation_result_from_row(
             "check_id": check_id,
             "status": status,
             "result": result.clone(),
-            "input_digest": row.try_get::<String, _>("input_digest")?,
+            "input_digest": row.input_digest().map_err(ApiError::project_artifact_mutation)?,
             "evaluated_at": evaluated_at.clone(),
             "governing_revision_ids": governing_revision_ids.clone(),
             "authorization": authorization.clone(),
@@ -943,10 +1022,16 @@ fn validation_result_from_row(
         result,
         principal,
         authorization,
-        input_digest: row.try_get("input_digest")?,
+        input_digest: row
+            .input_digest()
+            .map_err(ApiError::project_artifact_mutation)?,
         governing_revision_ids,
-        expected_version: row.try_get("expected_version")?,
-        event_id: row.try_get("explicit_event")?,
+        expected_version: row
+            .expected_version()
+            .map_err(ApiError::project_artifact_mutation)?,
+        event_id: row
+            .explicit_event()
+            .map_err(ApiError::project_artifact_mutation)?,
         evaluated_at,
         result_digest,
     })
