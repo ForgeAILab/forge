@@ -25,7 +25,6 @@ use db::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::Row;
 
 use crate::{
     errors::{ApiError, ApiResult},
@@ -80,51 +79,28 @@ pub async fn list_media(
         crate::routes::authorization::ProjectAccess::Read,
     )
     .await?;
-    let (cursor_created_at, cursor_id) = decode_cursor(query.cursor.as_deref())?
-        .map_or((None, None), |(created_at, id)| {
-            (Some(created_at), Some(id))
-        });
+    let cursor = decode_cursor(query.cursor.as_deref())?;
     let limit = query.limit.unwrap_or(20).clamp(1, 100);
-    let mut statement = sqlx::query(
-        "SELECT m.* FROM media_asset m
-         WHERE m.project_id = ? AND m.deleted_at IS NULL
-         ORDER BY m.created_at ASC, m.id ASC LIMIT ?",
-    );
-    if let (Some(created_at), Some(id)) = (cursor_created_at, cursor_id) {
-        statement = sqlx::query(
-            "SELECT m.* FROM media_asset m
-             WHERE m.project_id = ? AND m.deleted_at IS NULL
-               AND (m.created_at > ? OR (m.created_at = ? AND m.id > ?))
-             ORDER BY m.created_at ASC, m.id ASC LIMIT ?",
-        )
-        .bind(&project_id)
-        .bind(created_at.clone())
-        .bind(created_at)
-        .bind(id)
-        .bind(limit + 1);
-    } else {
-        statement = statement.bind(&project_id).bind(limit + 1);
-    }
-    let mut rows = statement.fetch_all(state.db.pool()).await?;
-    let has_more = rows.len() > limit as usize;
-    rows.truncate(limit as usize);
-    let mut assets = Vec::with_capacity(rows.len());
-    for row in rows {
-        let asset_id: String = row.try_get("id")?;
+    let (asset_rows, has_more) = state
+        .db
+        .project_media_asset_id_page(&project_id, cursor, limit)
+        .await
+        .map_err(ApiError::project_artifact_mutation)?;
+    let mut assets = Vec::with_capacity(asset_rows.len());
+    for row in asset_rows {
+        let asset_id = row
+            .asset_id()
+            .map_err(ApiError::project_artifact_mutation)?;
         let asset = SharedMediaRepo::get_media_asset(&*state.db, &asset_id)
             .await?
             .filter(|asset| asset.project_id == project_id)
             .ok_or_else(|| ApiError::internal("project media row disappeared during listing"))?;
         let asset = reconcile_asset_checksum(&state, asset).await?;
-        let task_media_ids = sqlx::query_scalar::<_, String>(
-            "SELECT task_media_id FROM project_media_attachment
-             WHERE project_id = ? AND asset_id = ? AND task_media_id IS NOT NULL
-               AND deleted_at IS NULL ORDER BY id ASC",
-        )
-        .bind(&project_id)
-        .bind(&asset_id)
-        .fetch_all(state.db.pool())
-        .await?;
+        let task_media_ids = state
+            .db
+            .project_media_task_media_ids(&project_id, &asset_id)
+            .await
+            .map_err(ApiError::project_artifact_mutation)?;
         let task_media_ids = if task_media_ids.is_empty() {
             asset.legacy_task_media_id.clone().into_iter().collect()
         } else {
@@ -624,43 +600,20 @@ pub async fn list_evidence(
         crate::routes::authorization::ProjectAccess::Read,
     )
     .await?;
-    let (cursor_created_at, cursor_id) = decode_cursor(query.cursor.as_deref())?
-        .map_or((None, None), |(created_at, id)| {
-            (Some(created_at), Some(id))
-        });
+    let cursor = decode_cursor(query.cursor.as_deref())?;
     let limit = query.limit.unwrap_or(20).clamp(1, 100);
-    let mut statement = sqlx::query(
-        "SELECT * FROM project_media_attachment
-         WHERE project_id = ? AND milestone_id = ?
-           AND attachment_kind = 'evidence' AND deleted_at IS NULL
-         ORDER BY created_at ASC, id ASC LIMIT ?",
-    );
-    if let (Some(created_at), Some(id)) = (cursor_created_at, cursor_id) {
-        statement = sqlx::query(
-            "SELECT * FROM project_media_attachment
-             WHERE project_id = ? AND milestone_id = ?
-               AND attachment_kind = 'evidence' AND deleted_at IS NULL
-               AND (created_at > ? OR (created_at = ? AND id > ?))
-             ORDER BY created_at ASC, id ASC LIMIT ?",
-        )
-        .bind(&project_id)
-        .bind(&milestone_id)
-        .bind(created_at.clone())
-        .bind(created_at)
-        .bind(id)
-        .bind(limit + 1);
-    } else {
-        statement = statement
-            .bind(&project_id)
-            .bind(&milestone_id)
-            .bind(limit + 1);
-    }
-    let mut rows = statement.fetch_all(state.db.pool()).await?;
-    let has_more = rows.len() > limit as usize;
-    rows.truncate(limit as usize);
-    let mut items = Vec::with_capacity(rows.len());
-    for row in rows {
-        items.push(evidence_attachment_response(map_attachment_row(&row)?)?);
+    let (attachments, has_more) = state
+        .db
+        .project_evidence_page(&project_id, &milestone_id, cursor, limit)
+        .await
+        .map_err(ApiError::project_artifact_mutation)?;
+    let mut items = Vec::with_capacity(attachments.len());
+    for attachment in attachments {
+        items.push(evidence_attachment_response(
+            attachment
+                .into_attachment()
+                .map_err(ApiError::project_artifact_mutation)?,
+        )?);
     }
     let next_cursor = has_more
         .then(|| {
@@ -688,20 +641,13 @@ pub async fn get_evidence(
         crate::routes::authorization::ProjectAccess::Read,
     )
     .await?;
-    let row = sqlx::query(
-        "SELECT * FROM project_media_attachment
-         WHERE id = ? AND project_id = ? AND milestone_id = ?
-           AND attachment_kind = 'evidence' AND deleted_at IS NULL",
-    )
-    .bind(&evidence_id)
-    .bind(&project_id)
-    .bind(&milestone_id)
-    .fetch_optional(state.db.pool())
-    .await?
-    .ok_or_else(|| ApiError::not_found("evidence", evidence_id))?;
-    Ok(Json(evidence_attachment_response(map_attachment_row(
-        &row,
-    )?)?))
+    let attachment = state
+        .db
+        .project_evidence_by_id(&project_id, &milestone_id, &evidence_id)
+        .await
+        .map_err(ApiError::project_artifact_mutation)?
+        .ok_or_else(|| ApiError::not_found("evidence", evidence_id))?;
+    Ok(Json(evidence_attachment_response(attachment)?))
 }
 
 pub async fn remove_evidence(
@@ -779,38 +725,6 @@ fn media_asset_response_from_model(
         stable_project_url,
         created_at: asset.created_at,
         deleted_at: asset.deleted_at,
-    })
-}
-
-fn map_attachment_row(row: &sqlx::sqlite::SqliteRow) -> ApiResult<db::ProjectMediaAttachment> {
-    Ok(db::ProjectMediaAttachment {
-        id: row.try_get("id")?,
-        project_id: row.try_get("project_id")?,
-        asset_id: row.try_get("asset_id")?,
-        attachment_kind: row.try_get("attachment_kind")?,
-        task_media_id: row.try_get("task_media_id")?,
-        task_id: row.try_get("task_id")?,
-        milestone_id: row.try_get("milestone_id")?,
-        milestone_check_id: row.try_get("milestone_check_id")?,
-        source_task_id: row.try_get("source_task_id")?,
-        source_execution_id: row.try_get("source_execution_id")?,
-        source_validation_id: row.try_get("source_validation_id")?,
-        source_task_version: row.try_get("source_task_version")?,
-        source_context_digest: row.try_get("source_context_digest")?,
-        source_definition_revision_id: row.try_get("source_definition_revision_id")?,
-        acceptance_check_ids_json: row.try_get("acceptance_check_ids_json")?,
-        caption: row.try_get("caption")?,
-        evidence_kind: row.try_get("evidence_kind")?,
-        checksum: row.try_get("checksum")?,
-        availability: row.try_get("availability")?,
-        project_url: row.try_get("project_url")?,
-        author_type: row.try_get("author_type")?,
-        author_id: row.try_get("author_id")?,
-        authorization_json: row.try_get("authorization_json")?,
-        version: row.try_get("version")?,
-        created_at: row.try_get("created_at")?,
-        deleted_at: row.try_get("deleted_at")?,
-        updated_at: row.try_get("updated_at")?,
     })
 }
 

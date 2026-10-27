@@ -1050,3 +1050,82 @@ impl UsageAnalyticsRepo for SqliteDb {
         Ok(count)
     }
 }
+
+/// The timing snapshot is decoded after the caller loads ledger usage, retaining
+/// the route's read and error ordering.
+pub struct TaskExecutionTimingRead {
+    row: SqliteRow,
+}
+
+impl TaskExecutionTimingRead {
+    pub fn with_usage(
+        self,
+        usage: UsageAggregate,
+    ) -> Result<api_types::TaskExecutionObservability> {
+        Ok(api_types::TaskExecutionObservability {
+            counts: usage.counts,
+            tokens: usage.tokens,
+            cost: usage.cost,
+            active_execution_id: self.row.try_get("active_execution_id")?,
+            active_role: self.row.try_get("active_role")?,
+            active_started_at: self.row.try_get("active_started_at")?,
+            active_elapsed_seconds: self
+                .row
+                .try_get::<Option<i64>, _>("active_elapsed_seconds")?
+                .map(|value| value as f64),
+            latest_execution_id: self.row.try_get("latest_execution_id")?,
+            latest_execution_status: self.row.try_get("latest_execution_status")?,
+            latest_role: self.row.try_get("latest_role")?,
+            latest_started_at: self.row.try_get("latest_started_at")?,
+            latest_stopped_at: self.row.try_get("latest_stopped_at")?,
+            latest_runtime_seconds: self
+                .row
+                .try_get::<Option<i64>, _>("latest_runtime_seconds")?
+                .map(|value| value as f64),
+            total_runtime_seconds: self.row.try_get::<i64, _>("total_runtime_seconds")? as f64,
+        })
+    }
+}
+
+impl SqliteDb {
+    pub async fn task_execution_timing(&self, task_id: &str) -> Result<TaskExecutionTimingRead> {
+        let row = sqlx::query(
+        "WITH task_executions AS (
+             SELECT * FROM execution WHERE task_id = ?
+         )
+         SELECT
+             (SELECT COALESCE(SUM(max(COALESCE(
+                 (CASE
+                     WHEN status = 'running' THEN CAST(strftime('%s', 'now') AS INTEGER)
+                     ELSE CAST(strftime('%s', COALESCE(stopped_at, updated_at)) AS INTEGER)
+                  END) - CAST(strftime('%s', created_at) AS INTEGER),
+                 0), 0)), 0)
+              FROM task_executions) AS total_runtime_seconds,
+             (SELECT id FROM task_executions WHERE status = 'running' ORDER BY created_at DESC, id DESC LIMIT 1) AS active_execution_id,
+             (SELECT role FROM task_executions WHERE status = 'running' ORDER BY created_at DESC, id DESC LIMIT 1) AS active_role,
+             (SELECT created_at FROM task_executions WHERE status = 'running' ORDER BY created_at DESC, id DESC LIMIT 1) AS active_started_at,
+             (SELECT max(COALESCE(
+                 CAST(strftime('%s', 'now') AS INTEGER) - CAST(strftime('%s', created_at) AS INTEGER),
+                 0), 0)
+              FROM task_executions WHERE status = 'running' ORDER BY created_at DESC, id DESC LIMIT 1) AS active_elapsed_seconds,
+             (SELECT id FROM task_executions ORDER BY created_at DESC, id DESC LIMIT 1) AS latest_execution_id,
+             (SELECT status FROM task_executions ORDER BY created_at DESC, id DESC LIMIT 1) AS latest_execution_status,
+             (SELECT role FROM task_executions ORDER BY created_at DESC, id DESC LIMIT 1) AS latest_role,
+             (SELECT created_at FROM task_executions ORDER BY created_at DESC, id DESC LIMIT 1) AS latest_started_at,
+             (SELECT stopped_at FROM task_executions ORDER BY created_at DESC, id DESC LIMIT 1) AS latest_stopped_at,
+             (SELECT max(COALESCE(
+                 (CASE
+                     WHEN status = 'running' THEN CAST(strftime('%s', 'now') AS INTEGER)
+                     ELSE CAST(strftime('%s', COALESCE(stopped_at, updated_at)) AS INTEGER)
+                  END) - CAST(strftime('%s', created_at) AS INTEGER),
+                 0), 0)
+              FROM task_executions ORDER BY created_at DESC, id DESC LIMIT 1) AS latest_runtime_seconds
+        ",
+    )
+    .bind(task_id)
+    .fetch_one(self.pool())
+    .await?;
+
+        Ok(TaskExecutionTimingRead { row })
+    }
+}

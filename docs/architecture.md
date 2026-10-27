@@ -336,6 +336,21 @@ trait methods delegate to those helpers without changing their contracts.
 `sqlite.rs` remains the shared database root, with execution creation and admission
 fences in `sqlite/execution_admission.rs`.
 
+Leaf API persistence reads and CLI runtime policy CAS use inherent `SqliteDb`
+methods in the owning aggregate modules. Project media keyset reads and attachment
+decoding live in `sqlite/shared_media/reads.rs`; routes retain authorization,
+cursor encoding and response projection. Execution timing is fetched before
+ledger usage and decoded afterward; media rows are decoded one at a time before
+checksum reconciliation or response conversion, preserving read and error order.
+SQL/decode failures from these CLI runtime and Project media methods retain the existing
+`500 internal_error` response with `Project artifact mutation failed`; CLI runtime
+policy version conflicts retain their dedicated `cli_runtime.version_conflict`.
+Project deletion ownership probes live in `sqlite/workspace_root/cleanup.rs`:
+typed owner selectors replace route SQL. The Project route owns `BEGIN IMMEDIATE`,
+the quarantine rename, commit/restore, and post-commit recursive removal; each
+ownership recheck and rename still share the same write lock and contextual
+errors. `TaskMediaRepo` and `SharedMediaRepo` retain their existing contracts.
+
 The MCP `tools/handlers.rs` root retains Task and Project handlers and re-exports
 Agent Chat and memory handlers from `handlers/`; its unit tests live in
 `handlers/tests.rs`. The `api-types/project_orchestration.rs` root retains shared

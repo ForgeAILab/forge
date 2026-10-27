@@ -95,6 +95,7 @@ mod agent_chat_topic;
 mod agent_inquiry;
 mod agent_wake;
 mod analytics;
+pub use analytics::TaskExecutionTimingRead;
 mod attention;
 mod command_finalization;
 mod command_receipt;
@@ -156,7 +157,7 @@ mod schedule;
 mod shared_media;
 pub use shared_media::{
     InsertReleaseEvidencePinInput, MilestoneEvidenceRow, MilestoneReleasePinMetadataRow,
-    ReleaseEvidencePinRow,
+    ProjectEvidenceAttachmentRead, ProjectMediaAssetIdRead, ReleaseEvidencePinRow,
 };
 mod skill;
 mod system_setting;
@@ -1140,6 +1141,7 @@ pub use task::RecordPlacementDispatchRefusalInput;
 
 mod workspace_root;
 pub use system_setting::record_workspace_root_setting;
+pub use workspace_root::ProjectCleanupOwner;
 pub use workspace_root::WorkspaceRootEntity;
 pub use workspace_root::WorkspaceRootPathRemaining;
 pub use workspace_root::WorkspaceRootPathRewrite;

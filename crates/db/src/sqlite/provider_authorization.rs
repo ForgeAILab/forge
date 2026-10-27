@@ -4,6 +4,84 @@ use crate::{
 };
 use async_trait::async_trait;
 use sqlx::{sqlite::SqliteRow, Row};
+use std::collections::HashMap;
+
+impl SqliteDb {
+    pub async fn set_cli_runtime_enabled(
+        &self,
+        owner_user_id: &str,
+        daemon_id: &str,
+        executor_type: &str,
+        enabled: bool,
+        expected_version: i64,
+        now: &str,
+    ) -> Result<()> {
+        let updated = sqlx::query(
+            "UPDATE cli_runtime_policy
+         SET enabled = ?, version = version + 1, updated_at = ?
+         WHERE owner_user_id = ? AND daemon_id = ? AND executor_type = ?
+           AND version = ?",
+        )
+        .bind(enabled)
+        .bind(now)
+        .bind(owner_user_id)
+        .bind(daemon_id)
+        .bind(executor_type)
+        .bind(expected_version)
+        .execute(self.pool())
+        .await?;
+        let changed = if updated.rows_affected() == 1 {
+            true
+        } else if expected_version == 0 {
+            sqlx::query(
+                "INSERT OR IGNORE INTO cli_runtime_policy (
+                 owner_user_id, daemon_id, executor_type, enabled,
+                 version, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, 1, ?, ?)",
+            )
+            .bind(owner_user_id)
+            .bind(daemon_id)
+            .bind(executor_type)
+            .bind(enabled)
+            .bind(now)
+            .bind(now)
+            .execute(self.pool())
+            .await?
+            .rows_affected()
+                == 1
+        } else {
+            false
+        };
+        if !changed {
+            return Err(DbError::VersionConflict);
+        }
+        Ok(())
+    }
+
+    pub async fn cli_runtime_policies_for_daemon(
+        &self,
+        owner_user_id: &str,
+        daemon_id: &str,
+    ) -> Result<HashMap<String, (bool, i64)>> {
+        let policies = sqlx::query(
+            "SELECT executor_type, enabled, version FROM cli_runtime_policy
+         WHERE owner_user_id = ? AND daemon_id = ?",
+        )
+        .bind(owner_user_id)
+        .bind(daemon_id)
+        .fetch_all(self.pool())
+        .await?;
+        policies
+            .into_iter()
+            .map(|row| {
+                Ok((
+                    row.try_get("executor_type")?,
+                    (row.try_get("enabled")?, row.try_get("version")?),
+                ))
+            })
+            .collect()
+    }
+}
 
 #[async_trait]
 impl ProviderAuthorizationRepo for SqliteDb {

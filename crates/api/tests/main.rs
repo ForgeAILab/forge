@@ -183,6 +183,12 @@ mod project_charters;
 #[path = "suite/project_deletion.rs"]
 mod project_deletion;
 
+#[path = "suite/project_media.rs"]
+mod project_media;
+
+#[path = "suite/providers.rs"]
+mod providers;
+
 #[path = "suite/project_environment_pause.rs"]
 mod project_environment_pause;
 
