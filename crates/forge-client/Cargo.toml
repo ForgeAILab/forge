@@ -35,7 +35,7 @@ futures-util = "0.3"
 libc = "0.2"
 url = "2"
 tracing = { workspace = true }
-which = "7"
+which = "8"
 dirs = "6"
 time = { version = "0.3", features = ["formatting", "macros"] }
 
