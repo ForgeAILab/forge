@@ -146,6 +146,7 @@ pub(crate) async fn record_retry(
     .expect("condition channel serializes");
     let annotation = serde_json::to_string(&channels::ErrorAnnotation::new(
         channels::AnnotationShape::PlanWait(channels::PlanWaitAnnotation {
+            blocking_reason: None,
             kind: channels::PlanWaitKind::PlanSettlementWait,
             code: if offline {
                 channels::PlanWaitCode::RuntimeOffline

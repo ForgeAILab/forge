@@ -225,6 +225,7 @@ impl TaskService {
             return Ok(true);
         }
         let annotation = channel::PlacementRefusalAnnotation {
+            blocking_reason: None,
             kind: api_types::FailureKind::DispatchFailed,
             code: channel::PlacementCode::PlacementUnavailable,
             state: task.status.clone(),

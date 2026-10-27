@@ -6192,13 +6192,20 @@ all 24 condition metadata values. The shapes are Blocking, Hold, TimedBlock,
 RecoveryExecution, RemoteCancel, Message, Reason, ReviewCandidate, ReviewPark,
 Detected, DetectedState, Budget, StepFailure, PlacementRefusal, PlanWait and
 UpgradeDispatch. Historical and merge-onto-existing values can have other shapes.
-Strict decoders are for new writes only; stored-row reads, restores and
-`map_legacy_condition` stay lenient. `ErrorAnnotation` selects by field set,
-since multiple shapes share a failure kind, and retains one replacing step
+Strict shapes cover new writes, queue overlays and queued-action restores.
+Restores try the strict shape first and fall back to the existing `Value` edit
+for anything it rejects; stored-row reads and `map_legacy_condition` stay lenient.
+`ErrorAnnotation` selects by field set, since multiple shapes share a failure
+kind, and retains one replacing step
 overlay. Unknown fields and tags are rejected, including in closed nested
 objects; missing and null stay distinct. `plan_settlement_wait` and interruption
 kind `integration_admission_failed` are stored tags outside `FailureKind`.
 The queue's kindless interruption has a required nullable reason.
+DetectedState, PlacementRefusal, PlanWait and UpgradeDispatch also carry an
+optional String `blocking_reason` for queued-action restore; fresh writers omit
+it, and the queue preserves it when adding a step-failure overlay.
+The `placement_refusal` metadata marker shares PlacementRefusal's annotation
+shape, so its decoder also accepts this field; production marker writers omit it.
 
 Storage encoding follows each main writer: `json!`/`Value` sorts object keys;
 `TaskBlockingAnnotation` uses declaration order, and demo message literals put

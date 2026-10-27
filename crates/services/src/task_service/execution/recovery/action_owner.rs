@@ -490,10 +490,21 @@ fn restore_action_annotation(raw: Option<&str>, reason: &str) -> Option<String> 
             value.blocking_reason = Some(Some(reason.into()));
             value.message = Some(reason.into());
         }
-        // These main restore outputs add blocking_reason to a shape that the
-        // frozen gate-1 vocabulary cannot represent.
-        S::DetectedState(_) | S::PlacementRefusal(_) | S::PlanWait(_) | S::UpgradeDispatch(_) => {
-            return None
+        S::DetectedState(value) => {
+            value.blocking_reason = Some(reason.into());
+            value.message = reason.into();
+        }
+        S::PlacementRefusal(value) => {
+            value.blocking_reason = Some(reason.into());
+            value.message = reason.into();
+        }
+        S::PlanWait(value) => {
+            value.blocking_reason = Some(reason.into());
+            value.message = reason.into();
+        }
+        S::UpgradeDispatch(value) => {
+            value.blocking_reason = Some(reason.into());
+            value.message = reason.into();
         }
     }
     Some(
