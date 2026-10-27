@@ -76,6 +76,14 @@ async fn claim_capacity_ignores_assigned_but_not_running_tasks() {
 
     assert_eq!(claimed.task.id, claim_task_id);
     assert_eq!(
+        claimed.task,
+        TaskRepo::get_by_id(&db, &claim_task_id, false)
+            .await
+            .expect("claimed Task reloads")
+            .expect("claimed Task exists"),
+        "claim returns the cache pair stored after entry and execution creation"
+    );
+    assert_eq!(
         sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM execution WHERE task_id = ? AND status = 'running'",
         )

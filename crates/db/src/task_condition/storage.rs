@@ -174,15 +174,31 @@ pub(super) async fn set_condition(
         decode(condition).is_ok_and(|decoded| encode(&decoded) == condition),
         "Task condition must round-trip through its stored form"
     );
-    let written =
+    let written = match
         sqlx::query("UPDATE task SET condition_json=?1,condition_digest=?4 WHERE id=?2 AND (?3 IS NULL OR version=?3) AND (condition_json IS NOT ?1 OR condition_digest IS NOT ?4)")
             .bind(condition)
             .bind(task_id)
             .bind(expected_version)
             .bind(digest)
-            .execute(connection)
-            .await?
-            .rows_affected();
+            .execute(&mut *connection)
+            .await
+    {
+        Ok(result) => result,
+        // Historical migration replay can enqueue steps before the digest
+        // column exists. Keep the same condition and version fences there.
+        Err(sqlx::Error::Database(error))
+            if error.message() == "no such column: condition_digest" =>
+        {
+            sqlx::query("UPDATE task SET condition_json=?1 WHERE id=?2 AND (?3 IS NULL OR version=?3) AND condition_json IS NOT ?1")
+                .bind(condition)
+                .bind(task_id)
+                .bind(expected_version)
+                .execute(connection)
+                .await?
+        }
+        Err(error) => return Err(error.into()),
+    }
+    .rows_affected();
     debug_assert!(written <= 1, "one Task owns one condition");
     Ok(())
 }

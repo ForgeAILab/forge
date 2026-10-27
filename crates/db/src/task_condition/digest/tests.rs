@@ -2,6 +2,95 @@ use super::*;
 use crate::task_condition::tests::{db, task};
 use crate::{SystemSettingRepo, TaskRepo};
 
+#[tokio::test]
+async fn write_results_and_frozen_receipts_keep_the_stored_cache_pair() {
+    for writer in ["update", "recovery_update", "recovery_status"] {
+        let db = db().await;
+        let before = task(&db, writer).await;
+        let at = crate::now_rfc3339();
+        let blocked = serde_json::json!({
+            "kind": "workflow_loop", "reason": "new block", "created_at": at
+        })
+        .to_string();
+        let input = crate::UpdateTask {
+            id: before.id.clone(),
+            expected_version: before.version,
+            title: None,
+            description: None,
+            priority: None,
+            merge_config: None,
+            plan: None,
+            error_annotation: None,
+            blocked_json: Some(Some(blocked.clone())),
+            failed_json: None,
+            task_state_config: None,
+            parent_task_id: None,
+            updated_at: at.clone(),
+        };
+        let marker = crate::CreateTransitionLog {
+            id: crate::new_uuid_v4(),
+            task_id: before.id.clone(),
+            from_state: before.status.clone(),
+            to_state: before.status.clone(),
+            trigger_name: None,
+            triggered_by: "system".into(),
+            bridge: Default::default(),
+            trigger_reason: "recovery".into(),
+            hook_results_json: None,
+            rejection: false,
+            created_at: at.clone(),
+        };
+        let returned = match writer {
+            "update" => TaskRepo::update(&db, input).await,
+            "recovery_update" => TaskRepo::update_with_recovery_marker(&db, input, marker).await,
+            _ => {
+                TaskRepo::update_status_with_recovery_marker(
+                    &db,
+                    crate::UpdateTaskStatus {
+                        id: before.id.clone(),
+                        expected_version: before.version,
+                        status: before.status.clone(),
+                        assignee_id: None,
+                        error_annotation: None,
+                        blocked_json: Some(Some(blocked)),
+                        failed_json: None,
+                        updated_at: at,
+                    },
+                    marker,
+                )
+                .await
+            }
+        }
+        .unwrap();
+        let stored = TaskRepo::get_by_id(&db, &before.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(stored.condition, before.condition, "{writer}");
+        assert_ne!(stored.condition_digest, before.condition_digest, "{writer}");
+        assert_eq!(returned, stored, "{writer}");
+        let frozen = serde_json::to_value(&returned).unwrap();
+
+        for digest in [None, Some("stale-stored-digest")] {
+            sqlx::query("UPDATE task SET blocked_json=NULL,condition_digest=? WHERE id=?")
+                .bind(digest)
+                .bind(&before.id)
+                .execute(db.pool())
+                .await
+                .unwrap();
+            let live = TaskRepo::get_by_id(&db, &before.id, false)
+                .await
+                .unwrap()
+                .unwrap();
+            let decoded: Task =
+                serde_json::from_value(serde_json::to_value(&live).unwrap()).unwrap();
+            assert_eq!(decoded, live, "{writer}: preserve NULL or stale stamps");
+            let replayed: Task = serde_json::from_value(frozen.clone()).unwrap();
+            assert_eq!(replayed, returned, "{writer}: frozen snapshot after drift");
+        }
+    }
+}
+
 #[test]
 fn raw_members_frame_absent_null_empty_and_preserve_rendered_bytes() {
     for field in CHANNEL_FIELDS.iter().take(4) {

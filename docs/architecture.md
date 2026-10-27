@@ -5989,6 +5989,15 @@ Every writer that stores `condition_json` also stores its matching digest in the
 same statement or transaction. The digest is separate from the encoded cache,
 whose field order and bytes remain unchanged. No invalidation trigger reads the
 digest column, so stamping it cannot dirty scheduler rows or list revisions.
+Returned Tasks refresh both cache fields after the writer's final condition
+producer, including recovery receipts and execution admission. Private Task
+snapshots in mutation replies, command receipts and move results serialize the
+stored digest with the condition, so replay preserves the original pair even
+after the live row changes. Older snapshots without a digest retain NULL;
+replay never guesses a digest from their channels or reads it from a newer row.
+REST and MCP Task representations use their public DTOs and omit this internal
+field. Historical migration replay before the digest column exists writes only
+`condition_json` under the same version fence.
 `V202610270500__task_condition_digest` adds the column with NULL for existing rows.
 It clears revision-8 progress saved before the column existed, so that old cursor
 cannot skip the newly NULL prefix. Checkpoints written after this migration still

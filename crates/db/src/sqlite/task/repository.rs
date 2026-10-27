@@ -1776,6 +1776,10 @@ impl TaskRepo for SqliteDb {
         execution.hard_deadline_at = initial_lease.hard_deadline_at.clone();
         execution.last_heartbeat_at = Some(initial_lease.now.clone());
         execution.updated_at = initial_lease.now.clone();
+        let task = self
+            .get_task_in_tx(transaction, &task.id)
+            .await?
+            .ok_or(DbError::NotFound)?;
         Ok(ClaimedTask { task, execution })
     }
 

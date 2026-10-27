@@ -751,6 +751,7 @@ async fn update_task_inner(
     }
     if let Some(marker) = recovery_marker {
         insert_recovery_marker_in_tx(&mut transaction, marker).await?;
+        crate::task_condition::refresh_task_condition(&mut transaction, &mut task).await?;
     }
     db.record_mutation_reply_in_tx(&mut transaction, &task)
         .await?;
@@ -1247,6 +1248,7 @@ async fn update_task_status_inner(
     DomainEventRepo::append_event_in_tx(db, &mut transaction, &event).await?;
     if let Some(marker) = recovery_marker {
         insert_recovery_marker_in_tx(&mut transaction, marker).await?;
+        crate::task_condition::refresh_task_condition(&mut transaction, &mut task).await?;
     }
     transaction.commit().await?;
     Ok(Some(task))
