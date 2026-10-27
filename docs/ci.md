@@ -45,12 +45,19 @@ green while its push is red or pending.
 The file-size check scans tracked `crates/**/*.rs` and `web/**/*.{ts,tsx}` files,
 excluding generated bindings and `node_modules`, `target` and `dist` directories.
 Caps are 2,000 lines for Rust and 1,000 for TS/TSX (counted like `wc -l`).
-Existing larger files have exact limits in `scripts/file-size-allowlist.txt`.
-Growth fails; shrinking or deleting a listed file also fails until
-`python3 scripts/check-file-sizes.py --update` lowers or removes its entry. That
+The allowlist in `scripts/file-size-allowlist.txt` has no remaining entries.
+Files above the caps fail. For any historical allowlist entry, growth fails;
+shrinking or deleting its file also fails until
+`python3 scripts/check-file-sizes.py --update` lowers or removes the entry. That
 command never adds or raises a limit. Split by responsibility instead of
 expanding the allowlist; `--init` is for maintainers only, to create the
 one-time baseline.
+
+Dispatcher, task-condition, and native-scope-composition tests use topic modules
+beside their original module roots, with shared fixtures in helper modules.
+Existing dispatcher child modules, generated equivalence case groups, and
+ignored task-condition measurement filters retain their paths. Other moved
+tests gain one topic segment; crate targets and CI shard filters stay the same.
 
 The matrix sets `fail-fast: false` and every shard keeps `--no-fail-fast`, so
 one red run still lists every failure.
