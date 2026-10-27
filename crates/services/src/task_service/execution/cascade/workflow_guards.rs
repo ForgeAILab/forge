@@ -1,6 +1,8 @@
 //! Completion guard retries, rejection prompts, and metadata.
 
 use super::*;
+use crate::condition_metadata::set_condition;
+use db::task_condition::channels;
 
 impl TaskService {
     pub(in crate::task_service::execution) async fn handle_executor_completion_guard_rejection(
@@ -74,22 +76,20 @@ impl TaskService {
                     limit: i64::from(budget),
                     step: format!("guard:{}", execution.id),
                 }),
-                db::TaskMetadataMutation::Set {
-                    key: "last_workflow_guard_rejection_at".to_owned(),
-                    value: Value::String(now.clone()),
-                },
-                db::TaskMetadataMutation::Set {
-                    key: "last_workflow_guard_name".to_owned(),
-                    value: Value::String(guard.to_owned()),
-                },
-                db::TaskMetadataMutation::Set {
-                    key: "last_workflow_guard_reason".to_owned(),
-                    value: Value::String(reason.to_owned()),
-                },
-                db::TaskMetadataMutation::Set {
-                    key: "last_workflow_guard_execution_id".to_owned(),
-                    value: Value::String(execution.id.clone()),
-                },
+                set_condition(
+                    channels::ConditionMetadataValue::LastWorkflowGuardRejectionAt(now.clone()),
+                ),
+                set_condition(channels::ConditionMetadataValue::LastWorkflowGuardName(
+                    guard.to_owned(),
+                )),
+                set_condition(channels::ConditionMetadataValue::LastWorkflowGuardReason(
+                    reason.to_owned(),
+                )),
+                set_condition(
+                    channels::ConditionMetadataValue::LastWorkflowGuardExecutionId(
+                        execution.id.clone(),
+                    ),
+                ),
             ],
             &now,
         )
@@ -210,34 +210,38 @@ impl TaskService {
         {
             return Ok(());
         }
-        let annotation = api_types::TaskBlockingAnnotation {
-            annotation_type: api_types::FailureKind::WorkflowGuardRejected,
-            blocking_reason: guard.to_owned(),
-            blocked_by: Some(
-                api_types::Actor::system(api_types::SystemComponent::Workflow).display(),
-            ),
-            blocked_at: Some(now_rfc3339()),
-            blocked_execution_id: Some(execution.id.clone()),
-            artifact: Some(api_types::BlockingArtifact {
-                kind: "execution".to_owned(),
-                id: Some(execution.id.clone()),
-                log_path: execution.logs_path.clone(),
-            }),
-            message: Some(reason.to_owned()),
-            hook: None,
-        };
+        let annotation = channels::ErrorAnnotation::new(channels::AnnotationShape::Blocking(
+            channels::BlockingAnnotation {
+                kind: api_types::FailureKind::WorkflowGuardRejected,
+                blocking_reason: guard.to_owned(),
+                blocked_by: Some(
+                    api_types::Actor::system(api_types::SystemComponent::Workflow).display(),
+                ),
+                blocked_at: Some(now_rfc3339()),
+                blocked_execution_id: Some(execution.id.clone()),
+                artifact: Some(channels::AnnotationArtifact {
+                    kind: "execution".to_owned(),
+                    id: Some(execution.id.clone()),
+                    log_path: execution.logs_path.clone(),
+                }),
+                message: Some(reason.to_owned()),
+                hook: None,
+            },
+        ));
         let annotation = serde_json::to_string(&annotation).map_err(|error| {
             ServiceError::invalid_operation(format!(
                 "failed to serialize workflow-guard annotation: {error}"
             ))
         })?;
-        let blocked_meta = json!({
-            "reason": reason,
-            "created_at": now_rfc3339(),
-            "kind": api_types::FailureKind::WorkflowGuardRejected,
-            "source": guard,
-            "execution_id": execution.id,
-        });
+        let blocked_meta = serde_json::to_string(&channels::Interruption {
+            reason: Some(reason.into()),
+            created_at: Some(Some(now_rfc3339())),
+            kind: Some(Some(api_types::FailureKind::WorkflowGuardRejected.into())),
+            source: Some(Some(guard.into())),
+            execution_id: Some(Some(execution.id.clone())),
+            ..Default::default()
+        })
+        .expect("condition channel serializes");
         let Some(updated) = TaskRepo::update_status_for_latest_execution(
             &*self.db,
             UpdateTaskStatus {
@@ -246,7 +250,7 @@ impl TaskService {
                 status: task.status.clone(),
                 assignee_id: None,
                 error_annotation: Some(Some(annotation)),
-                blocked_json: Some(Some(blocked_meta.to_string())),
+                blocked_json: Some(Some(blocked_meta)),
                 failed_json: Some(None),
                 updated_at: now_rfc3339(),
             },
@@ -327,3 +331,6 @@ impl TaskService {
         )
     }
 }
+
+#[cfg(test)]
+mod writer_parity_tests;

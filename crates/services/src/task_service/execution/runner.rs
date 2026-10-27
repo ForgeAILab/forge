@@ -1732,15 +1732,14 @@ impl TaskService {
                 );
             }
         } else if updated.status == ExecutionStatus::Failed && executor_unavailable {
-            let attempts = serde_json::Value::Array(
-                route_outcome
-                    .attempts
-                    .iter()
-                    .map(|(candidate_key, outcome)| {
-                        serde_json::json!({"candidate_key": candidate_key, "outcome": outcome})
-                    })
-                    .collect(),
-            );
+            let attempts = route_outcome
+                .attempts
+                .iter()
+                .map(|(candidate_key, outcome)| channels::ExecutorRouteAttempt {
+                    candidate_key: candidate_key.clone(),
+                    outcome: outcome.clone(),
+                })
+                .collect();
             if let Err(error) = self
                 .annotate_executor_unavailable_block(&updated, unavailable_retry_at, attempts)
                 .await

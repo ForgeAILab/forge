@@ -8,6 +8,7 @@ use crate::{
     Result, ServiceError,
 };
 use api_types::{Actor, SystemComponent};
+use db::task_condition::channels;
 use db::{TaskRepo, TaskStep, TaskStepRepo, WorkflowReference};
 use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Duration};
@@ -1777,10 +1778,18 @@ impl TaskStepWorker {
         error: Option<&str>,
     ) -> Result<()> {
         let now = db::now_rfc3339();
-        let mut annotation = serde_json::json!({"type":kind, "state":step.expected_status, "message":error, "detected_at":now, "task_step_id":step.id});
-        if kind == api_types::FailureKind::WorkspaceError {
-            annotation["blocking_reason"] = serde_json::json!(error);
-        }
+        let mut annotation = serde_json::to_string(&channels::ErrorAnnotation::new(
+            channels::AnnotationShape::StepFailure(channels::StepFailureAnnotation {
+                kind,
+                state: step.expected_status.clone(),
+                message: error.map(str::to_owned),
+                detected_at: now.clone(),
+                task_step_id: step.id.clone(),
+                blocking_reason: (kind == api_types::FailureKind::WorkspaceError)
+                    .then(|| error.map(str::to_owned)),
+            }),
+        ))
+        .expect("condition channel serializes");
         if status != "parked" {
             if let Some(mut existing) = task
                 .error_annotation
@@ -1793,21 +1802,40 @@ impl TaskStepWorker {
                         .as_str()
                         .is_some_and(crate::task_dispatcher::is_blocking_annotation_type)
                 {
-                    existing["task_step_id"] = serde_json::json!(step.id);
-                    existing["task_step_error"] = serde_json::json!(error);
-                    annotation = existing;
+                    if let Some(mut typed) = task
+                        .error_annotation
+                        .as_deref()
+                        .and_then(|raw| serde_json::from_str::<channels::ErrorAnnotation>(raw).ok())
+                    {
+                        typed.set_step_failure(channels::StepFailureOverlay {
+                            task_step_id: step.id.clone(),
+                            task_step_error: error.map(str::to_owned),
+                        });
+                        annotation =
+                            serde_json::to_string(&typed).expect("condition channel serializes");
+                    } else {
+                        // Historical shapes retain the original merge, including unknown kinds.
+                        existing["task_step_id"] = serde_json::json!(step.id);
+                        existing["task_step_error"] = serde_json::json!(error);
+                        annotation = existing.to_string();
+                    }
                 }
             }
         }
         let blocked = (status == "parked").then(|| {
-            serde_json::json!({"reason":error, "blocked_at":now, "source":"workflow_loop"})
-                .to_string()
+            serde_json::to_string(&channels::Interruption {
+                reason: error.map(str::to_owned),
+                blocked_at: Some(Some(now.clone())),
+                source: Some(Some("workflow_loop".into())),
+                ..Default::default()
+            })
+            .expect("condition channel serializes")
         });
         let written = self
             .db
             .annotate_task_step_failure_in_tx(
                 tx,
-                annotation.to_string(),
+                annotation.clone(),
                 &blocked,
                 &now,
                 &step.task_id,
@@ -1821,7 +1849,7 @@ impl TaskStepWorker {
         self.db
             .state_condition_in_tx(tx, &step.task_id, db::ConditionChange::Legacy)
             .await?;
-        task.error_annotation = Some(annotation.to_string());
+        task.error_annotation = Some(annotation);
         if blocked.is_some() {
             task.blocked_json = blocked;
         }
@@ -1941,3 +1969,6 @@ pub(crate) mod condition_tests;
 
 #[cfg(test)]
 mod workflow_loop_tests;
+
+#[cfg(test)]
+pub(crate) mod writer_parity;

@@ -35,3 +35,97 @@ pub(crate) async fn merge_after_writer(
     );
     task
 }
+
+use super::writer_parity::{case, channel_sample};
+
+#[tokio::test]
+async fn queue_channels_and_overlays() {
+    for (kind, status, error) in [
+        (
+            api_types::FailureKind::CascadeFailed,
+            "failed",
+            Some("failed"),
+        ),
+        (
+            api_types::FailureKind::WorkspaceError,
+            "failed",
+            Some("workspace"),
+        ),
+        (api_types::FailureKind::WorkspaceError, "failed", None),
+        (api_types::FailureKind::WorkflowLoop, "parked", None),
+        (
+            api_types::FailureKind::MergeConflict,
+            "failed",
+            Some("merge"),
+        ),
+        (api_types::FailureKind::CiFailed, "failed", Some("ci")),
+    ] {
+        case!(
+            &format!("step-{kind}-{}", error.is_some()),
+            "in_progress",
+            f,
+            {
+                let worker = super::TaskStepWorker::new(f.ctx.task_service.clone());
+                let mut tx = f.db.pool().begin().await.unwrap();
+                let mut task = f.task.clone();
+                worker
+                    .write_annotation_in_tx(&mut tx, &f.step, &mut task, status, kind, error)
+                    .await
+                    .unwrap();
+                tx.commit().await.unwrap();
+            }
+        );
+    }
+    for sample in [
+        "executor",
+        "hold",
+        "script-hook",
+        "dispatch-state",
+        "dispatch-upgrade",
+        "lifecycle-reset",
+        "owner-recovery",
+        "removed-machine",
+        "recovered-task",
+        "budget",
+        "review-finding",
+        "workflow-guard",
+        "review-candidate",
+        "review-ci",
+        "placement",
+        "plan-wait",
+        "review-park-null",
+        "historical",
+    ] {
+        case!(&format!("overlay-{sample}"), "in_progress", f, {
+            let raw = if sample == "historical" {
+                "{\"type\":\"unknown\",\"extra\":true}".into()
+            } else {
+                channel_sample(sample)
+            };
+            sqlx::query("UPDATE task SET error_annotation=?,blocked_json='{}' WHERE id=?")
+                .bind(raw)
+                .bind(&f.task.id)
+                .execute(f.db.pool())
+                .await
+                .unwrap();
+            let mut task = db::TaskRepo::get_by_id(&*f.db, &f.task.id, false)
+                .await
+                .unwrap()
+                .unwrap();
+            let worker = super::TaskStepWorker::new(f.ctx.task_service.clone());
+            let mut tx = f.db.pool().begin().await.unwrap();
+            worker
+                .write_annotation_in_tx(
+                    &mut tx,
+                    &f.step,
+                    &mut task,
+                    "failed",
+                    api_types::FailureKind::CascadeFailed,
+                    Some("later hook failed"),
+                )
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+        });
+    }
+}

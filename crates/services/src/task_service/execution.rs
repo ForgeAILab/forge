@@ -1,11 +1,13 @@
 use super::*;
 use crate::agent_capacity::count_running_executions;
+use crate::condition_metadata::set_condition;
 use crate::turn_log_sink::TurnProgressObserver;
 use crate::workflow::dispatch::{
     build_effective_prompt, dispatch_intent_from_workflow_dispatch, effective_prompt_selection,
     loader::load_agent_dispatch_context,
 };
 use async_trait::async_trait;
+use db::task_condition::channels;
 use db::{UpdateTask, UpdateTaskStatus};
 use std::sync::{Mutex as StdMutex, OnceLock};
 
@@ -853,34 +855,22 @@ pub(super) async fn settle_plan_publication_for_review(
                 db::TaskMetadataMutation::Remove {
                     key: PLAN_PUBLICATION_CLAIM_KEY.to_owned(),
                 },
-                db::TaskMetadataMutation::Set {
-                    key: "awaiting_human".to_owned(),
-                    value: json!(true),
-                },
-                db::TaskMetadataMutation::Set {
-                    key: "awaiting_human_reason".to_owned(),
-                    value: json!("plan_review"),
-                },
-                db::TaskMetadataMutation::Set {
-                    key: "planning_completed_at".to_owned(),
-                    value: Value::String(now_rfc3339()),
-                },
-                db::TaskMetadataMutation::Set {
-                    key: "awaiting_human_marker_id".to_owned(),
-                    value: Value::String(new_uuid_v4()),
-                },
-                db::TaskMetadataMutation::Set {
-                    key: "planning_execution_id".to_owned(),
-                    value: Value::String(execution.id.clone()),
-                },
-                db::TaskMetadataMutation::Set {
-                    key: "planning_state_entry_token".to_owned(),
-                    value: claim
-                        .state_entry_token
-                        .clone()
-                        .map(Value::String)
-                        .unwrap_or(Value::Null),
-                },
+                set_condition(channels::ConditionMetadataValue::AwaitingHuman(true)),
+                set_condition(channels::ConditionMetadataValue::AwaitingHumanReason(
+                    "plan_review".into(),
+                )),
+                set_condition(channels::ConditionMetadataValue::PlanningCompletedAt(
+                    now_rfc3339(),
+                )),
+                set_condition(channels::ConditionMetadataValue::AwaitingHumanMarkerId(
+                    new_uuid_v4(),
+                )),
+                set_condition(channels::ConditionMetadataValue::PlanningExecutionId(
+                    execution.id.clone(),
+                )),
+                set_condition(channels::ConditionMetadataValue::PlanningStateEntryToken(
+                    claim.state_entry_token.clone(),
+                )),
                 db::TaskMetadataMutation::Set {
                     key: TERMINAL_EXECUTION_SETTLEMENT_KEY.to_owned(),
                     value: claim.value(),
@@ -1134,32 +1124,24 @@ pub(super) async fn set_planning_awaiting_review_metadata(
         .await?
         .map(|entry| entry.id);
         let mut next = vec![
-            db::TaskMetadataMutation::Set {
-                key: "awaiting_human".to_owned(),
-                value: json!(true),
-            },
-            db::TaskMetadataMutation::Set {
-                key: "awaiting_human_reason".to_owned(),
-                value: json!("plan_review"),
-            },
-            db::TaskMetadataMutation::Set {
-                key: "planning_completed_at".to_owned(),
-                value: Value::String(completed_at),
-            },
-            db::TaskMetadataMutation::Set {
-                key: "awaiting_human_marker_id".to_owned(),
-                value: Value::String(marker_id),
-            },
-            db::TaskMetadataMutation::Set {
-                key: "planning_state_entry_token".to_owned(),
-                value: state_entry_token.map(Value::String).unwrap_or(Value::Null),
-            },
+            set_condition(channels::ConditionMetadataValue::AwaitingHuman(true)),
+            set_condition(channels::ConditionMetadataValue::AwaitingHumanReason(
+                "plan_review".into(),
+            )),
+            set_condition(channels::ConditionMetadataValue::PlanningCompletedAt(
+                completed_at,
+            )),
+            set_condition(channels::ConditionMetadataValue::AwaitingHumanMarkerId(
+                marker_id,
+            )),
+            set_condition(channels::ConditionMetadataValue::PlanningStateEntryToken(
+                state_entry_token,
+            )),
         ];
         if let Some(execution_id) = execution_id {
-            next.push(db::TaskMetadataMutation::Set {
-                key: "planning_execution_id".to_owned(),
-                value: Value::String(execution_id.to_owned()),
-            });
+            next.push(set_condition(
+                channels::ConditionMetadataValue::PlanningExecutionId(execution_id.to_owned()),
+            ));
         }
         next
     } else if metadata
@@ -1305,3 +1287,6 @@ pub(crate) async fn clear_stale_planning_review_metadata(
     .await
     .map_err(Into::into)
 }
+
+#[cfg(test)]
+mod writer_parity_tests;

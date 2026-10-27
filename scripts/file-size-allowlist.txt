@@ -26,9 +26,9 @@
 2036 crates/services/src/task_dispatcher/tests/equivalence.rs
 2342 crates/services/src/task_dispatcher/tests/lead_check.rs
 2541 crates/services/src/task_dispatcher/tests/lead_operations.rs
-2858 crates/services/src/task_service/execution/runner.rs
+2857 crates/services/src/task_service/execution/runner.rs
 2113 crates/services/src/task_service/governance.rs
-10367 crates/services/src/task_service/tests/service_tests/cases/executions.rs
+10128 crates/services/src/task_service/tests/service_tests/cases/executions.rs
 4897 crates/services/src/workflow/actions/tests.rs
 2227 crates/services/src/workflow/dispatch/tests.rs
 5427 crates/services/src/workflow/engine/tests.rs

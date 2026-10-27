@@ -6228,6 +6228,19 @@ retains its match against pre-upgrade annotation bytes. Each case holds
 returns a fixed microsecond sequence on that thread and the comparison is exact
 on every platform.
 
+The additional writer corpus is pinned to main `94609411` and generated only
+against that archived production source. It retains exact legacy-column and
+`condition_json` strings, plus one SHA-256 per snapshot of the canonical JSON
+for read/public projections, offers and the interruption-event dedupe key.
+The existing UUID and wall-clock normalizations remain in place; the two
+wall-clock normalizers live in their calling tests. Shared writer support stays
+in `worker_runtime/queue/writer_parity.rs`; queue, owner-failure and
+executor-failure cases extend their existing `condition_tests` modules.
+Services metadata writers derive each set mutation's key from
+`ConditionMetadataValue::key()`. Executor-unavailable writers take a vector of
+`ExecutorRouteAttempt` from both local and remote producers; its stored array
+and sorted interruption JSON retain main's bytes.
+
 Stored condition
 bytes, public projections, offers, failure kinds, Operations text and Attention
 digests retain main `6120c133` behavior, including corruption repair, except for

@@ -1,6 +1,7 @@
 //! Review failure routing and automatic recovery dispatch.
 
 use super::*;
+use db::task_condition::channels;
 
 impl TaskService {
     pub(crate) async fn review_failure_target(
@@ -163,19 +164,24 @@ impl TaskService {
                 budget = i64::from(budget),
                 "review retry budget exhausted, blocking task"
             );
-            let blocked_meta = json!({
-                "reason": reason,
-                "created_at": now_rfc3339(),
-                "kind": api_types::FailureKind::ReviewGateFailed,
-                "source": null,
-                "execution_id": execution_id,
-            });
-            let annotation = json!({
-                "type": api_types::FailureKind::ReviewBudgetExhausted,
-                "blocking_reason": reason,
-                "message": reason,
-                "detected_at": now_rfc3339(),
-            });
+            let blocked_meta = serde_json::to_string(&channels::Interruption {
+                reason: Some(reason.into()),
+                created_at: Some(Some(now_rfc3339())),
+                kind: Some(Some(api_types::FailureKind::ReviewGateFailed.into())),
+                source: Some(None),
+                execution_id: Some(execution_id.map(str::to_owned)),
+                ..Default::default()
+            })
+            .expect("condition channel serializes");
+            let annotation = serde_json::to_string(&channels::ErrorAnnotation::new(
+                channels::AnnotationShape::Budget(channels::BudgetAnnotation {
+                    kind: api_types::FailureKind::ReviewBudgetExhausted,
+                    blocking_reason: reason.into(),
+                    message: reason.into(),
+                    detected_at: now_rfc3339(),
+                }),
+            ))
+            .expect("condition channel serializes");
             // A stale recovery snapshot must not annotate a successor state
             // or execution. Let the caller retry from current authority.
             let task = TaskRepo::update(
@@ -188,8 +194,8 @@ impl TaskService {
                     priority: None,
                     merge_config: None,
                     plan: None,
-                    error_annotation: Some(Some(annotation.to_string())),
-                    blocked_json: Some(Some(blocked_meta.to_string())),
+                    error_annotation: Some(Some(annotation)),
+                    blocked_json: Some(Some(blocked_meta)),
                     failed_json: Some(None),
                     task_state_config: None,
                     parent_task_id: None,
@@ -241,21 +247,25 @@ impl TaskService {
                     target = %target,
                     "review failure has no remediation target, blocking task"
                 );
-                let blocked_meta = json!({
-                    "reason": reason,
-                    "created_at": now_rfc3339(),
-                    "kind": api_types::FailureKind::ReviewGateFailed,
-                    "source": null,
-                    "execution_id": execution_id,
-                });
-                let annotation = json!({
-                    "type": api_types::FailureKind::ReviewGateFailed,
-                    "blocking_reason": reason,
-                    "message": format!(
-                        "{reason}: the review gate sends a failed review to `{target}`, which this workflow does not define"
-                    ),
-                    "detected_at": now_rfc3339(),
-                });
+                let blocked_meta = serde_json::to_string(&channels::Interruption {
+                    reason: Some(reason.into()),
+                    created_at: Some(Some(now_rfc3339())),
+                    kind: Some(Some(api_types::FailureKind::ReviewGateFailed.into())),
+                    source: Some(None),
+                    execution_id: Some(execution_id.map(str::to_owned)),
+                    ..Default::default()
+                })
+                .expect("condition channel serializes");
+                let annotation = channels::ErrorAnnotation::new(channels::AnnotationShape::Budget(
+                    channels::BudgetAnnotation {
+                        kind: api_types::FailureKind::ReviewGateFailed,
+                        blocking_reason: reason.into(),
+                        message: format!("{reason}: the review gate sends a failed review to `{target}`, which this workflow does not define"),
+                        detected_at: now_rfc3339(),
+                    },
+                ));
+                let annotation =
+                    serde_json::to_string(&annotation).expect("condition channel serializes");
                 let task = TaskRepo::update(
                     &*self.db,
                     UpdateTask {
@@ -266,8 +276,8 @@ impl TaskService {
                         priority: None,
                         merge_config: None,
                         plan: None,
-                        error_annotation: Some(Some(annotation.to_string())),
-                        blocked_json: Some(Some(blocked_meta.to_string())),
+                        error_annotation: Some(Some(annotation)),
+                        blocked_json: Some(Some(blocked_meta)),
                         failed_json: Some(None),
                         task_state_config: None,
                         parent_task_id: None,
@@ -632,3 +642,6 @@ impl TaskService {
             .is_some_and(|gate_config| gate_config.requires_user_approval()))
     }
 }
+
+#[cfg(test)]
+mod writer_parity_tests;

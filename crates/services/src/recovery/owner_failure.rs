@@ -1,6 +1,7 @@
 //! Owner failure annotation and cleanup receipts.
 
 use super::*;
+use db::task_condition::channels;
 
 pub(super) async fn fail_placement_executions(
     db: &SqliteDb,
@@ -145,11 +146,17 @@ async fn annotate_owner_recovery(
                 existing_reason.as_deref(),
                 Some("owner_disconnected_timeout" | "owner_lost_execution")
             ));
-    let annotation = json!({"type": api_types::FailureKind::RecoveryRequired,
-            "blocking_reason": cause.to_string(), "blocked_by": actor.display(),
-            "blocked_at": now_rfc3339(), "blocked_execution_id": execution.id,
-            "message": format!("Workspace owner recovery required: {cause}"),
-    });
+    let annotation = serde_json::to_string(&channels::ErrorAnnotation::new(
+        channels::AnnotationShape::RecoveryExecution(channels::RecoveryExecutionAnnotation {
+            kind: api_types::FailureKind::RecoveryRequired,
+            blocking_reason: cause.to_string(),
+            blocked_by: actor.display(),
+            blocked_at: now_rfc3339(),
+            blocked_execution_id: Some(execution.id.clone()),
+            message: format!("Workspace owner recovery required: {cause}"),
+        }),
+    ))
+    .expect("condition channel serializes");
     if can_annotate {
         // The heartbeat runs outside the Task lease, so this blocking
         // annotation is usually queued. It must never be dropped by a status
@@ -167,7 +174,7 @@ async fn annotate_owner_recovery(
                 &mut transaction,
                 &task.id,
                 db::AnnotateOwnerRecoveryInTxInput {
-                    annotation: annotation.to_string(),
+                    annotation,
                     updated_at: now_rfc3339(),
                     task_id: &task.id,
                     expected_version: task.version,
@@ -272,17 +279,15 @@ pub(super) async fn annotate_owner_workspace_reset(
     {
         return Ok(());
     }
-    let annotation = db::task_condition::channels::ErrorAnnotation::new(
-        db::task_condition::channels::AnnotationShape::TimedBlock(
-            db::task_condition::channels::TimedBlockAnnotation {
-                kind: api_types::FailureKind::WorkspaceResetRequired,
-                blocked_at: now_rfc3339(),
-                blocked_by: actor.display(),
-                blocking_reason: "owner_workspace_reset_required".into(),
-                message: message.into(),
-            },
-        ),
-    );
+    let annotation = channels::ErrorAnnotation::new(channels::AnnotationShape::TimedBlock(
+        channels::TimedBlockAnnotation {
+            kind: api_types::FailureKind::WorkspaceResetRequired,
+            blocked_at: now_rfc3339(),
+            blocked_by: actor.display(),
+            blocking_reason: "owner_workspace_reset_required".into(),
+            message: message.into(),
+        },
+    ));
     let annotation = serde_json::to_string(&annotation).map_err(|error| {
         ServiceError::invalid_operation(format!(
             "failed to serialize workspace-reset annotation: {error}"
