@@ -1262,9 +1262,7 @@ pub struct CreateProjectTaskGovernance {
 /// Atomic Task proposal composite.  The Task row, optional immutable
 /// governance projection, prerequisite dependencies, explicit/default role
 /// assignments, durable `task.created` event, and direct command receipt
-/// are committed by one SQLite transaction. The command
-/// receipt is optional only for repository-level characterization callers;
-/// the service command always supplies it.
+/// are committed by one SQLite transaction. A command receipt is required.
 #[derive(Debug, Clone)]
 pub struct CreateTaskProposalCommand {
     pub task: CreateTask,
@@ -1286,7 +1284,7 @@ pub struct CreateTaskProposalCommand {
     pub source_policy_digest: Option<String>,
     pub executor_type: String,
     pub executor_id: String,
-    pub command_receipt: Option<CreateCommandReceipt>,
+    pub command_receipt: CreateCommandReceipt,
 }
 
 /// One bounded child payload for an adaptive Task split.  The payload is

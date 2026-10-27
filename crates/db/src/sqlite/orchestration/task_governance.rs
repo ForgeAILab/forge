@@ -16,26 +16,10 @@ async fn recheck_task_proposal_authorization_in_tx(
     {
         return Err(DbError::IdempotencyConflict);
     }
-    let (actor_identity_id, scope_type, scope_id, operation, requested_permission, policy_result) = (
-        input.source_actor_identity_id.clone(),
-        input.source_scope_type.clone(),
-        input.source_scope_id.clone(),
-        input.source_operation.clone(),
-        input.source_requested_permission.clone(),
-        input.source_policy_result.clone(),
-    );
-
-    if operation != "task.propose"
-        || requested_permission != "propose_task"
-        || policy_result != input.source_policy_result
-        || receipt.policy_result != policy_result
-    {
-        return Err(DbError::IdempotencyConflict);
-    }
     if !action_scope_resolves_to_command_scope(
         transaction,
-        &scope_type,
-        &scope_id,
+        &input.source_scope_type,
+        &input.source_scope_id,
         "project",
         &input.task.project_id,
     )
@@ -53,7 +37,7 @@ async fn recheck_task_proposal_authorization_in_tx(
                 selected_profile_id
          FROM agent_identity WHERE id = ? LIMIT 1",
     )
-    .bind(&actor_identity_id)
+    .bind(&input.source_actor_identity_id)
     .fetch_optional(&mut **transaction)
     .await?
     .ok_or(DbError::NotFound)?;
@@ -75,7 +59,7 @@ async fn recheck_task_proposal_authorization_in_tx(
          WHERE id = ? AND identity_id = ? LIMIT 1",
     )
     .bind(selected_profile_id)
-    .bind(&actor_identity_id)
+    .bind(&input.source_actor_identity_id)
     .fetch_optional(&mut **transaction)
     .await?;
     if !profile_policy
@@ -92,7 +76,7 @@ async fn recheck_task_proposal_authorization_in_tx(
          LIMIT 1",
     )
     .bind(&input.task.project_id)
-    .bind(&actor_identity_id)
+    .bind(&input.source_actor_identity_id)
     .fetch_optional(&mut **transaction)
     .await?;
     let Some(binding) = binding else {
@@ -119,7 +103,7 @@ async fn recheck_task_proposal_authorization_in_tx(
 
     match input.executor_type.as_str() {
         "agent" => {
-            if input.executor_id != actor_identity_id {
+            if input.executor_id != input.source_actor_identity_id {
                 return Err(DbError::IdempotencyConflict);
             }
             let identity_exists: Option<i64> =
@@ -410,11 +394,11 @@ pub(super) async fn create_task_proposal_command(
 
     // Receipt lookup is deliberately the first operation.  A response
     // loss must replay the frozen Task even if the binding or baseline has
-    // since moved on; changed input/principal is
-    // rejected by the canonical receipt identity before any current
-    // authorization read can produce a different answer.
+    // since moved on; changed input/principal is rejected by the canonical
+    // receipt identity before any current authorization read can produce a
+    // different answer.
     if let Some(receipt) =
-        resolve_command_replay(db, &mut transaction, input.command_receipt.as_ref()).await?
+        resolve_command_replay(db, &mut transaction, Some(&input.command_receipt)).await?
     {
         let task_id = command_outcome_string(&receipt, "task_id")?;
         let task_snapshot = command_outcome_task(&receipt)?;
@@ -440,10 +424,7 @@ pub(super) async fn create_task_proposal_command(
         });
     }
 
-    let receipt = input
-        .command_receipt
-        .as_ref()
-        .ok_or_else(|| DbError::Check("task proposal requires a command receipt".to_owned()))?;
+    let receipt = &input.command_receipt;
     if receipt.operation != "task.propose"
         || receipt.scope_type != "project"
         || receipt.scope_id != input.task.project_id
@@ -707,19 +688,17 @@ pub(super) async fn create_task_proposal_command(
     DomainEventRepo::append_event_in_tx(db, &mut transaction, &event).await?;
 
     let mut receipt = input.command_receipt;
-    if let Some(receipt) = receipt.as_mut() {
-        let mut outcome: serde_json::Value = serde_json::from_str(&receipt.outcome_json)
-            .map_err(|_| DbError::IdempotencyConflict)?;
-        outcome["task_id"] = serde_json::Value::String(frozen_task.id.clone());
-        outcome["task"] = serde_json::to_value(&frozen_task).map_err(|error| {
-            DbError::Check(format!(
-                "Task proposal outcome serialization failed: {error}"
-            ))
-        })?;
-        receipt.outcome_json =
-            serde_json::to_string(&outcome).map_err(|_| DbError::IdempotencyConflict)?;
-    }
-    finalize_command_in_tx(db, &mut transaction, &event.id, receipt, None).await?;
+    let mut outcome: serde_json::Value =
+        serde_json::from_str(&receipt.outcome_json).map_err(|_| DbError::IdempotencyConflict)?;
+    outcome["task_id"] = serde_json::Value::String(frozen_task.id.clone());
+    outcome["task"] = serde_json::to_value(&frozen_task).map_err(|error| {
+        DbError::Check(format!(
+            "Task proposal outcome serialization failed: {error}"
+        ))
+    })?;
+    receipt.outcome_json =
+        serde_json::to_string(&outcome).map_err(|_| DbError::IdempotencyConflict)?;
+    finalize_command_in_tx(db, &mut transaction, &event.id, Some(receipt), None).await?;
     transaction.commit().await?;
     Ok(CreatedTaskProposal {
         task: frozen_task,

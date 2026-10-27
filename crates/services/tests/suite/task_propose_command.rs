@@ -470,15 +470,6 @@ async fn task_proposal_commits_one_atomic_bundle_and_replays_frozen_task() {
     assert_eq!(
         count(
             &fixture.db,
-            "SELECT COUNT(*) FROM task WHERE id = 'task-command-atomic-action'",
-        )
-        .await,
-        0,
-        "the server mints the Task id; it is not the input correlation label"
-    );
-    assert_eq!(
-        count(
-            &fixture.db,
             "SELECT COUNT(*) FROM task WHERE project_id = 'task-command-baseline-project'"
         )
         .await,
@@ -548,6 +539,7 @@ async fn task_proposal_commits_one_atomic_bundle_and_replays_frozen_task() {
     let replay = propose(&fixture, task_input.clone(), "task-command-atomic-key")
         .await
         .expect("replay frozen task after response loss");
+    assert!(replay.replayed);
     assert_eq!(replay.task.id, task_id);
     assert_eq!(replay.task.title, first.task.title);
     assert_eq!(

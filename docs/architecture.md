@@ -2238,7 +2238,7 @@ possible for locally managed CLI authentication). A missing Worker or
 reviewer is a typed `setup_required` blocker in the current setup projection;
 it is not an operator-only log or an executable success. Replays reuse the
 operation, checkpoint target path, directory, repository row, Project link,
-and role set. Agent `task.propose` executions on a
+and role set. Agent `task.propose` invocations on a
 Charter-backed Project without an explicit governance envelope are bound
 server-side to the current approved Charter; the proposal payload carries only
 `plan_item_id` (required for implementation Tasks), optional `milestone_id`

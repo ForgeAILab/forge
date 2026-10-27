@@ -583,7 +583,7 @@ impl TaskService {
                 source_policy_digest: policy_digest.map(str::to_owned),
                 executor_type: executed_by_type.to_owned(),
                 executor_id: executed_by_id.to_owned(),
-                command_receipt: Some(receipt),
+                command_receipt: receipt,
             },
         )
         .await
