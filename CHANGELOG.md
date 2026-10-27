@@ -172,6 +172,14 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   memo/heap telemetry and follow-up documentation/spec sign-off remain open in
   the change tracker.
 
+### Security
+
+- zstd compression, used for session journal packs, protected-store payloads
+  and HTTP response compression, moves to `zstd` 0.14.3, `zstd-safe` 8.2.0 and
+  `zstd-sys` 2.1.2 (RUSTSEC-2026-0391, RUSTSEC-2026-0398, RUSTSEC-2026-0403,
+  RUSTSEC-2026-0410). The on-disk format is unchanged; existing packs read as
+  before.
+
 ## [0.14.1] - 2026-10-21
 
 ### Security
