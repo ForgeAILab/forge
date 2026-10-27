@@ -1,6 +1,7 @@
 //! A review candidate may be an Agent delivery or a human branch submission.
 use super::*;
 use ::review::ReviewWorkspace;
+use db::task_condition::channels as channel;
 use db::{Project, UpdateTask};
 
 pub(crate) const MISSING_REVIEW_CANDIDATE: &str = "review_candidate_missing";
@@ -351,14 +352,27 @@ impl TaskService {
                 merge_config: None,
                 plan: None,
                 error_annotation: Some(Some(
-                    json!({"type":api_types::FailureKind::ReviewBlocked,
-                "blocking_reason":MISSING_REVIEW_CANDIDATE,"message":message,"blocked_at":now})
-                    .to_string(),
+                    serde_json::to_string(&channel::ErrorAnnotation::new(
+                        channel::AnnotationShape::ReviewCandidate(
+                            channel::ReviewCandidateAnnotation {
+                                kind: api_types::FailureKind::ReviewBlocked,
+                                blocking_reason: MISSING_REVIEW_CANDIDATE.into(),
+                                message: message.clone(),
+                                blocked_at: now.clone(),
+                            },
+                        ),
+                    ))
+                    .expect("review candidate annotation serializes"),
                 )),
                 blocked_json: Some(Some(
-                    json!({"kind":api_types::FailureKind::ReviewBlocked,
-                "reason":reason,"created_at":now,"execution_id":null})
-                    .to_string(),
+                    serde_json::to_string(&channel::Interruption {
+                        kind: Some(Some(api_types::FailureKind::ReviewBlocked.into())),
+                        reason: Some(reason.clone()),
+                        created_at: Some(Some(now.clone())),
+                        execution_id: Some(None),
+                        ..Default::default()
+                    })
+                    .expect("review candidate interruption serializes"),
                 )),
                 failed_json: Some(None),
                 task_state_config: None,

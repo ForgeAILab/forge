@@ -11,7 +11,7 @@ struct DemoTask {
     description: &'static str,
     status: &'static str,
     priority: i64,
-    error_annotation: Option<&'static str>,
+    error_annotation: Option<(api_types::FailureKind, &'static str)>,
 }
 
 const DEMO_TASKS: &[DemoTask] = &[
@@ -104,18 +104,20 @@ const DEMO_TASKS: &[DemoTask] = &[
         description: "Move session storage from in-memory to Redis for horizontal scaling.",
         status: "blocked",
         priority: 6,
-        error_annotation: Some(
-            r#"{"type":"workspace_reset_required","message":"workspace reset required: task branch no longer exists in repo"}"#,
-        ),
+        error_annotation: Some((
+            api_types::FailureKind::WorkspaceResetRequired,
+            "workspace reset required: task branch no longer exists in repo",
+        )),
     },
     DemoTask {
         title: "Upgrade OpenAPI spec generator",
         description: "Update codegen tooling to v4 for better TypeScript output.",
         status: "blocked",
         priority: 4,
-        error_annotation: Some(
-            r#"{"type":"workspace_error","message":"workspace error: repository directory not found on disk"}"#,
-        ),
+        error_annotation: Some((
+            api_types::FailureKind::WorkspaceError,
+            "workspace error: repository directory not found on disk",
+        )),
     },
 ];
 
@@ -377,7 +379,17 @@ async fn install_demo_tasks(
         )
         .await?;
 
-        if let Some(annotation) = demo_task.error_annotation {
+        if let Some((kind, message)) = demo_task.error_annotation {
+            use db::task_condition::channels::{
+                AnnotationShape, ErrorAnnotation, MessageAnnotation,
+            };
+            let annotation = serde_json::to_string(&ErrorAnnotation::new(
+                AnnotationShape::Message(MessageAnnotation {
+                    kind,
+                    message: message.into(),
+                }),
+            ))
+            .expect("demo annotation serializes");
             TaskRepo::update(
                 db,
                 UpdateTask {
@@ -388,7 +400,7 @@ async fn install_demo_tasks(
                     priority: None,
                     merge_config: None,
                     plan: None,
-                    error_annotation: Some(Some(annotation.to_owned())),
+                    error_annotation: Some(Some(annotation)),
                     blocked_json: None,
                     failed_json: None,
                     task_state_config: None,
@@ -598,3 +610,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod condition_tests;

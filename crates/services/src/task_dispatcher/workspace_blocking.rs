@@ -1,4 +1,4 @@
-use db::{Task, TaskRepo, UpdateTask};
+use db::{task_condition::channels as channel, Task, TaskRepo, UpdateTask};
 
 use crate::{Result, ServiceError};
 
@@ -10,13 +10,16 @@ impl TaskDispatcher {
         task: &Task,
         error: &ServiceError,
     ) -> Result<()> {
-        let annotation = serde_json::json!({
-            "type": api_types::FailureKind::WorkspaceResetRequired,
-            "blocking_reason": "workspace_error",
-            "blocked_by": api_types::Actor::system(api_types::SystemComponent::TaskDispatcher).display(),
-            "blocked_at": db::now_rfc3339(),
-            "message": error.to_string(),
-        });
+        let annotation = channel::ErrorAnnotation::new(channel::AnnotationShape::TimedBlock(
+            channel::TimedBlockAnnotation {
+                kind: api_types::FailureKind::WorkspaceResetRequired,
+                blocking_reason: "workspace_error".into(),
+                blocked_by: api_types::Actor::system(api_types::SystemComponent::TaskDispatcher)
+                    .display(),
+                blocked_at: db::now_rfc3339(),
+                message: error.to_string(),
+            },
+        ));
         TaskRepo::update(
             &*self.db,
             UpdateTask {
@@ -27,7 +30,9 @@ impl TaskDispatcher {
                 priority: None,
                 merge_config: None,
                 plan: None,
-                error_annotation: Some(Some(annotation.to_string())),
+                error_annotation: Some(Some(
+                    serde_json::to_string(&annotation).expect("workspace annotation serializes"),
+                )),
                 blocked_json: None,
                 failed_json: None,
                 task_state_config: None,
@@ -52,13 +57,16 @@ impl TaskDispatcher {
         task: &Task,
         error: &ServiceError,
     ) -> Result<()> {
-        let annotation = serde_json::json!({
-            "type": api_types::FailureKind::WorkspaceError,
-            "blocking_reason": "workspace_error",
-            "blocked_by": api_types::Actor::system(api_types::SystemComponent::TaskDispatcher).display(),
-            "blocked_at": db::now_rfc3339(),
-            "message": error.to_string(),
-        });
+        let annotation = channel::ErrorAnnotation::new(channel::AnnotationShape::TimedBlock(
+            channel::TimedBlockAnnotation {
+                kind: api_types::FailureKind::WorkspaceError,
+                blocking_reason: "workspace_error".into(),
+                blocked_by: api_types::Actor::system(api_types::SystemComponent::TaskDispatcher)
+                    .display(),
+                blocked_at: db::now_rfc3339(),
+                message: error.to_string(),
+            },
+        ));
         TaskRepo::update(
             &*self.db,
             UpdateTask {
@@ -69,7 +77,9 @@ impl TaskDispatcher {
                 priority: None,
                 merge_config: None,
                 plan: None,
-                error_annotation: Some(Some(annotation.to_string())),
+                error_annotation: Some(Some(
+                    serde_json::to_string(&annotation).expect("workspace annotation serializes"),
+                )),
                 blocked_json: None,
                 failed_json: None,
                 task_state_config: None,
@@ -89,3 +99,6 @@ impl TaskDispatcher {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod condition_tests;

@@ -1,6 +1,7 @@
 use super::*;
 use ::review::ReviewWorkspace;
 use api_types::Actor;
+use db::task_condition::channels as channel;
 /// What a stopped execution of the retired inline review re-run says while
 /// its Task is on hold. The release looks for it and runs the review entry.
 pub(crate) const RETIRED_REVIEW_RERUN_HELD: &str =
@@ -186,29 +187,93 @@ impl TaskService {
         } else {
             "review_ci_unavailable"
         };
-        barrier["state"] = json!(task.status);
-        barrier["status"] = json!("blocked");
-        barrier["updated_at"] = json!(now);
-        barrier["interrupted_at"] = json!(now);
-        barrier["blocking_reason"] = json!(reason);
-        let annotation = json!({"type":if reset {api_types::FailureKind::WorkspaceResetRequired} else {api_types::FailureKind::BeforeWorkHookFailed},"blocking_reason":kind,"blocked_at":now,"blocked_by":"system:workflow","message":reason});
-        let deferral = retry.then(|| json!({
-            "target_state": task.status, "reason": reason,
-            "not_before": (Utc::now() + chrono::Duration::seconds(5 * (1_i64 << attempts.saturating_sub(1).clamp(0,4)))).to_rfc3339(),
-        }).to_string());
-        let changed = self.db.record_review_ci_failure_in_tx(
-            &mut tx,
-            db::RecordReviewCiFailureInTxInput {
-                entry_barrier_json: barrier.to_string(),
-                error_annotation: annotation.to_string(),
-                blocked_json: (!retry).then(|| json!({"kind": if reset { api_types::FailureKind::WorkspaceResetRequired } else { api_types::FailureKind::BeforeWorkHookFailed }, "reason": reason, "created_at": now, "execution_id": null}).to_string()),
-                deferral: &deferral,
-                updated_at: &now,
-                task_id: &task.id,
-                version: task.version,
-                status: &task.status,
+        let barrier = if let Ok(mut typed) =
+            serde_json::from_value::<channel::EntryBarrier>(barrier.clone())
+        {
+            typed.state = task.status.clone();
+            typed.status = channel::BarrierStatus::Blocked;
+            typed.updated_at = Some(Some(now.clone()));
+            typed.interrupted_at = Some(Some(now.clone()));
+            typed.blocking_reason = Some(Some(reason.into()));
+            serde_json::to_string(&typed).expect("review barrier serializes")
+        } else if task.entry_barrier_json.is_none() {
+            serde_json::to_string(&channel::EntryBarrier {
+                state: task.status.clone(),
+                status: channel::BarrierStatus::Blocked,
+                updated_at: Some(Some(now.clone())),
+                interrupted_at: Some(Some(now.clone())),
+                blocking_reason: Some(Some(reason.into())),
+                started_at: None,
+            })
+            .expect("review barrier serializes")
+        } else {
+            // Keep main's merge for historical or noncanonical barriers.
+            barrier["state"] = json!(task.status);
+            barrier["status"] = json!("blocked");
+            barrier["updated_at"] = json!(now);
+            barrier["interrupted_at"] = json!(now);
+            barrier["blocking_reason"] = json!(reason);
+            barrier.to_string()
+        };
+        let annotation = channel::ErrorAnnotation::new(channel::AnnotationShape::TimedBlock(
+            channel::TimedBlockAnnotation {
+                kind: if reset {
+                    api_types::FailureKind::WorkspaceResetRequired
+                } else {
+                    api_types::FailureKind::BeforeWorkHookFailed
+                },
+                blocking_reason: kind.into(),
+                blocked_at: now.clone(),
+                blocked_by: "system:workflow".into(),
+                message: reason.into(),
             },
-        ).await?;
+        ));
+        let deferral = retry.then(|| {
+            serde_json::to_string(&channel::DeferredDispatch {
+                target_state: task.status.clone(),
+                reason: reason.into(),
+                kind: None,
+                not_before: (Utc::now()
+                    + chrono::Duration::seconds(
+                        5 * (1_i64 << attempts.saturating_sub(1).clamp(0, 4)),
+                    ))
+                .to_rfc3339(),
+            })
+            .expect("review deferral serializes")
+        });
+        let changed = self
+            .db
+            .record_review_ci_failure_in_tx(
+                &mut tx,
+                db::RecordReviewCiFailureInTxInput {
+                    entry_barrier_json: barrier,
+                    error_annotation: serde_json::to_string(&annotation)
+                        .expect("review annotation serializes"),
+                    blocked_json: (!retry).then(|| {
+                        serde_json::to_string(&channel::Interruption {
+                            kind: Some(Some(
+                                if reset {
+                                    api_types::FailureKind::WorkspaceResetRequired
+                                } else {
+                                    api_types::FailureKind::BeforeWorkHookFailed
+                                }
+                                .into(),
+                            )),
+                            reason: Some(reason.into()),
+                            created_at: Some(Some(now.clone())),
+                            execution_id: Some(None),
+                            ..Default::default()
+                        })
+                        .expect("review interruption serializes")
+                    }),
+                    deferral: &deferral,
+                    updated_at: &now,
+                    task_id: &task.id,
+                    version: task.version,
+                    status: &task.status,
+                },
+            )
+            .await?;
         // Runs in the Task's review hook step; a queued write would make the
         // attention and returned Task below untruthful.
         if changed.require_applied()? != 1 {

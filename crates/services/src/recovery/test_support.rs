@@ -134,3 +134,6 @@ pub(crate) async fn seed_task_with_assignee(
 
 #[cfg(test)]
 pub(crate) mod conditions;
+
+#[cfg(test)]
+pub(crate) mod writer_fixture;

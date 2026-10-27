@@ -8,6 +8,7 @@
 //! carries the same receipt. When the budget is spent the root is blocked
 //! with a typed `budget_exhausted{replan}` park instead.
 use super::*;
+use db::task_condition::channels as channel;
 
 /// The blocker text of a root whose re-plan budget is spent.
 pub(crate) const REPLAN_EXHAUSTED_REASON: &str = "re-plan budget exhausted";
@@ -64,19 +65,22 @@ impl TaskService {
             "{REPLAN_EXHAUSTED_REASON}: the lead of this root already re-planned {} times; {trigger}",
             db::budget::Kind::Replan.default_limit()
         );
-        let blocked_meta = json!({
-            "reason": REPLAN_EXHAUSTED_REASON,
-            "created_at": now_rfc3339(),
-            "kind": api_types::FailureKind::RetryExhausted,
-            "source": REPLAN_BLOCK_SOURCE,
-            "execution_id": null,
-        });
-        let annotation = json!({
-            "type": api_types::FailureKind::RetryExhausted,
-            "blocking_reason": REPLAN_EXHAUSTED_REASON,
-            "message": message,
-            "detected_at": now_rfc3339(),
-        });
+        let blocked_meta = channel::Interruption {
+            reason: Some(REPLAN_EXHAUSTED_REASON.into()),
+            created_at: Some(Some(now_rfc3339())),
+            kind: Some(Some(api_types::FailureKind::RetryExhausted.into())),
+            source: Some(Some(REPLAN_BLOCK_SOURCE.into())),
+            execution_id: Some(None),
+            ..Default::default()
+        };
+        let annotation = channel::ErrorAnnotation::new(channel::AnnotationShape::Budget(
+            channel::BudgetAnnotation {
+                kind: api_types::FailureKind::RetryExhausted,
+                blocking_reason: REPLAN_EXHAUSTED_REASON.into(),
+                message,
+                detected_at: now_rfc3339(),
+            },
+        ));
         let task = TaskRepo::update(
             &*self.db,
             db::UpdateTask {
@@ -87,8 +91,12 @@ impl TaskService {
                 priority: None,
                 merge_config: None,
                 plan: None,
-                error_annotation: Some(Some(annotation.to_string())),
-                blocked_json: Some(Some(blocked_meta.to_string())),
+                error_annotation: Some(Some(
+                    serde_json::to_string(&annotation).expect("budget annotation serializes"),
+                )),
+                blocked_json: Some(Some(
+                    serde_json::to_string(&blocked_meta).expect("budget interruption serializes"),
+                )),
                 failed_json: Some(None),
                 task_state_config: None,
                 parent_task_id: None,

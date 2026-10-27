@@ -118,6 +118,18 @@ future lease, avoiding a real-time deadline and mixed RFC3339 text ordering.
 SQL trigger timestamps remain outside these compared fields; they are not
 rewritten by the harness. Production builds keep the wall clock unchanged.
 
+The additional condition writers use the shared
+`recovery/test_support/writer_fixture.rs` harness for setup, stored-row snapshots,
+a following metadata write, and queue overlays. Its expected fingerprints live in
+`recovery/test_support/writer_fixture/fixtures/main-94609411.jsonl`; the budget
+writer keeps raw snapshots in `db/src/budget/fixtures/main-94609411.jsonl`.
+Each corpus has one provenance row per case with archived-main writer locations.
+Snapshot options explicitly name wall-clock fields to normalize and whether to
+read offers through the Task's workflow. Both service harnesses share ID
+normalization, byte fingerprints, and canonical Attention incident digests.
+Expected records must come from the harness running against the archived main
+source, never from the branch being checked.
+
 ### Test features and required-features
 
 `forge-agent-host`, `services` and `db` do not dev-depend on themselves.
