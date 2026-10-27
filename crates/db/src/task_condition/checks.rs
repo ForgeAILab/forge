@@ -31,7 +31,7 @@ fn condition_page_select(resuming: bool) -> String {
 pub struct ConditionCheckPass {
     pub checked: u64,
     pub repaired: u64,
-    /// Digest-only stamps included in revision-walk progress.
+    /// Digest-only stamps tracked separately from steady-pass repairs.
     pub stamped: u64,
     /// Tasks whose stored condition is a newer build's encoding. They are
     /// read, counted and left byte for byte; nothing here repairs them.
@@ -119,8 +119,8 @@ pub(super) struct Repair {
 struct Page {
     checked: u64,
     repaired: u64,
-    /// Adding a digest to an otherwise matching readable cache is an
-    /// upgrade, never an invariant incident reported to the operator.
+    /// Adding or refreshing a digest on an otherwise matching readable cache
+    /// is never an invariant incident reported to the operator.
     encoding_repairs: u64,
     /// Ids on this page left quarantined.
     quarantined: Vec<String>,
@@ -271,7 +271,7 @@ impl SqliteDb {
             });
             (backfilling, completed)
         };
-        if page.repaired != 0 && !backfilling {
+        if page.repaired != page.encoding_repairs && !backfilling {
             tracing::warn!(
                 checked = page.checked,
                 repaired = page.repaired,
@@ -455,10 +455,14 @@ impl SqliteDb {
             match expected {
                 Ok((condition, digest)) => {
                     let read_digest: Option<String> = row.try_get("condition_digest")?;
-                    let stamp_only = read_digest.is_none()
-                        && matches!(&classified,
-                        Stored::Readable(prior) if prior.can_stamp(&condition));
                     let expected = encode(&condition);
+                    let stamp_only = match &classified {
+                        Stored::Readable(prior) if read_digest.is_none() => {
+                            prior.can_stamp(&condition)
+                        }
+                        Stored::Readable(_) => stored == expected.as_bytes(),
+                        _ => false,
+                    };
                     if read_digest.as_deref() != Some(digest.as_str())
                         || !TaskCondition::stored_agrees(&stored, &condition, &expected)
                     {

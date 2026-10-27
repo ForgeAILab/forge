@@ -118,6 +118,52 @@ async fn repairing_pass_is_reported_until_the_next_clean_pass() {
         .await
         .unwrap();
     }
+    // Both steady check paths must keep digest-only refreshes quiet.
+    db::SystemSettingRepo::set_setting(
+        &*db,
+        db::MAPPING_REVISION_KEY,
+        &db::MAPPING_REVISION.to_string(),
+        &db::now_rfc3339(),
+    )
+    .await
+    .unwrap();
+    assert!(!db.backfill_task_conditions_if_stale().await.unwrap());
+    use tracing::instrument::WithSubscriber;
+    let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    #[derive(Clone)]
+    struct LogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for LogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            std::io::Write::write(&mut *self.0.lock().unwrap(), bytes)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let writer = LogWriter(logs.clone());
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(move || writer.clone())
+        .finish();
+    async {
+        sqlx::query("UPDATE task SET condition_digest='stale'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        db.check_task_conditions_of(&["a".into()]).await.unwrap();
+        db.check_task_conditions(db::CONDITION_CHECK_PAGE)
+            .await
+            .unwrap();
+    }
+    .with_subscriber(subscriber)
+    .await;
+    let pass = db.condition_check_status().last_pass.unwrap();
+    assert_eq!((pass.repaired, pass.stamped), (0, 2));
+    assert!(status(&db).await.recent_errors.is_empty());
+    assert!(!String::from_utf8(logs.lock().unwrap().clone())
+        .unwrap()
+        .contains("Task condition invariant check repaired rows"));
     // Corrupt, not a newer encoding: the check restates it.
     sqlx::query("UPDATE task SET condition_json='{}' WHERE id='a'")
         .execute(db.pool())

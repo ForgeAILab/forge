@@ -128,6 +128,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   recorded before this fix cannot tell `unavailable` or `pending` from
   `blocked` and still replay as `blocked`. A retry that changes only the
   `display_name` or the status now returns 409 `idempotency_conflict`.
+- The Task condition check no longer reports a Task as repaired in operator
+  status when only its cached condition digest was stale and the stored
+  condition was already correct. It refreshes the digest quietly.
 - Whether a Project capacity wait is "at capacity" or "waiting on owner" is
   now recorded as a typed field instead of being read from the message wording.
   Existing waits keep their classification.
