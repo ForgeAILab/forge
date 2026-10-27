@@ -737,7 +737,7 @@ mod tests {
     async fn condition_mapping_blocks_exactly_where_the_dispatcher_blocks() {
         assert!(std::ptr::eq(
             helpers::BLOCKING_ANNOTATION_KINDS,
-            db::LEGACY_BLOCKING_ANNOTATION_KINDS
+            db::BLOCKING_ANNOTATION_KINDS
         ));
         let (db, project) = fixture().await;
         let template = task(&db, &project, "todo", None).await;
@@ -820,7 +820,7 @@ mod tests {
                 legacy.blocked_json = blocked_json.map(str::to_owned);
                 legacy.failed_json = failed_json.map(str::to_owned);
                 let dispatcher_blocks = helpers::has_blocking_annotation(&legacy);
-                let condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&legacy));
+                let condition = db::compose_condition(&db::ConditionInput::from(&legacy));
                 assert_eq!(
                     condition.is_blocked(),
                     dispatcher_blocks,
@@ -832,7 +832,7 @@ mod tests {
                 blocked += usize::from(dispatcher_blocks);
             }
             assert_eq!(
-                db::legacy_annotation_blocks(annotation.as_deref()),
+                db::annotation_blocks_dispatch(annotation.as_deref()),
                 helpers::has_blocking_annotation(&db::Task {
                     condition: Default::default(),
                     error_annotation: annotation.clone(),

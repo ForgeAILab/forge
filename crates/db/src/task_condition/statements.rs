@@ -100,7 +100,7 @@ impl ConditionStatement {
 
     /// Whether another writer's reason survives this statement.
     fn carries(&self, reason: &ParkReason) -> bool {
-        use LegacyConditionField as Field;
+        use ConditionField as Field;
         match reason {
             ParkReason::Integration { .. } | ParkReason::Check { .. } => true,
             ParkReason::EntryBlocked { .. }
@@ -135,7 +135,7 @@ impl ConditionStatement {
         }
     }
     fn carries_observation(&self, observation: &ParkReason) -> bool {
-        use LegacyConditionField as Field;
+        use ConditionField as Field;
         let ParkReason::UnknownCondition { source, problem } = observation else {
             return false;
         };
@@ -173,14 +173,14 @@ impl ConditionStatement {
             evidence.stated = true;
             evidence.observations.retain(|r| !matches!(r,
                 ParkReason::UnknownCondition { source, problem: UnknownConditionProblem::UnownedEntry }
-                    if source.field == LegacyConditionField::MetadataJson && source.key.as_deref() == Some("coordination_review_pending")));
+                    if source.field == ConditionField::MetadataJson && source.key.as_deref() == Some("coordination_review_pending")));
 
             let mut reasons: Vec<_> = stored
                 .reasons()
                 .filter(|r| {
                     !matches!(r, ParkReason::Children { .. })
                         && !matches!(r, ParkReason::RemoteCancelPending { source }
-                            if source.field == LegacyConditionField::PendingRemoteCancel)
+                            if source.field == ConditionField::PendingRemoteCancel)
                 })
                 .cloned()
                 .collect();
@@ -222,7 +222,7 @@ impl ConditionStatement {
             stated.evidence_mut().stated = true;
             return stated;
         }
-        use LegacyConditionField as Field;
+        use ConditionField as Field;
         let prior = stored.evidence();
         let mut read = prior.presentation.clone().unwrap_or_default();
         let observations: Vec<ParkReason> = prior

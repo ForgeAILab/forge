@@ -981,12 +981,13 @@ pub(crate) fn replan_entered(transitions: &[db::TransitionLog], receipt: &str) -
 /// shadows the legacy fields may lag them; the fields decide, as they do for
 /// the Task itself in the dispatcher's snapshot.
 fn decision_condition(child: &Task) -> db::TaskCondition {
-    if child.condition.evidence().stated {
+    if child.condition.channels_match(
+        &db::ConditionInput::from(child),
+        child.condition_digest.as_deref(),
+    ) {
         child.condition.clone()
     } else {
-        child
-            .condition
-            .restate_legacy(&db::LegacyConditionInput::from(child))
+        child.condition.recompose(&db::ConditionInput::from(child))
     }
 }
 
@@ -1200,6 +1201,7 @@ mod replan_tests {
 
     fn task(id: &str, status: &str, parent: Option<&str>) -> Task {
         Task {
+            condition_digest: None,
             condition: Default::default(),
             id: id.to_owned(),
             project_id: "project".to_owned(),
@@ -1335,6 +1337,37 @@ mod replan_tests {
     }
 
     #[test]
+    fn decision_freshness_uses_digest_and_null_uses_bounded_evidence() {
+        let mut child = parked("child", "2026-10-12T01:00:00Z", "retry_exhausted");
+        let input = db::ConditionInput::from(&child);
+        child.condition = db::compose_condition(&input);
+        let mut stated = serde_json::to_value(&child.condition).unwrap();
+        stated["evidence"]["stated"] = serde_json::json!(true);
+        child.condition = serde_json::from_value(stated).unwrap();
+        child.condition_digest = Some(input.channel_digest());
+        child.error_annotation = None;
+        assert_eq!(
+            decision_condition(&child),
+            child.condition.recompose(&db::ConditionInput::from(&child))
+        );
+        assert_ne!(decision_condition(&child), child.condition);
+        child.condition_digest = None;
+        assert_eq!(
+            decision_condition(&child),
+            child.condition,
+            "NULL stated caches retain the pre-digest fallback"
+        );
+        let mut mapped = serde_json::to_value(&child.condition).unwrap();
+        mapped["evidence"]["stated"] = serde_json::json!(false);
+        child.condition = serde_json::from_value(mapped).unwrap();
+        assert_ne!(
+            decision_condition(&child),
+            child.condition,
+            "NULL mapped caches still compare bounded evidence"
+        );
+    }
+
+    #[test]
     fn a_subtask_needs_a_decision_only_when_nothing_clears_its_park_by_itself() {
         let at = "2026-10-12T01:00:00Z";
         assert_eq!(
@@ -1394,7 +1427,7 @@ mod replan_tests {
         // The identity survives a restatement of the stored condition and
         // changes with the next park.
         let mut restated = parked("child", at, "retry_exhausted");
-        restated.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&restated));
+        restated.condition = db::compose_condition(&db::ConditionInput::from(&restated));
         assert_eq!(subtask_decision_park(&restated).as_deref(), Some(at));
         assert_ne!(
             subtask_decision_park(&parked("child", "2026-10-12T02:00:00Z", "retry_exhausted")),
@@ -1501,7 +1534,7 @@ mod replan_tests {
         // A blocked or held root never re-plans.
         let mut blocked = root("in_progress");
         blocked.blocked_json = Some("{}".to_owned());
-        blocked.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&blocked));
+        blocked.condition = db::compose_condition(&db::ConditionInput::from(&blocked));
         assert_eq!(
             policy.replan_due(&blocked, &children, &lead_row(), &[]),
             None
@@ -1552,6 +1585,7 @@ mod tests {
 
     fn task(id: &str, status: &str, parent_task_id: Option<&str>) -> Task {
         Task {
+            condition_digest: None,
             condition: Default::default(),
             id: id.to_owned(),
             project_id: "project".to_owned(),
@@ -1668,22 +1702,22 @@ mod tests {
         assert!(!root_blocked(&root));
 
         root.blocked_json = Some("{}".to_owned());
-        root.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&root));
+        root.condition = db::compose_condition(&db::ConditionInput::from(&root));
         assert!(root_blocked(&root));
         root.blocked_json = None;
-        root.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&root));
+        root.condition = db::compose_condition(&db::ConditionInput::from(&root));
         root.failed_json = Some("{}".to_owned());
-        root.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&root));
+        root.condition = db::compose_condition(&db::ConditionInput::from(&root));
         assert!(root_blocked(&root));
         root.failed_json = None;
-        root.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&root));
+        root.condition = db::compose_condition(&db::ConditionInput::from(&root));
         root.error_annotation = Some("{}".to_owned());
-        root.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&root));
+        root.condition = db::compose_condition(&db::ConditionInput::from(&root));
         assert!(root_blocked(&root));
         root.error_annotation = None;
-        root.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&root));
+        root.condition = db::compose_condition(&db::ConditionInput::from(&root));
         root.entry_barrier_json = Some("{}".to_owned());
-        root.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&root));
+        root.condition = db::compose_condition(&db::ConditionInput::from(&root));
         assert!(root_blocked(&root));
     }
 
@@ -1931,7 +1965,7 @@ mod tests {
         assert!(!coordination_root_allows_child_dispatch(&root, &workflow));
         root.status = default_states::IN_PROGRESS.to_owned();
         root.error_annotation = Some("{}".to_owned());
-        root.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&root));
+        root.condition = db::compose_condition(&db::ConditionInput::from(&root));
         assert!(!coordination_root_allows_child_dispatch(&root, &workflow));
     }
 }

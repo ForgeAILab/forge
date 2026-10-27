@@ -368,9 +368,15 @@ async fn unicode_attention_material_keeps_its_identity() {
         },
     };
     let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
-    set_condition(&mut tx, "unicode-material", &encode(&condition), None)
-        .await
-        .unwrap();
+    set_condition(
+        &mut tx,
+        "unicode-material",
+        &encode(&condition),
+        &ConditionInput::default().channel_digest(),
+        None,
+    )
+    .await
+    .unwrap();
     tx.commit().await.unwrap();
     let stored = db.task_condition("unicode-material").await.unwrap();
     assert_eq!(

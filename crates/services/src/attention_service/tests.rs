@@ -311,7 +311,7 @@ async fn material_blocker_keeps_the_real_incident_digest() {
             None,
         ),
     ];
-    for kind in db::LEGACY_BLOCKING_ANNOTATION_KINDS {
+    for kind in db::BLOCKING_ANNOTATION_KINDS {
         let annotation = json!({"type":kind,"message":"detail","blocking_reason":"reason","blocked_by":"owner","blocked_execution_id":"execution"});
         let interruption = json!({"kind":kind,"reason":"reason","execution_id":"execution","details":{"key":"detail"}});
         shapes.push((text(annotation.clone()), None, None));

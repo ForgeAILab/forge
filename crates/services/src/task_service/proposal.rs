@@ -534,6 +534,7 @@ impl TaskService {
             .to_json()
         });
         let task = Task {
+            condition_digest: None,
             condition: Default::default(),
             id: task_id.clone(),
             project_id: project_id.clone(),

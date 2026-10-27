@@ -5,7 +5,7 @@ use super::*;
 pub(super) fn unreadable(condition: &TaskCondition) -> bool {
     condition.reasons().any(|reason| {
         matches!(reason, ParkReason::UnknownCondition {
-        source: ConditionSource { field: LegacyConditionField::ConditionJson, .. },
+        source: ConditionSource { field: ConditionField::ConditionJson, .. },
         problem,
     } if *problem != UnknownConditionProblem::UnknownKind)
     })

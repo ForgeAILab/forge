@@ -184,7 +184,7 @@ impl TaskCondition {
                 ParkReason::UnknownCondition {
                     source:
                         ConditionSource {
-                            field: LegacyConditionField::ConditionJson,
+                            field: ConditionField::ConditionJson,
                             ..
                         },
                     problem,
@@ -321,14 +321,14 @@ impl TaskCondition {
                         ParkReason::EntryBlocked { .. }
                             | ParkReason::BudgetExhausted {
                                 source: ConditionSource {
-                                    field: LegacyConditionField::EntryBarrierJson,
+                                    field: ConditionField::EntryBarrierJson,
                                     ..
                                 },
                                 ..
                             }
                             | ParkReason::UnknownCondition {
                                 source: ConditionSource {
-                                    field: LegacyConditionField::EntryBarrierJson,
+                                    field: ConditionField::EntryBarrierJson,
                                     ..
                                 },
                                 ..
@@ -421,7 +421,7 @@ fn untyped_diagnostic(raw: &str) -> Option<TaskBlockingAnnotation> {
 }
 
 impl ConditionRead {
-    pub(super) fn import(view: &LegacyView<'_>) -> Self {
+    pub(super) fn import(view: &ChannelView<'_>) -> Self {
         let fields: Fields<'_> = view
             .metadata_json
             .and_then(|s| serde_json::from_str(s).ok())
@@ -504,14 +504,12 @@ impl ConditionRead {
                 "Task interrupted",
             ),
             interruption_present: view.blocked_json.is_some()
-                || view.non_text.contains(&LegacyConditionField::BlockedJson),
+                || view.non_text.contains(&ConditionField::BlockedJson),
             hard_failure: view.failed_json.is_some()
-                || view.non_text.contains(&LegacyConditionField::FailedJson),
+                || view.non_text.contains(&ConditionField::FailedJson),
             failure_kind,
             entry_recorded: view.entry_barrier_json.is_some()
-                || view
-                    .non_text
-                    .contains(&LegacyConditionField::EntryBarrierJson),
+                || view.non_text.contains(&ConditionField::EntryBarrierJson),
             entry: view
                 .entry_barrier_json
                 .and_then(|s| serde_json::from_str(s).ok()),
@@ -536,7 +534,7 @@ impl ConditionRead {
                 .error_annotation
                 .and_then(|s| serde_json::from_str::<Value>(s).ok())
                 .and_then(|v| v["type"].as_str().map(str::to_owned))
-                .is_some_and(|kind| LEGACY_BLOCKING_ANNOTATION_KINDS.contains(&kind.as_str())),
+                .is_some_and(|kind| BLOCKING_ANNOTATION_KINDS.contains(&kind.as_str())),
             review_wait: false,
             review_failure: false,
             placement_matches_diagnostic: meta("placement_refusal").is_some_and(|p| {
@@ -580,7 +578,7 @@ impl ConditionRead {
 pub(crate) fn owner_park(raw: &Value) -> Option<(ParkReason, TaskBlockingAnnotation)> {
     let r = &raw["reason"];
     let source = ConditionSource {
-        field: LegacyConditionField::SchedulePark,
+        field: ConditionField::SchedulePark,
         key: None,
     };
     if let Some(v) = r.get("WorkflowInvalid") {

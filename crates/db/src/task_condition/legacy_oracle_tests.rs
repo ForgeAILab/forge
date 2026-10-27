@@ -56,9 +56,9 @@ async fn corrupt_statements_keep_legacy_reasons_and_base_write_outcomes() {
             ConditionStatement::Check { wait, epoch } => facts.check = Some((wait.clone(), *epoch)),
             _ => {}
         }
-        let mut input = LegacyConditionInput::from(&row);
+        let mut input = ConditionInput::from(&row);
         input.facts = Some(facts);
-        let expected = map_legacy_condition(&input);
+        let expected = compose_condition(&input);
         let refused = matches!(
             statement,
             ConditionStatement::IntegrationCleared { .. }
@@ -108,8 +108,8 @@ async fn corrupt_statements_keep_legacy_reasons_and_base_write_outcomes() {
             let after = TaskRepo::get_by_id(&db, &id, false).await.unwrap().unwrap();
             assert_eq!(after.version, row.version, "{statement:?}");
             assert_eq!(
-                LegacyConditionInput::from(&after),
-                LegacyConditionInput::from(&row),
+                ConditionInput::from(&after),
+                ConditionInput::from(&row),
                 "{statement:?}"
             );
         })
@@ -129,9 +129,9 @@ async fn legacy_oracle(db: &SqliteDb, id: &str) -> TaskCondition {
     let row = TaskRepo::get_by_id(db, id, false).await.unwrap().unwrap();
     let mut c = db.pool().acquire().await.unwrap();
     let facts = ConditionFacts::load(&mut c, id).await.unwrap();
-    let mut input = LegacyConditionInput::from(&row);
+    let mut input = ConditionInput::from(&row);
     input.facts = Some(facts);
-    map_legacy_condition(&input)
+    compose_condition(&input)
 }
 
 #[tokio::test]
@@ -223,9 +223,9 @@ async fn coordination_statement_matches_legacy(block: Option<&str>, visible_chil
             ConditionStatement::Check { wait, epoch } => facts.check = Some((wait.clone(), *epoch)),
             _ => unreachable!(),
         }
-        let mut input = LegacyConditionInput::from(&before);
+        let mut input = ConditionInput::from(&before);
         input.facts = Some(facts);
-        let expected = map_legacy_condition(&input);
+        let expected = compose_condition(&input);
         crate::task_writer::in_task_step(step, async {
             let mut previous_raw = None;
             for _ in 0..2 {
@@ -260,7 +260,7 @@ async fn coordination_statement_matches_legacy(block: Option<&str>, visible_chil
                 } else {
                     let observation = ParkReason::UnknownCondition {
                         source: ConditionSource {
-                            field: LegacyConditionField::MetadataJson,
+                            field: ConditionField::MetadataJson,
                             key: Some("coordination_review_pending".into()),
                         },
                         problem: UnknownConditionProblem::UnownedEntry,
@@ -286,10 +286,7 @@ async fn coordination_statement_matches_legacy(block: Option<&str>, visible_chil
                     .unwrap()
                     .unwrap();
                 assert_eq!(after.version, before.version);
-                assert_eq!(
-                    LegacyConditionInput::from(&after),
-                    LegacyConditionInput::from(&before)
-                );
+                assert_eq!(ConditionInput::from(&after), ConditionInput::from(&before));
             }
         })
         .await;
@@ -358,9 +355,9 @@ async fn maximal_free_text_is_stored_without_refusing_the_legacy_write() {
     let mut c = db.pool().acquire().await.unwrap();
     let facts = ConditionFacts::load(&mut c, &row.id).await.unwrap();
     drop(c);
-    let mut input = LegacyConditionInput::from(&row);
+    let mut input = ConditionInput::from(&row);
     input.facts = Some(facts);
-    let expected = map_legacy_condition(&input);
+    let expected = compose_condition(&input);
     assert_eq!(raw, serde_json::to_string(&expected).unwrap());
     assert_eq!(row.condition.public(), expected.public());
     assert_eq!(row.condition.read(), expected.read());
@@ -386,9 +383,9 @@ async fn maximal_free_text_is_stored_without_refusing_the_legacy_write() {
     let mut c = db.pool().acquire().await.unwrap();
     let facts = ConditionFacts::load(&mut c, &row.id).await.unwrap();
     drop(c);
-    let mut input = LegacyConditionInput::from(&released);
+    let mut input = ConditionInput::from(&released);
     input.facts = Some(facts);
-    let mapped = map_legacy_condition(&input);
+    let mapped = compose_condition(&input);
     assert_eq!(
         released.condition.read(),
         mapped.read(),

@@ -910,7 +910,7 @@ pub async fn assert_condition_readable(
         matches!(
             reason,
             db::ParkReason::UnknownCondition { source, .. }
-                if source.field == db::LegacyConditionField::ConditionJson
+                if source.field == db::ConditionField::ConditionJson
         )
     };
     assert!(

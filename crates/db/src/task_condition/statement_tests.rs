@@ -2,7 +2,7 @@
 //! the fields it just wrote would have stored. The legacy fields are still
 //! written, so the old mapping is the oracle: every case drives the real
 //! repository writer, then compares the stored condition with
-//! `map_legacy_condition` under the Task's durable facts. The only named
+//! `compose_condition` under the Task's durable facts. The only named
 //! differences are the ones [`TaskCondition::typed`] removes: the six legacy
 //! copies in `evidence` (absent from a stated condition) and `evidence.stated`.
 use super::tests::{db, task};
@@ -17,9 +17,9 @@ async fn stored_and_mapped(db: &SqliteDb, id: &str) -> (TaskCondition, TaskCondi
     let row = TaskRepo::get_by_id(db, id, false).await.unwrap().unwrap();
     let mut connection = db.pool().acquire().await.unwrap();
     let facts = ConditionFacts::load(&mut connection, id).await.unwrap();
-    let mut input = LegacyConditionInput::from(&row);
+    let mut input = ConditionInput::from(&row);
     input.facts = Some(facts);
-    (row.condition, map_legacy_condition(&input))
+    (row.condition, compose_condition(&input))
 }
 
 /// Give a Task the state other writers leave behind, through the mapping

@@ -20,7 +20,7 @@ impl TaskService {
             let mut cleared = task.clone();
             cleared.error_annotation = None;
             cleared.blocked_json = None;
-            cleared.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&cleared));
+            cleared.condition = db::compose_condition(&db::ConditionInput::from(&cleared));
             return Ok(cleared);
         }
         let previous_reason = task.condition.read().interruption.map(|i| i.reason);

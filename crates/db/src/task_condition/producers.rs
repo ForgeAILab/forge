@@ -40,7 +40,7 @@ pub enum ConditionChange {
 /// A condition as one producer states it, with the fences it was read under.
 pub(crate) struct Produced {
     pub version: i64,
-    pub legacy: LegacyConditionInput,
+    pub input: ConditionInput,
     pub condition: TaskCondition,
     pub encoded: String,
     /// The stored text differs and must be written.
@@ -104,7 +104,11 @@ pub(crate) async fn derive(
         snapshot
             .input
             .non_text
-            .retain(|field| *field != LegacyConditionField::MetadataJson);
+            .retain(|field| *field != ConditionField::MetadataJson);
+        snapshot
+            .input
+            .non_text_bytes
+            .retain(|(field, _)| *field != ConditionField::MetadataJson);
     }
     let carried = (!explicit)
         .then(|| write::applied_condition(task_id, &snapshot.stored, snapshot.version))
@@ -118,7 +122,7 @@ pub(crate) async fn derive(
         _ => None,
     };
     let from_statement = stated.is_some();
-    let mapped = stated.unwrap_or_else(|| map_view(&snapshot.input.view()));
+    let mapped = stated.unwrap_or_else(|| compose_channels(&snapshot.input.view()));
     let exhausted = mapped.budget_exhausted();
     if change == Change::Budget && !exhausted {
         // Only an exhausted condition witnesses the ledger.
@@ -259,12 +263,13 @@ pub(crate) async fn derive(
     let encoded = serde_json::to_string(&condition).map_err(storage::json_error)?;
     Ok(Some(Produced {
         version: snapshot.version,
-        changed: encoded.as_bytes() != snapshot.stored,
+        changed: encoded.as_bytes() != snapshot.stored
+            || snapshot.digest.as_deref() != Some(snapshot.input.channel_digest().as_str()),
         parent: snapshot
             .parent_watches
             .then(|| snapshot.parent.clone())
             .flatten(),
-        legacy: snapshot.input,
+        input: snapshot.input,
         condition,
         encoded,
     }))
@@ -280,7 +285,14 @@ pub(crate) async fn produce(
         return Ok(());
     };
     if produced.changed {
-        set_condition(c, task_id, &produced.encoded, Some(produced.version)).await?;
+        set_condition(
+            c,
+            task_id,
+            &produced.encoded,
+            &produced.input.channel_digest(),
+            Some(produced.version),
+        )
+        .await?;
     }
     if let Some(parent) = &produced.parent {
         produce_children(c, parent).await?;
@@ -306,7 +318,14 @@ pub(crate) async fn state(
         return Ok(());
     };
     if produced.changed {
-        set_condition(c, task_id, &produced.encoded, Some(produced.version)).await?;
+        set_condition(
+            c,
+            task_id,
+            &produced.encoded,
+            &produced.input.channel_digest(),
+            Some(produced.version),
+        )
+        .await?;
     }
     if let Some(parent) = &produced.parent {
         produce_children(c, parent).await?;
@@ -318,7 +337,14 @@ pub(crate) async fn state(
 pub(crate) async fn produce_children(c: &mut SqliteConnection, parent_id: &str) -> Result<()> {
     if let Some(produced) = derive(c, parent_id, ConditionChange::Children, None, None).await? {
         if produced.changed {
-            set_condition(c, parent_id, &produced.encoded, Some(produced.version)).await?;
+            set_condition(
+                c,
+                parent_id,
+                &produced.encoded,
+                &produced.input.channel_digest(),
+                Some(produced.version),
+            )
+            .await?;
         }
     }
     Ok(())
@@ -398,12 +424,12 @@ pub(crate) async fn metadata_condition(
     c: &mut SqliteConnection,
     task_id: &str,
     metadata: Option<&str>,
-) -> Result<Option<String>> {
+) -> Result<Option<(String, String)>> {
     Ok(
         derive(c, task_id, ConditionChange::Legacy, Some(metadata), None)
             .await?
             .filter(|produced| produced.changed)
-            .map(|produced| produced.encoded),
+            .map(|produced| (produced.encoded, produced.input.channel_digest())),
     )
 }
 

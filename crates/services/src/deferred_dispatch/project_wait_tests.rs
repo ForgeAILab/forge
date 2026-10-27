@@ -203,7 +203,7 @@ async fn literal_pre_upgrade_waits_keep_offers_health_operations_and_attention_m
             serde_json::from_str(typed.metadata_json.as_deref().unwrap()).unwrap();
         metadata["dispatch_disposition"]["project_wait"] = row["project_wait"].clone();
         typed.metadata_json = Some(metadata.to_string());
-        typed.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&typed));
+        typed.condition = db::compose_condition(&db::ConditionInput::from(&typed));
         snapshot.task = typed.clone();
         assert_eq!(crate::available_actions(&snapshot), offers);
         assert_eq!(

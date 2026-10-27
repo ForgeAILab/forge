@@ -219,15 +219,15 @@ fn redact_sensitive(value: Value) -> Value {
 mod condition_serialization_snapshots {
     use super::*;
     use db::{
-        ConditionContinuation, ConditionEvidence, ConditionSource, LegacyConditionField,
-        ParkReason, RetryCause, TaskCondition, TerminalOutcome, UnknownConditionProblem,
+        ConditionContinuation, ConditionEvidence, ConditionField, ConditionSource, ParkReason,
+        RetryCause, TaskCondition, TerminalOutcome, UnknownConditionProblem,
     };
     #[test]
     fn every_task_condition_kind_has_one_public_shape_without_legacy_fields() {
         let e = ConditionEvidence::default();
         let reason = ParkReason::UnknownCondition {
             source: ConditionSource {
-                field: LegacyConditionField::EntryBarrierJson,
+                field: ConditionField::EntryBarrierJson,
                 key: None,
             },
             problem: UnknownConditionProblem::UnownedEntry,

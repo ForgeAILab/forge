@@ -3774,7 +3774,7 @@ async fn native_eight_action_verbs_match_offers_across_work_review_merge_hold_an
                 let annotation =
                     json!({"type":"manual_stop","blocking_reason":"held","blocked_by":"user"})
                         .to_string();
-                let condition = db::map_legacy_condition(&db::LegacyConditionInput {
+                let condition = db::compose_condition(&db::ConditionInput {
                     error_annotation: Some(annotation.clone()),
                     ..Default::default()
                 });
@@ -3799,7 +3799,7 @@ async fn native_eight_action_verbs_match_offers_across_work_review_merge_hold_an
                     }),
                     ..Default::default()
                 }
-                .condition(&db::LegacyConditionInput::default());
+                .condition(&db::ConditionInput::default());
                 sqlx::query("UPDATE task SET condition_json=? WHERE id=?")
                     .bind(serde_json::to_string(&condition).unwrap())
                     .bind(&task.id)

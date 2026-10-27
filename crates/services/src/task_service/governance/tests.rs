@@ -73,6 +73,7 @@ async fn charter_backed_task_governance_is_runnable_before_repository_attachment
 
 fn minimal_task(id: &str, project_id: &str) -> db::Task {
     db::Task {
+        condition_digest: None,
         condition: Default::default(),
         id: id.to_owned(),
         project_id: project_id.to_owned(),

@@ -327,13 +327,13 @@ fn strict_nested_tags_and_copied_decode_depth() {
 
 #[test]
 fn legacy_mapping_matches_archived_main_without_strict_decode() {
-    use super::super::{LegacyConditionField as Field, LegacyConditionInput};
+    use super::super::{ConditionField as Field, ConditionInput};
     let corpus = include_str!("fixtures/legacy-main-13bc2ae1.jsonl");
     let mut visited = 0;
     for line in corpus.lines() {
         let record: Value = serde_json::from_str(line).unwrap();
         let text = |key: &str| record[key].as_str().map(str::to_owned);
-        let input = LegacyConditionInput {
+        let input = ConditionInput {
             error_annotation: text("annotation"),
             blocked_json: text("blocked"),
             failed_json: text("failed"),
@@ -349,9 +349,10 @@ fn legacy_mapping_matches_archived_main_without_strict_decode() {
                 Some(field) => panic!("unexpected non-text field: {field}"),
             },
             facts: None,
+            non_text_bytes: Vec::new(),
         };
         assert_eq!(
-            serde_json::to_string(&crate::map_legacy_condition(&input)).unwrap(),
+            serde_json::to_string(&crate::compose_condition(&input)).unwrap(),
             record["expected"].as_str().unwrap(),
             "{}",
             record["name"]

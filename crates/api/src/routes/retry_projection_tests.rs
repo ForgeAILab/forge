@@ -21,7 +21,7 @@ async fn owner_wait_and_review_ci_blockers_project_in_task_response() {
     ] {
         let mut task = test_task();
         task.blocked_json = Some(serde_json::json!({"reason":"owner unavailable", "created_at":"2026-10-01T00:00:00Z", "kind":kind, "execution_id":null}).to_string());
-        task.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&task));
+        task.condition = db::compose_condition(&db::ConditionInput::from(&task));
         let response = super::task_response_inner(
             &db,
             &service.workspace_backend_router(),
@@ -67,7 +67,7 @@ async fn integration_condition_survives_the_task_response_projection() {
         }),
         ..Default::default()
     }
-    .condition(&db::LegacyConditionInput::default());
+    .condition(&db::ConditionInput::default());
     let expected = task.condition.public();
     let response = super::task_response_inner(
         &db,
@@ -198,6 +198,7 @@ fn legacy_retry_blocker_uses_the_service_allowlist() {
 
 fn test_task() -> db::Task {
     db::Task {
+        condition_digest: None,
         condition: Default::default(),
         id: "task".to_owned(),
         project_id: "project".to_owned(),

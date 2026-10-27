@@ -107,7 +107,7 @@ pub fn material_blocker(condition: &TaskCondition) -> MaterialBlocker {
             interruption: None,
         })
 }
-pub(super) fn legacy_material_blocker(
+pub(super) fn channel_material_blocker(
     a: Option<&str>,
     b: Option<&str>,
     f: Option<&str>,
@@ -315,10 +315,10 @@ impl TaskCondition {
     }
     /// Refresh a stale legacy projection while carrying supported typed owners.
     /// Used by the scheduler's read snapshot before the repair sweep writes it.
-    pub fn restate_legacy(&self, input: &LegacyConditionInput) -> Self {
+    pub fn recompose(&self, input: &ConditionInput) -> Self {
         match ConditionFacts::recover(self) {
             Some(facts) => facts.condition(input),
-            None => map_legacy_condition(input),
+            None => compose_condition(input),
         }
     }
     pub fn reasons(&self) -> impl Iterator<Item = &ParkReason> {
@@ -396,7 +396,7 @@ impl Families {
         &SQL.get_or_init(|| {
             (0..8usize)
                 .map(|bits| {
-                    let mut columns = String::from("t.error_annotation,t.blocked_json,t.failed_json,t.entry_barrier_json,t.metadata_json,t.condition_json,t.version,t.status,t.status_epoch,t.created_at,t.parent_task_id,t.project_id,(SELECT reason_json FROM task_schedule_park WHERE task_id=t.id AND epoch=t.status_epoch AND NOT (json_valid(reason_json) AND json_extract(reason_json,'$.reason')='ProjectPaused' AND (SELECT paused_at FROM project WHERE id=t.project_id) IS NULL)) AS owner_park,(SELECT status FROM review WHERE task_id=t.id ORDER BY attempt_number DESC,created_at DESC,id DESC LIMIT 1) AS human_review_status,(SELECT created_at FROM review WHERE task_id=t.id ORDER BY attempt_number DESC,created_at DESC,id DESC LIMIT 1) AS human_review_created_at");
+                    let mut columns = String::from("t.error_annotation,t.blocked_json,t.failed_json,t.entry_barrier_json,t.metadata_json,t.condition_json,t.version,t.status,t.status_epoch,t.created_at,t.parent_task_id,t.project_id,t.condition_digest,(SELECT reason_json FROM task_schedule_park WHERE task_id=t.id AND epoch=t.status_epoch AND NOT (json_valid(reason_json) AND json_extract(reason_json,'$.reason')='ProjectPaused' AND (SELECT paused_at FROM project WHERE id=t.project_id) IS NULL)) AS owner_park,(SELECT status FROM review WHERE task_id=t.id ORDER BY attempt_number DESC,created_at DESC,id DESC LIMIT 1) AS human_review_status,(SELECT created_at FROM review WHERE task_id=t.id ORDER BY attempt_number DESC,created_at DESC,id DESC LIMIT 1) AS human_review_created_at");
                     let mut joins = String::new();
                     if bits & 1 != 0 {
                         // An engine or board entry logs its epoch and is the
@@ -428,8 +428,9 @@ impl Families {
 /// One Task row as a producer reads it, with the requested fact families.
 pub(super) struct Snapshot {
     pub id: String,
-    pub input: LegacyConditionInput,
+    pub input: ConditionInput,
     pub stored: Vec<u8>,
+    pub digest: Option<String>,
     pub version: i64,
     pub state: String,
     pub epoch: i64,
@@ -446,25 +447,34 @@ impl Snapshot {
         id: &str,
         families: Families,
     ) -> Result<Option<Self>> {
-        let query = families.sql();
-        let row = match sqlx::query(query).bind(id).fetch_optional(&mut *c).await {
-            Ok(row) => row,
-            // Migration replay before the scheduler table was introduced.
-            Err(sqlx::Error::Database(e))
-                if e.message().contains("no such table: task_schedule_park") =>
-            {
-                let old = query.replace("(SELECT reason_json FROM task_schedule_park WHERE task_id=t.id AND epoch=t.status_epoch AND NOT (json_valid(reason_json) AND json_extract(reason_json,'$.reason')='ProjectPaused' AND (SELECT paused_at FROM project WHERE id=t.project_id) IS NULL)) AS owner_park", "NULL AS owner_park,(SELECT status FROM review WHERE task_id=t.id ORDER BY attempt_number DESC,created_at DESC,id DESC LIMIT 1) AS human_review_status,(SELECT created_at FROM review WHERE task_id=t.id ORDER BY attempt_number DESC,created_at DESC,id DESC LIMIT 1) AS human_review_created_at");
-                sqlx::query(&old).bind(id).fetch_optional(&mut *c).await?
+        let mut query = std::borrow::Cow::Borrowed(families.sql());
+        let row = loop {
+            match sqlx::query(&query).bind(id).fetch_optional(&mut *c).await {
+                Ok(row) => break row,
+                Err(sqlx::Error::Database(e))
+                    if e.message().contains("no such column: t.condition_digest") =>
+                {
+                    query = std::borrow::Cow::Owned(
+                        query.replace("t.condition_digest", "NULL AS condition_digest"),
+                    );
+                }
+                // Historical migration replay before scheduler parks existed.
+                Err(sqlx::Error::Database(e))
+                    if e.message().contains("no such table: task_schedule_park") =>
+                {
+                    query = std::borrow::Cow::Owned(query.replace("(SELECT reason_json FROM task_schedule_park WHERE task_id=t.id AND epoch=t.status_epoch AND NOT (json_valid(reason_json) AND json_extract(reason_json,'$.reason')='ProjectPaused' AND (SELECT paused_at FROM project WHERE id=t.project_id) IS NULL)) AS owner_park", "NULL AS owner_park"));
+                }
+                Err(e) => return Err(e.into()),
             }
-            Err(e) => return Err(e.into()),
         };
         let Some(row) = row else {
             return Ok(None);
         };
         Ok(Some(Self {
             id: id.to_owned(),
-            input: LegacyConditionInput::from_row(&row)?,
+            input: ConditionInput::from_row(&row)?,
             stored: row.try_get(5)?,
+            digest: row.try_get("condition_digest")?,
             version: row.try_get(6)?,
             state: row.try_get(7)?,
             epoch: row.try_get(8)?,
@@ -828,11 +838,11 @@ impl ConditionFacts {
         witnesses
     }
     /// The condition these facts and the legacy fields state together.
-    pub fn condition(&self, input: &LegacyConditionInput) -> TaskCondition {
+    pub fn condition(&self, input: &ConditionInput) -> TaskCondition {
         self.condition_of(&input.view())
     }
-    pub(super) fn condition_of(&self, view: &LegacyView<'_>) -> TaskCondition {
-        self.apply(map_view_from(self.initial, view))
+    pub(super) fn condition_of(&self, view: &ChannelView<'_>) -> TaskCondition {
+        self.apply(compose_channels_from(self.initial, view))
     }
     /// Combine the legacy mapping with these facts. Legacy is authoritative:
     /// a condition parks exactly where today's readers hold the Task.
@@ -900,7 +910,7 @@ impl ConditionFacts {
                 // Legacy dispatches a flagged root without visible children as
                 // an ordinary Task. Keep the diagnosis; do not park.
                 let observation = unknown(
-                    &LegacyConditionField::MetadataJson,
+                    &ConditionField::MetadataJson,
                     Some("coordination_review_pending"),
                     UnknownConditionProblem::UnownedEntry,
                 );
@@ -917,7 +927,7 @@ impl ConditionFacts {
         }
         let remote_cancel = !self.operations.is_empty();
         let remote_reason = ParkReason::RemoteCancelPending {
-            source: source(&LegacyConditionField::PendingRemoteCancel, None),
+            source: source(&ConditionField::PendingRemoteCancel, None),
         };
         let remaining = || {
             self.children
@@ -1034,9 +1044,9 @@ impl Snapshot {
         };
         let mapped = match write::current_statement(&self.id) {
             Some(ConditionStatement::Preserve) => stored(),
-            _ => Some(map_view(&self.input.view())),
+            _ => Some(compose_channels(&self.input.view())),
         };
-        let mapped = mapped.unwrap_or_else(|| map_view(&self.input.view()));
+        let mapped = mapped.unwrap_or_else(|| compose_channels(&self.input.view()));
         if !matches!(
             mapped,
             TaskCondition::Parked {

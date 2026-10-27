@@ -131,7 +131,7 @@ pub fn decode_or_unknown(raw: &str) -> TaskCondition {
     TaskCondition::Parked {
         primary: ParkReason::UnknownCondition {
             source: ConditionSource {
-                field: LegacyConditionField::ConditionJson,
+                field: ConditionField::ConditionJson,
                 key: None,
             },
             problem,
@@ -145,27 +145,60 @@ pub fn decode_or_unknown(raw: &str) -> TaskCondition {
 pub(super) fn encode(condition: &TaskCondition) -> String {
     serde_json::to_string(condition).expect("Task condition serializes")
 }
+/// Refresh the returned Task from the same cache snapshot its writer stored.
+pub(crate) async fn refresh_task_condition(
+    connection: &mut SqliteConnection,
+    task: &mut Task,
+) -> Result<()> {
+    let (body, digest): (String, Option<String>) =
+        sqlx::query_as("SELECT condition_json,condition_digest FROM task WHERE id=?")
+            .bind(&task.id)
+            .fetch_one(connection)
+            .await?;
+    task.condition = decode_or_unknown(&body);
+    task.condition_digest = digest;
+    Ok(())
+}
+
 /// Version-fenced shadow write shared by every producer seam: store `condition` unless the
-/// row already holds exactly it. Touches only `condition_json`: no version,
+/// row already holds exactly it and its digest. Touches only cache columns: no version,
 /// timestamp, revision, event or Attention change.
 pub(super) async fn set_condition(
     connection: &mut SqliteConnection,
     task_id: &str,
     condition: &str,
+    digest: &str,
     expected_version: Option<i64>,
 ) -> Result<()> {
     debug_assert!(
         decode(condition).is_ok_and(|decoded| encode(&decoded) == condition),
         "Task condition must round-trip through its stored form"
     );
-    let written =
-        sqlx::query("UPDATE task SET condition_json=?1 WHERE id=?2 AND (?3 IS NULL OR version=?3) AND condition_json IS NOT ?1")
+    let written = match
+        sqlx::query("UPDATE task SET condition_json=?1,condition_digest=?4 WHERE id=?2 AND (?3 IS NULL OR version=?3) AND (condition_json IS NOT ?1 OR condition_digest IS NOT ?4)")
             .bind(condition)
             .bind(task_id)
             .bind(expected_version)
-            .execute(connection)
-            .await?
-            .rows_affected();
+            .bind(digest)
+            .execute(&mut *connection)
+            .await
+    {
+        Ok(result) => result,
+        // Historical migration replay can enqueue steps before the digest
+        // column exists. Keep the same condition and version fences there.
+        Err(sqlx::Error::Database(error))
+            if error.message() == "no such column: condition_digest" =>
+        {
+            sqlx::query("UPDATE task SET condition_json=?1 WHERE id=?2 AND (?3 IS NULL OR version=?3) AND condition_json IS NOT ?1")
+                .bind(condition)
+                .bind(task_id)
+                .bind(expected_version)
+                .execute(connection)
+                .await?
+        }
+        Err(error) => return Err(error.into()),
+    }
+    .rows_affected();
     debug_assert!(written <= 1, "one Task owns one condition");
     Ok(())
 }
@@ -184,12 +217,17 @@ pub(crate) async fn sync_condition(connection: &mut SqliteConnection, task_id: &
 /// revision it wrote. Runs inside the migration's transaction; on a Task only
 /// `condition_json` changes, and only where it differs from the column default.
 pub(crate) async fn backfill(connection: &mut SqliteConnection) -> Result<()> {
+    let has_digest: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('task') WHERE name='condition_digest')",
+    )
+    .fetch_one(&mut *connection)
+    .await?;
     let full_schema: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name IN ('project','execution','task_step')").fetch_one(&mut *connection).await?;
     let mut after: Option<String> = None;
     let (mut quarantined, mut quarantined_ids) = (0_u64, Vec::<String>::new());
     loop {
         let rows = sqlx::query(&format!(
-            "SELECT {LEGACY_SELECT},id FROM task WHERE ?1 IS NULL OR id>?1 ORDER BY id LIMIT 200"
+            "SELECT {CHANNEL_SELECT},id FROM task WHERE ?1 IS NULL OR id>?1 ORDER BY id LIMIT 200"
         ))
         .bind(after.as_deref())
         .fetch_all(&mut *connection)
@@ -212,8 +250,8 @@ pub(crate) async fn backfill(connection: &mut SqliteConnection) -> Result<()> {
                 }
                 continue;
             }
-            let input = LegacyConditionInput::from_row(row)?;
-            let mapped = map_legacy_condition(&input);
+            let input = ConditionInput::from_row(row)?;
+            let mapped = compose_condition(&input);
             let condition = if full_schema == 3 {
                 match ConditionFacts::load(connection, &id).await {
                     Ok(facts) => encode(&facts.condition(&input)),
@@ -222,9 +260,23 @@ pub(crate) async fn backfill(connection: &mut SqliteConnection) -> Result<()> {
             } else {
                 encode(&mapped)
             };
-            if row.try_get::<Vec<u8>, _>(5)? != condition.as_bytes() {
+            if has_digest {
+                set_condition(
+                    &mut *connection,
+                    &id,
+                    &condition,
+                    &input.channel_digest(),
+                    None,
+                )
+                .await?;
+            } else if row.try_get::<Vec<u8>, _>(5)? != condition.as_bytes() {
                 let id: String = row.try_get(6)?;
-                set_condition(&mut *connection, &id, &condition, None).await?;
+                // This post-step precedes the additive digest migration.
+                sqlx::query("UPDATE task SET condition_json=? WHERE id=?")
+                    .bind(&condition)
+                    .bind(&id)
+                    .execute(&mut *connection)
+                    .await?;
             }
         }
     }
@@ -246,7 +298,7 @@ pub(crate) async fn backfill(connection: &mut SqliteConnection) -> Result<()> {
     if full_schema == 3 && settings == 1 {
         sqlx::query("INSERT INTO system_setting(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at")
             .bind(MAPPING_REVISION_KEY)
-            .bind(MAPPING_REVISION.to_string())
+            .bind(if has_digest { MAPPING_REVISION } else { 7 }.to_string())
             .bind(crate::now_rfc3339())
             .execute(&mut *connection)
             .await?;
@@ -304,7 +356,7 @@ impl SqliteDb {
             tx,
             task_id,
             produced.version,
-            &produced.legacy,
+            &produced.input,
             &produced.condition,
         )
         .await
@@ -326,7 +378,7 @@ impl SqliteDb {
         tx: &mut Transaction<'_, Sqlite>,
         task_id: &str,
         expected_version: i64,
-        expected_legacy: &LegacyConditionInput,
+        expected_input: &ConditionInput,
         condition: &TaskCondition,
     ) -> Result<()> {
         integration::validate(condition)?;
@@ -339,7 +391,7 @@ impl SqliteDb {
         self.fence_task_lease_in_tx(tx, task_id, "set_condition")
             .await?;
         let row = sqlx::query(&format!(
-            "SELECT {LEGACY_SELECT},version,status,status_epoch FROM task WHERE id=?"
+            "SELECT {CHANNEL_SELECT},version,status,status_epoch FROM task WHERE id=?"
         ))
         .bind(task_id)
         .fetch_optional(&mut **tx)
@@ -400,10 +452,9 @@ impl SqliteDb {
                 ));
             }
         }
-        let mut bare = expected_legacy.clone();
+        let mut bare = expected_input.clone();
         bare.facts = None;
-        if row.try_get::<i64, _>(6)? != expected_version
-            || LegacyConditionInput::from_row(&row)? != bare
+        if row.try_get::<i64, _>(6)? != expected_version || ConditionInput::from_row(&row)? != bare
         {
             return Err(DbError::VersionConflict);
         }
@@ -456,6 +507,7 @@ impl SqliteDb {
             tx,
             task_id,
             &serde_json::to_string(condition).map_err(json_error)?,
+            &expected_input.channel_digest(),
             Some(expected_version),
         )
         .await
@@ -486,7 +538,7 @@ impl SqliteDb {
                     tx,
                     task_id,
                     produced.version,
-                    &produced.legacy,
+                    &produced.input,
                     &produced.condition,
                 )
                 .await
@@ -499,7 +551,14 @@ impl SqliteDb {
                 // the legacy write stands on its own fences and the
                 // condition must still describe it, under the version fence.
                 Err(DbError::VersionConflict) => {
-                    set_condition(tx, task_id, &produced.encoded, Some(produced.version)).await?
+                    set_condition(
+                        tx,
+                        task_id,
+                        &produced.encoded,
+                        &produced.input.channel_digest(),
+                        Some(produced.version),
+                    )
+                    .await?
                 }
                 // The strict seam refused the condition itself. Nothing is
                 // written: the legacy write is authoritative and proceeds,
@@ -540,18 +599,17 @@ impl SqliteDb {
         sync_condition(tx, task_id).await
     }
 
-    /// Invariant usable by writer tests: the persisted shadow equals the
-    /// mapping of the supplied Task snapshot.
+    /// Invariant usable by writer tests: the cache agrees with the row's
+    /// current channel digest and independently loaded durable facts.
     pub async fn check_task_condition_invariant(&self, task: &Task) -> Result<()> {
         let mut connection = self.pool().begin().await?;
-        let actual: String = sqlx::query_scalar("SELECT condition_json FROM task WHERE id=?")
-            .bind(&task.id)
-            .fetch_one(&mut *connection)
-            .await?;
-        decode(&actual)?;
+        let input = ConditionInput::from(task);
+        let actual = encode(&task.condition);
         let facts = ConditionFacts::load(&mut connection, &task.id).await?;
-        let expected = facts.condition(&LegacyConditionInput::from(task));
-        if !TaskCondition::stored_agrees(actual.as_bytes(), &expected, &encode(&expected)) {
+        let expected = facts.condition(&input);
+        if task.condition_digest.as_deref() != Some(input.channel_digest().as_str())
+            || !TaskCondition::stored_agrees(actual.as_bytes(), &expected, &encode(&expected))
+        {
             return Err(DbError::Check(format!(
                 "Task condition invariant failed for {}",
                 task.id
@@ -564,19 +622,27 @@ impl SqliteDb {
     /// of its legacy fields and durable facts. Production uses bounded pages.
     pub async fn task_condition_violations(&self) -> Result<Vec<String>> {
         let mut connection = self.pool().begin().await?;
-        let rows = sqlx::query(&format!("SELECT {LEGACY_SELECT},id FROM task ORDER BY id"))
-            .fetch_all(&mut *connection)
-            .await?;
+        let rows = sqlx::query(&format!(
+            "SELECT {CHANNEL_SELECT},id,condition_digest FROM task ORDER BY id"
+        ))
+        .fetch_all(&mut *connection)
+        .await?;
         let mut violations = Vec::new();
         for row in &rows {
             let id: String = row.try_get(6)?;
             let facts = ConditionFacts::load(&mut connection, &id).await?;
-            let expected = facts.condition(&LegacyConditionInput::from_row(row)?);
-            if !TaskCondition::stored_agrees(
-                &row.try_get::<Vec<u8>, _>(5)?,
-                &expected,
-                &encode(&expected),
-            ) {
+            let input = ConditionInput::from_row(row)?;
+            let expected = facts.condition(&input);
+            if row
+                .try_get::<Option<String>, _>("condition_digest")?
+                .as_deref()
+                != Some(input.channel_digest().as_str())
+                || !TaskCondition::stored_agrees(
+                    &row.try_get::<Vec<u8>, _>(5)?,
+                    &expected,
+                    &encode(&expected),
+                )
+            {
                 violations.push(id);
             }
         }
