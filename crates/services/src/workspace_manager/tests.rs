@@ -1326,16 +1326,24 @@ fn raw_path_uses(source: &str) -> usize {
     let mut uses = 0;
     let mut index = 0;
     while index < lines.len() {
-        // A `#[cfg(test)]` module builds its own fixtures: skip to its
-        // closing brace. Items after it are production code again.
-        let opens_test_module = lines[index] == "#[cfg(test)]"
-            && lines[index + 1..]
+        // Skip an inline test module through its closing brace, or an
+        // out-of-line declaration through its semicolon. Resume scanning
+        // production code immediately after either form.
+        let test_module = if lines[index] == "#[cfg(test)]" {
+            lines[index + 1..]
                 .iter()
                 .take(2)
-                .any(|line| line.starts_with("mod ") || line.starts_with("pub(crate) mod "));
-        if opens_test_module {
-            while index < lines.len() && lines[index] != "}" {
-                index += 1;
+                .position(|line| line.starts_with("mod ") || line.starts_with("pub(crate) mod "))
+                .map(|offset| index + 1 + offset)
+        } else {
+            None
+        };
+        if let Some(module_index) = test_module {
+            index = module_index;
+            if !lines[index].trim_end().ends_with(';') {
+                while index < lines.len() && lines[index] != "}" {
+                    index += 1;
+                }
             }
             index += 1;
             continue;
@@ -1447,4 +1455,15 @@ fn raw_path_scan_counts_production_code_only() {
                   fn d() { v.recorded_server_path(); }\n\
                   #[cfg(test)]\nmod more;\n";
     assert_eq!(raw_path_uses(source), 3);
+}
+
+#[test]
+fn raw_path_scan_preserves_production_after_out_of_line_test_modules() {
+    for source in [
+        "#[cfg(test)]\nmod tests;\nfn production() { workspace.embedded_path(); }\n",
+        "#[cfg(test)]\n#[path = \"fixtures.rs\"]\nmod tests;\n\
+         fn production() { workspace.recorded_server_path(); }\n",
+    ] {
+        assert_eq!(raw_path_uses(source), 1, "source: {source}");
+    }
 }

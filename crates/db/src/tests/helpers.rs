@@ -292,57 +292,6 @@ pub(super) fn memory_item(project_id: &str, title: &str, body: &str) -> MemoryIt
     }
 }
 
-pub(super) fn memory_cursor(item: &MemoryItem) -> String {
-    URL_SAFE_NO_PAD.encode(
-        serde_json::to_vec(&serde_json::json!({
-            "created_at": &item.created_at,
-            "id": &item.id,
-        }))
-        .expect("memory cursor serializes"),
-    )
-}
-
-pub(super) async fn seed_agent(
-    db: &SqliteDb,
-    name: &str,
-    visibility: &str,
-    owner_id: Option<String>,
-) -> String {
-    let now = now_rfc3339();
-    let agent_id = new_uuid_v4();
-    AgentRepo::create(
-        db,
-        CreateAgent {
-            id: agent_id.clone(),
-            name: name.to_owned(),
-            description: None,
-            executor_type: "shell".to_owned(),
-            model: None,
-            reasoning_effort: None,
-            permission_policy: None,
-            prompt_template: None,
-            capabilities_json: "[]".to_owned(),
-            config_json: "{}".to_owned(),
-            credential_ref: None,
-            daemon_id: None,
-            max_concurrent_tasks: 1,
-            heartbeat_interval_seconds: 30,
-            max_missed_heartbeats: 3,
-            status: AgentStatus::Idle,
-            last_heartbeat_at: None,
-            is_default: false,
-            paused: false,
-            owner_id,
-            visibility: visibility.to_owned(),
-            created_at: now.clone(),
-            updated_at: now,
-        },
-    )
-    .await
-    .expect("agent creates");
-    agent_id
-}
-
 pub(super) async fn seed_task(
     db: &SqliteDb,
     project_id: &str,
@@ -415,64 +364,6 @@ pub(super) async fn seed_workspace_for_task(db: &SqliteDb, task_id: &str, repo_i
     .await
     .expect("workspace creates");
     workspace_id
-}
-
-pub(super) async fn seed_terminal_session(
-    db: &SqliteDb,
-    task_id: &str,
-    workspace_id: &str,
-    user_id: &str,
-    created_at: &str,
-) -> crate::TerminalSession {
-    TerminalSessionRepo::create_terminal_session(
-        db,
-        CreateTerminalSession {
-            id: new_uuid_v4(),
-            task_id: task_id.to_owned(),
-            workspace_id: workspace_id.to_owned(),
-            daemon_id: None,
-            created_by_user_id: user_id.to_owned(),
-            rows: 24,
-            cols: 80,
-            created_at: created_at.to_owned(),
-        },
-    )
-    .await
-    .expect("terminal session creates")
-}
-
-pub(super) async fn seed_ordered_task(
-    db: &SqliteDb,
-    project_id: &str,
-    parent_task_id: Option<&str>,
-    subtask_order: Option<i64>,
-    title: &str,
-    created_at: &str,
-) -> Task {
-    TaskRepo::create(
-        db,
-        CreateTask {
-            id: new_uuid_v4(),
-            project_id: project_id.to_owned(),
-            parent_task_id: parent_task_id.map(str::to_owned),
-            subtask_order,
-            assignee_type: None,
-            assignee_id: None,
-            title: title.to_owned(),
-            description: None,
-            task_type: "task".to_owned(),
-            status: "todo".to_owned(),
-            is_automation: false,
-            priority: 0,
-            task_state_config: None,
-            merge_config: None,
-            plan: None,
-            created_at: created_at.to_owned(),
-            updated_at: created_at.to_owned(),
-        },
-    )
-    .await
-    .expect("ordered task creates")
 }
 
 // Freeze both contract and passed assessment so these tests exercise the same
@@ -618,30 +509,6 @@ pub(super) async fn seed_review_digest_contract(
     (db, project_id, task_id, contract)
 }
 
-pub(super) async fn assert_review_digest_integrates(db: &SqliteDb, task_id: &str) {
-    let guard = db.lock_review_integration(task_id).await.unwrap();
-    assert!(guard.contract.is_some(), "must check automated authority");
-    guard.release().await.unwrap();
-}
-
-pub(super) async fn seed_child(
-    db: &SqliteDb,
-    project_id: &str,
-    root: &str,
-    order: i64,
-    title: &str,
-) -> String {
-    let id = seed_task(db, project_id, None, "todo".into(), title).await;
-    sqlx::query("UPDATE task SET parent_task_id=?, subtask_order=? WHERE id=?")
-        .bind(root)
-        .bind(order)
-        .bind(&id)
-        .execute(db.pool())
-        .await
-        .unwrap();
-    id
-}
-
 // ── User / RefreshToken tests ──────────────────────────────────────────────
 
 pub(super) async fn seed_user(db: &SqliteDb) -> String {
@@ -658,53 +525,4 @@ pub(super) async fn seed_user(db: &SqliteDb) -> String {
     };
     UserRepo::create_user(db, &user).await.expect("seed user");
     id
-}
-
-pub(super) async fn long_form_review_assessment() -> (SqliteDb, api_types::ReviewConformance, String)
-{
-    let (db, _, _, mut contract) = seed_review_digest_contract(2).await;
-    let now = now_rfc3339();
-    contract.execution_id = new_uuid_v4();
-    contract.digest = String::new();
-    contract.digest = api_types::canonical_digest(&contract).unwrap();
-    sqlx::query("INSERT INTO execution(id,task_id,role,status,created_at,updated_at) VALUES(?,?,'reviewer','completed',?,?)")
-        .bind(&contract.execution_id).bind(&contract.context.task_id).bind(&now).bind(&now)
-        .execute(db.pool()).await.unwrap();
-    sqlx::query("INSERT INTO execution_review_contract VALUES(?,?,?,?,?,?)")
-        .bind(&contract.execution_id)
-        .bind(&contract.context.task_id)
-        .bind(&contract.digest)
-        .bind(&contract.context.source_digest)
-        .bind(serde_json::to_string(&contract).unwrap())
-        .bind(&now)
-        .execute(db.pool())
-        .await
-        .unwrap();
-    let assessment = api_types::ReviewConformance {
-        status: api_types::ConformanceStatus::Failed,
-        contract: Some(contract.clone()),
-        assessment: Some(api_types::ReviewAssessment {
-            result: api_types::ReviewResult::Fail,
-            reason: "missing test".into(),
-            report: "## Review\n\nNo test.".into(),
-            fixable_by: api_types::FixableBy::Coder,
-            repeat: false,
-            findings: Vec::new(),
-            resolved: Vec::new(),
-        }),
-        checks: Vec::new(),
-        reason: Some("missing test".into()),
-    };
-    let mut historical = serde_json::to_value(&assessment).unwrap();
-    historical["assessment"]["fixable_by"] = serde_json::json!("coder");
-    historical["assessment"]["repeat"] = serde_json::json!(false);
-    let historical = serde_json::to_string_pretty(&historical).unwrap();
-    sqlx::query("INSERT INTO execution_review_assessment VALUES(?,?,?)")
-        .bind(&contract.execution_id)
-        .bind(&historical)
-        .bind(&now)
-        .execute(db.pool())
-        .await
-        .unwrap();
-    (db, assessment, historical)
 }

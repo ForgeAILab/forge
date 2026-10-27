@@ -305,3 +305,11 @@ async fn an_integration_consumer_withdrawn_under_its_head_waits_again_on_a_fresh
         .cancelled_at
         .is_some());
 }
+
+async fn run_state(db: &SqliteDb, id: &str) -> String {
+    sqlx::query_scalar("SELECT state FROM check_run WHERE id=?")
+        .bind(id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap()
+}

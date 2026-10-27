@@ -248,15 +248,11 @@ async fn project_charter_for_project(
     let charter_id = if let Some(charter_id) = project.current_charter_id.as_deref() {
         Some(charter_id.to_owned())
     } else {
-        sqlx::query_scalar::<_, String>(
-            "SELECT id FROM project_charter
-             WHERE project_id = ? AND account_id = ?
-             ORDER BY updated_at DESC, id DESC LIMIT 1",
-        )
-        .bind(&project.id)
-        .bind(account_id)
-        .fetch_optional(state.db.pool())
-        .await?
+        state
+            .db
+            .latest_project_charter_id(&project.id, account_id)
+            .await
+            .map_err(ApiError::project_artifact_mutation)?
     };
     let Some(charter_id) = charter_id else {
         return Ok(None);
@@ -341,13 +337,11 @@ async fn charter_projection(
         .as_ref()
         .and_then(|id| revisions.iter().find(|revision| &revision.id == id))
         .cloned();
-    let approval_id = sqlx::query_scalar::<_, String>(
-        "SELECT id FROM project_charter_approval
-         WHERE charter_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
-    )
-    .bind(&charter_record.id)
-    .fetch_optional(state.db.pool())
-    .await?;
+    let approval_id = state
+        .db
+        .latest_project_charter_approval_id(&charter_record.id)
+        .await
+        .map_err(ApiError::project_artifact_mutation)?;
     let approval = match approval_id {
         Some(id) => ProjectOrchestrationRepo::get_project_charter_approval(&*state.db, &id)
             .await?
@@ -637,25 +631,15 @@ fn required_text(field: &'static str, value: String) -> ApiResult<String> {
 }
 
 async fn current_project_agent_operating_skill_revision(state: &AppState) -> ApiResult<String> {
-    sqlx::query_scalar::<_, String>(
-        "SELECT revision.id
-         FROM operating_skill AS skill
-         JOIN operating_skill_revision AS revision
-           ON revision.id = skill.current_revision_id
-          AND revision.operating_skill_id = skill.id
-          AND revision.skill_key = skill.skill_key
-         WHERE skill.skill_key = ?
-           AND skill.lifecycle = 'active'
-           AND skill.current_revision_id IS NOT NULL
-         LIMIT 1",
-    )
-    .bind(PROJECT_OPERATING_SKILL_KEY)
-    .fetch_optional(state.db.pool())
-    .await?
-    .ok_or_else(|| {
-        ApiError::conflict_with_code(
-            "operating_skill_conflict",
-            "the Project Agent operating skill has no current active revision",
-        )
-    })
+    state
+        .db
+        .current_project_operating_skill_revision_id(PROJECT_OPERATING_SKILL_KEY)
+        .await
+        .map_err(ApiError::project_artifact_mutation)?
+        .ok_or_else(|| {
+            ApiError::conflict_with_code(
+                "operating_skill_conflict",
+                "the Project Agent operating skill has no current active revision",
+            )
+        })
 }

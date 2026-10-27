@@ -318,3 +318,27 @@ async fn terminal_sessions_cascade_when_workspace_is_deleted() {
             .is_empty()
     );
 }
+
+async fn seed_terminal_session(
+    db: &SqliteDb,
+    task_id: &str,
+    workspace_id: &str,
+    user_id: &str,
+    created_at: &str,
+) -> crate::TerminalSession {
+    TerminalSessionRepo::create_terminal_session(
+        db,
+        CreateTerminalSession {
+            id: new_uuid_v4(),
+            task_id: task_id.to_owned(),
+            workspace_id: workspace_id.to_owned(),
+            daemon_id: None,
+            created_by_user_id: user_id.to_owned(),
+            rows: 24,
+            cols: 80,
+            created_at: created_at.to_owned(),
+        },
+    )
+    .await
+    .expect("terminal session creates")
+}

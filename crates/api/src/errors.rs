@@ -134,6 +134,7 @@ impl ApiError {
         }
     }
 
+    // Keep the historical SQL/decode error response body on purpose.
     pub(crate) fn project_artifact_mutation(error: DbError) -> Self {
         tracing::error!(error = %error, "Project artifact mutation failed");
         Self::internal("Project artifact mutation failed")

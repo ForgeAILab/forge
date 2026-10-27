@@ -98,10 +98,9 @@ pub(super) struct World {
     pub(super) reviewer_id: String,
     pub(super) project_paused: bool,
     pub(super) agent_paused: bool,
-    /// Random runs step around the open findings pinned by the ignored
-    /// tests at the end of this file, so they keep finding other things:
-    /// both former guards (cancelled dependencies, Project pause) are
-    /// fixed and removed; the flag stays for the next one.
+    /// Reserved for random runs to step around open findings. The former
+    /// guards for cancelled dependencies and Project pause are fixed and
+    /// removed; the flag currently changes no generated actions.
     pub(super) avoid_open_findings: bool,
     pub(super) tasks: Vec<String>,
     /// Model index -> the terminal state the Task was first seen in.

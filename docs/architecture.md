@@ -69,7 +69,7 @@ types.
 | `integration_owner.rs` | Server owner admission, Git effects, object transfer, and receipt validation stay in the root; tests live in `integration_owner/tests.rs` |
 | `operator_status.rs` | Status computation stays in the root; payload fixtures live in `operator_status/tests.rs` and condition-check tests in `operator_status/condition_check_tests.rs`, alongside the existing log snapshot child |
 | `placement/selection.rs` | Selection types, filters, and context loading stay in the root; selection, readiness, capacity, and loader tests live in `placement/selection/tests.rs` |
-| `task_service/execution/runner.rs` | Execution launch, running, heartbeat, and settlement stay in the root; provider selection, owner launch parameters, turn limits, and log paths live in `runner/provider.rs`, with tests in `runner/tests.rs` |
+| `task_service/execution/runner.rs` | Execution launch, running, heartbeat, and settlement stay in the root; provider selection and cancellation, owner launch parameters, outbox ingestion, turn limits, and log paths live in `runner/provider.rs`, with tests in `runner/tests.rs` |
 | `project_provisioning.rs` | Provisioning operations, checkpoints, repository registration, and role assignment stay in the root; Charter scaffold execution and exports live in `project_provisioning/scaffold.rs`, with tests in `project_provisioning/tests.rs` |
 | `task_service/governance.rs` | Task governance, capability admission, and workspace leases stay in the root; governance and lease tests live in `governance/tests.rs` |
 
@@ -342,9 +342,17 @@ decoding live in `sqlite/shared_media/reads.rs`; routes retain authorization,
 cursor encoding and response projection. Execution timing is fetched before
 ledger usage and decoded afterward; media rows are decoded one at a time before
 checksum reconciliation or response conversion, preserving read and error order.
-SQL/decode failures from these CLI runtime and Project media methods retain the existing
-`500 internal_error` response with `Project artifact mutation failed`; CLI runtime
+SQL/decode failures from these CLI runtime and Project media methods retain the
+existing `500 internal_error` response with `Project artifact mutation failed`; CLI runtime
 policy version conflicts retain their dedicated `cli_runtime.version_conflict`.
+Project artifact pages, Charter/Genesis lookups, context pointers and Overview
+read SQL live in `sqlite/orchestration/` and its `documents/reads.rs`,
+`decisions/reads.rs`, `charters/reads.rs` and `overview.rs` children. Routes retain
+visibility checks, cursor encoding, JSON validation and public response projection.
+Query-specific snapshots defer decoding where projection validation or skip
+branches determine read order; context pointers and scalar lookups decode eagerly.
+Artifact and context SQL/decode errors keep the same historical mutation response;
+Overview errors retain `Project Overview is temporarily unavailable`.
 Project deletion ownership probes live in `sqlite/workspace_root/cleanup.rs`:
 typed owner selectors replace route SQL. The Project route owns `BEGIN IMMEDIATE`,
 the quarantine rename, commit/restore, and post-commit recursive removal; each

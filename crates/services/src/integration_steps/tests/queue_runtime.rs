@@ -423,8 +423,6 @@ async fn the_worker_over_production_ports_writes_only_queue_attempt_and_task_ste
     );
 }
 
-// ----- importer continuation from pre-upgrade fixtures (plan 3.2 stage D2b) --
-
 /// A Task re-enters `merging` while the attempt of its previous entry is the
 /// head of the queue, in the middle of its check. The admission flags that
 /// attempt, the worker releases it at once, and the new entry is admitted

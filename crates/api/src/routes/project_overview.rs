@@ -13,7 +13,6 @@ use axum::{
 };
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
-use sqlx::Row;
 use std::collections::HashMap;
 
 use crate::{
@@ -402,10 +401,10 @@ fn parse_release_refs<T: DeserializeOwned>(value: &str) -> Option<Vec<T>> {
 }
 
 fn typed_json_array<T: DeserializeOwned>(
-    row: &sqlx::sqlite::SqliteRow,
+    value: db::Result<String>,
     column: &str,
 ) -> ApiResult<Vec<T>> {
-    let value = row_json_array(row, column)?;
+    let value = row_json_array(value, column)?;
     serde_json::from_value(value).map_err(|_| invalid_persisted_field(column))
 }
 
@@ -451,13 +450,13 @@ fn append_projection_reason(mut reasons: Value, reason: Value) -> Value {
     reasons
 }
 
-fn row_json(row: &sqlx::sqlite::SqliteRow, column: &str) -> ApiResult<Value> {
-    let value = row.try_get::<String, _>(column).map_err(sql_error)?;
+fn row_json(value: db::Result<String>, column: &str) -> ApiResult<Value> {
+    let value = value.map_err(sql_error)?;
     serde_json::from_str(&value).map_err(|_| invalid_persisted_field(column))
 }
 
-fn row_json_array(row: &sqlx::sqlite::SqliteRow, column: &str) -> ApiResult<Value> {
-    let value = row_json(row, column)?;
+fn row_json_array(value: db::Result<String>, column: &str) -> ApiResult<Value> {
+    let value = row_json(value, column)?;
     if value.is_array() {
         Ok(value)
     } else {
@@ -465,12 +464,12 @@ fn row_json_array(row: &sqlx::sqlite::SqliteRow, column: &str) -> ApiResult<Valu
     }
 }
 
-fn row_json_array_from(row: &sqlx::sqlite::SqliteRow, column: &str) -> ApiResult<Value> {
-    row_json_array(row, column)
+fn row_json_array_from(value: db::Result<String>, column: &str) -> ApiResult<Value> {
+    row_json_array(value, column)
 }
 
-fn string_array_from(row: &sqlx::sqlite::SqliteRow, column: &str) -> ApiResult<Value> {
-    let value = row_json_array(row, column)?;
+fn string_array_from(value: db::Result<String>, column: &str) -> ApiResult<Value> {
+    let value = row_json_array(value, column)?;
     if value
         .as_array()
         .is_some_and(|items| items.iter().all(Value::is_string))
@@ -486,7 +485,7 @@ fn invalid_persisted_field(column: &str) -> ApiError {
     ApiError::internal("Project Overview contains invalid persisted data")
 }
 
-fn sql_error(error: sqlx::Error) -> ApiError {
+fn sql_error(error: db::DbError) -> ApiError {
     tracing::error!(error = %error, "Project Overview query failed");
     ApiError::internal("Project Overview is temporarily unavailable")
 }
