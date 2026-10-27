@@ -134,6 +134,11 @@ impl ApiError {
         }
     }
 
+    pub(crate) fn project_artifact_mutation(error: DbError) -> Self {
+        tracing::error!(error = %error, "Project artifact mutation failed");
+        Self::internal("Project artifact mutation failed")
+    }
+
     fn invalid_operation(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,

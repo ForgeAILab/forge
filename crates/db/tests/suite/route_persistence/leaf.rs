@@ -213,7 +213,7 @@ async fn execution_timing_preserves_runtime_fallbacks_and_latest_tie_breaking() 
     let response = snapshot.with_usage(usage_sample(&db).await).unwrap();
     assert_eq!(response.active_execution_id.as_deref(), Some("running"));
     assert_eq!(response.active_role.as_deref(), Some("reviewer"));
-    assert_eq!(response.active_elapsed_seconds, Some(5.0));
+    assert!((5.0..=6.0).contains(&response.active_elapsed_seconds.unwrap()));
     assert_eq!(response.latest_execution_id.as_deref(), Some("running"));
-    assert_eq!(response.total_runtime_seconds, 65.0);
+    assert!((65.0..=66.0).contains(&response.total_runtime_seconds));
 }

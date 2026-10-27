@@ -84,10 +84,13 @@ pub async fn list_media(
     let (asset_rows, has_more) = state
         .db
         .project_media_asset_id_page(&project_id, cursor, limit)
-        .await?;
+        .await
+        .map_err(ApiError::project_artifact_mutation)?;
     let mut assets = Vec::with_capacity(asset_rows.len());
     for row in asset_rows {
-        let asset_id = row.asset_id()?;
+        let asset_id = row
+            .asset_id()
+            .map_err(ApiError::project_artifact_mutation)?;
         let asset = SharedMediaRepo::get_media_asset(&*state.db, &asset_id)
             .await?
             .filter(|asset| asset.project_id == project_id)
@@ -96,7 +99,8 @@ pub async fn list_media(
         let task_media_ids = state
             .db
             .project_media_task_media_ids(&project_id, &asset_id)
-            .await?;
+            .await
+            .map_err(ApiError::project_artifact_mutation)?;
         let task_media_ids = if task_media_ids.is_empty() {
             asset.legacy_task_media_id.clone().into_iter().collect()
         } else {
@@ -601,10 +605,15 @@ pub async fn list_evidence(
     let (attachments, has_more) = state
         .db
         .project_evidence_page(&project_id, &milestone_id, cursor, limit)
-        .await?;
+        .await
+        .map_err(ApiError::project_artifact_mutation)?;
     let mut items = Vec::with_capacity(attachments.len());
     for attachment in attachments {
-        items.push(evidence_attachment_response(attachment.into_attachment()?)?);
+        items.push(evidence_attachment_response(
+            attachment
+                .into_attachment()
+                .map_err(ApiError::project_artifact_mutation)?,
+        )?);
     }
     let next_cursor = has_more
         .then(|| {
@@ -635,7 +644,8 @@ pub async fn get_evidence(
     let attachment = state
         .db
         .project_evidence_by_id(&project_id, &milestone_id, &evidence_id)
-        .await?
+        .await
+        .map_err(ApiError::project_artifact_mutation)?
         .ok_or_else(|| ApiError::not_found("evidence", evidence_id))?;
     Ok(Json(evidence_attachment_response(attachment)?))
 }

@@ -264,7 +264,7 @@ pub async fn set_cli_runtime_availability(
                 "cli_runtime.version_conflict",
                 "CLI runtime availability changed before it could be updated",
             ),
-            other => ApiError::from(other),
+            other => ApiError::project_artifact_mutation(other),
         })?;
     let entries = cli_runtime_entries_for_daemon(&state, &user.user_id, daemon).await?;
     let entry = entries
@@ -467,7 +467,8 @@ async fn cli_runtime_entries_for_daemon(
     let policy_by_executor = state
         .db
         .cli_runtime_policies_for_daemon(owner_user_id, &daemon.id)
-        .await?;
+        .await
+        .map_err(ApiError::project_artifact_mutation)?;
     Ok(detected
         .into_iter()
         .map(|cli| {
