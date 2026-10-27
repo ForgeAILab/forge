@@ -67,7 +67,7 @@ pub(super) fn is_deterministic_dispatch_refusal(error: &ServiceError) -> bool {
 }
 
 /// One list with the Task condition mapping, so the two cannot drift.
-pub(super) const BLOCKING_ANNOTATION_KINDS: &[&str] = db::LEGACY_BLOCKING_ANNOTATION_KINDS;
+pub(super) const BLOCKING_ANNOTATION_KINDS: &[&str] = db::BLOCKING_ANNOTATION_KINDS;
 const _: () = assert!(matches!(
     crate::workflow::engine::DISPATCH_FAILED_ANNOTATION.as_bytes(),
     b"dispatch_failed"

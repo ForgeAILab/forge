@@ -6,10 +6,25 @@
 use super::*;
 use std::time::{Duration, Instant};
 
+const BACKFILL_CURSOR_KEY: &str = "task_condition_backfill_cursor";
+
+#[derive(Serialize, Deserialize)]
+struct BackfillCursor {
+    revision: i64,
+    after: String,
+}
+
 /// Rows recomputed per page.
 pub const CONDITION_CHECK_PAGE: usize = 50;
 /// Work one tick may spend re-running the backfill after a mapping change.
 const BACKFILL_SLICE: Duration = Duration::from_millis(250);
+
+fn condition_page_select(resuming: bool) -> String {
+    // An OR with a nullable cursor makes SQLite scan the index from its
+    // beginning on every page. Keep resumed pages as a primary-key seek.
+    let predicate = if resuming { "id>?1" } else { "?1 IS NULL" };
+    format!("SELECT {CHANNEL_SELECT},id,version FROM task WHERE {predicate} ORDER BY id LIMIT ?2")
+}
 
 /// One walk over every Task, first id to last.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -24,9 +39,14 @@ pub struct ConditionCheckPass {
     pub completed_at: String,
 }
 impl ConditionCheckPass {
-    fn add(&mut self, page: &Page) {
+    fn add(&mut self, page: &Page, include_encoding: bool) {
         self.checked += page.checked;
-        self.repaired += page.repaired;
+        self.repaired += page.repaired
+            - if include_encoding {
+                0
+            } else {
+                page.encoding_repairs
+            };
         // A Task the scheduler re-checks within one pass is counted once
         // (exactly, while the named list has room for it).
         for id in &page.quarantined {
@@ -85,6 +105,9 @@ impl Drop for CheckGuard {
 struct Page {
     checked: u64,
     repaired: u64,
+    /// Adding a digest to an otherwise matching readable cache is an
+    /// upgrade, never an invariant incident reported to the operator.
+    encoding_repairs: u64,
     /// Ids on this page left quarantined.
     quarantined: Vec<String>,
     /// The cursor after this page; `None` once the last Task was read.
@@ -123,7 +146,7 @@ impl SqliteDb {
         let ids = serde_json::to_string(ids).map_err(|e| DbError::Check(e.to_string()))?;
         let page = self
             .check_condition_rows(
-                &format!("SELECT {LEGACY_SELECT},id,version FROM task WHERE id IN (SELECT value FROM json_each(?1)) AND ?2 ORDER BY id"),
+                &format!("SELECT {CHANNEL_SELECT},id,version FROM task WHERE id IN (SELECT value FROM json_each(?1)) AND ?2 ORDER BY id"),
                 Some(&ids),
                 1,
             )
@@ -133,9 +156,9 @@ impl SqliteDb {
         state.status.repaired += page.repaired;
         state.status.ticks += 1;
         state.status.last_at = Some(crate::now_rfc3339());
-        state.pass.add(&page);
+        state.pass.add(&page, false);
         drop(state);
-        if page.repaired != 0 {
+        if page.repaired != page.encoding_repairs {
             tracing::warn!(
                 checked = page.checked,
                 repaired = page.repaired,
@@ -167,6 +190,34 @@ impl SqliteDb {
         };
         let _running = CheckGuard(self.condition_checks.clone());
         let page = self.check_condition_page(after.as_deref(), limit).await?;
+        let backfilling = self
+            .condition_checks
+            .lock()
+            .expect("condition checks")
+            .backfill
+            == Some(true);
+        if backfilling && limit != 0 {
+            // Persist only after the page's fenced repairs have committed.
+            // Replaying a page after a crash is harmless; skipping it is not.
+            let mut tx = crate::begin_immediate(self.pool()).await?;
+            if let Some(after) = &page.next {
+                let cursor = serde_json::to_string(&BackfillCursor {
+                    revision: MAPPING_REVISION,
+                    after: after.clone(),
+                })
+                .map_err(storage::json_error)?;
+                sqlx::query("INSERT INTO system_setting(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at")
+                    .bind(BACKFILL_CURSOR_KEY).bind(cursor).bind(crate::now_rfc3339()).execute(&mut *tx).await?;
+            } else {
+                sqlx::query("INSERT INTO system_setting(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at")
+                    .bind(MAPPING_REVISION_KEY).bind(MAPPING_REVISION.to_string()).bind(crate::now_rfc3339()).execute(&mut *tx).await?;
+                sqlx::query("DELETE FROM system_setting WHERE key=?")
+                    .bind(BACKFILL_CURSOR_KEY)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            tx.commit().await?;
+        }
         let (backfilling, completed) = {
             let mut state = self.condition_checks.lock().expect("condition checks");
             state.in_progress = false;
@@ -174,9 +225,9 @@ impl SqliteDb {
             state.status.repaired += page.repaired;
             state.status.ticks += 1;
             state.status.last_at = Some(crate::now_rfc3339());
-            state.pass.add(&page);
-            state.after = page.next.clone();
             let backfilling = state.backfill == Some(true);
+            state.pass.add(&page, backfilling);
+            state.after = page.next.clone();
             let completed = (limit != 0 && page.next.is_none()).then(|| {
                 let mut pass = std::mem::take(&mut state.pass);
                 pass.completed_at = crate::now_rfc3339();
@@ -205,13 +256,6 @@ impl SqliteDb {
                 "Task condition invariant pass completed"
             );
             if backfilling {
-                crate::SystemSettingRepo::set_setting(
-                    self,
-                    MAPPING_REVISION_KEY,
-                    &MAPPING_REVISION.to_string(),
-                    &crate::now_rfc3339(),
-                )
-                .await?;
                 self.condition_checks
                     .lock()
                     .expect("condition checks")
@@ -242,14 +286,24 @@ impl SqliteDb {
                     .as_deref()
                     .and_then(|recorded| recorded.parse::<i64>().ok())
                     .is_none_or(|recorded| recorded < MAPPING_REVISION);
+                let cursor = if stale {
+                    crate::SystemSettingRepo::get_setting(self, BACKFILL_CURSOR_KEY)
+                        .await?
+                        .and_then(|raw| serde_json::from_str::<BackfillCursor>(&raw).ok())
+                        .filter(|cursor| cursor.revision == MAPPING_REVISION)
+                        .map(|cursor| cursor.after)
+                } else {
+                    None
+                };
                 let mut state = self.condition_checks.lock().expect("condition checks");
                 state.backfill = Some(stale);
                 if stale {
                     // The pass that clears the marker must cover every row.
-                    state.after = None;
+                    state.after = cursor;
                     state.pass = ConditionCheckPass::default();
                 }
-                stale
+                // Discovering an upgrade never does row work on this tick.
+                return Ok(stale);
             }
         };
         if !backfilling {
@@ -289,6 +343,15 @@ impl SqliteDb {
             return Ok(0);
         }
         let condition = decode(expected)?;
+        let row = sqlx::query(&format!("SELECT {CHANNEL_SELECT} FROM task WHERE id=?"))
+            .bind(task_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        // Metadata and some channel writes deliberately leave version alone.
+        // Fence those bytes too, under the writer lock, before a repair.
+        if !condition.channels_match(&ConditionInput::from_row(&row)?) {
+            return Ok(0);
+        }
         let corrupt = matches!(classify(read_condition), Stored::Corrupt(_));
         if corrupt {
             recovery::record_raw(&mut tx, task_id, read_condition).await?;
@@ -308,16 +371,13 @@ impl SqliteDb {
             return Ok(Page {
                 checked: 0,
                 repaired: 0,
+                encoding_repairs: 0,
                 quarantined: Vec::new(),
                 next: after.map(str::to_owned),
             });
         }
         let mut page = self
-            .check_condition_rows(
-                &format!("SELECT {LEGACY_SELECT},id,version FROM task WHERE ?1 IS NULL OR id>?1 ORDER BY id LIMIT ?2"),
-                after,
-                limit as i64,
-            )
+            .check_condition_rows(&condition_page_select(after.is_some()), after, limit as i64)
             .await?;
         if page.checked as usize != limit {
             page.next = None;
@@ -351,17 +411,35 @@ impl SqliteDb {
                 continue;
             }
             let expected = async {
-                let input = LegacyConditionInput::from_row(row)?;
+                let input = ConditionInput::from_row(row)?;
                 let facts = ConditionFacts::load(&mut reader, &id).await?;
                 Ok::<_, DbError>(facts.condition(&input))
             }
             .await;
             match expected {
-                Ok(condition) => {
+                Ok(mut condition) => {
+                    let mut encoding_only = false;
+                    // An encoding-only upgrade preserves the existing cache
+                    // body, including stated presentation and owned witnesses.
+                    if let Stored::Readable(mut prior) = classified {
+                        let missing_digest = prior.evidence().channel_digest.is_none();
+                        if missing_digest && prior.typed() == condition.typed() {
+                            encoding_only = true;
+                            prior.evidence_mut().channel_digest =
+                                condition.evidence().channel_digest.clone();
+                            condition = *prior;
+                        }
+                    }
                     let expected = encode(&condition);
                     let stored: Vec<u8> = row.try_get(5)?;
                     if !TaskCondition::stored_agrees(&stored, &condition, &expected) {
-                        stale.push((id, row.try_get::<i64, _>(7)?, stored, expected));
+                        stale.push((
+                            id,
+                            row.try_get::<i64, _>(7)?,
+                            stored,
+                            expected,
+                            encoding_only,
+                        ));
                     }
                 }
                 Err(error) => {
@@ -371,13 +449,19 @@ impl SqliteDb {
         }
         reader.rollback().await?;
         let mut repaired = 0;
-        for (id, version, stored, expected) in stale {
+        let mut encoding_repairs = 0;
+        for (id, version, stored, expected, encoding_only) in stale {
             // A row written since is left to its own producer and the next pass.
             match self
                 .repair_condition(&id, version, &stored, &expected)
                 .await
             {
-                Ok(count) => repaired += count,
+                Ok(count) => {
+                    repaired += count;
+                    if encoding_only {
+                        encoding_repairs += count;
+                    }
+                }
                 Err(error) => {
                     tracing::warn!(task_id = %id, error_kind = repair_error_kind(&error), "Task condition could not be repaired; skipped")
                 }
@@ -386,6 +470,7 @@ impl SqliteDb {
         Ok(Page {
             checked: rows.len() as u64,
             repaired,
+            encoding_repairs,
             quarantined,
             next: rows.last().map(|row| row.try_get(6)).transpose()?,
         })
@@ -398,5 +483,31 @@ fn repair_error_kind(error: &DbError) -> &'static str {
         DbError::Check(_) => "condition",
         DbError::VersionConflict => "version_conflict",
         _ => "storage",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn resumed_revision_pages_seek_past_the_cursor_instead_of_scanning() {
+        let db = crate::task_condition::tests::db().await;
+        let rows = sqlx::query(&format!(
+            "EXPLAIN QUERY PLAN {}",
+            condition_page_select(true)
+        ))
+        .bind("cursor")
+        .bind(CONDITION_CHECK_PAGE as i64)
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert!(
+            rows.iter().any(|row| {
+                let detail: String = row.get("detail");
+                detail.contains("SEARCH task") && detail.contains("id>?")
+            }),
+            "resumed pages must use the id range, even late in a large archive"
+        );
     }
 }

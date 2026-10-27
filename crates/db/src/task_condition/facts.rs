@@ -107,7 +107,7 @@ pub fn material_blocker(condition: &TaskCondition) -> MaterialBlocker {
             interruption: None,
         })
 }
-pub(super) fn legacy_material_blocker(
+pub(super) fn channel_material_blocker(
     a: Option<&str>,
     b: Option<&str>,
     f: Option<&str>,
@@ -315,10 +315,10 @@ impl TaskCondition {
     }
     /// Refresh a stale legacy projection while carrying supported typed owners.
     /// Used by the scheduler's read snapshot before the repair sweep writes it.
-    pub fn restate_legacy(&self, input: &LegacyConditionInput) -> Self {
+    pub fn recompose(&self, input: &ConditionInput) -> Self {
         match ConditionFacts::recover(self) {
             Some(facts) => facts.condition(input),
-            None => map_legacy_condition(input),
+            None => compose_condition(input),
         }
     }
     pub fn reasons(&self) -> impl Iterator<Item = &ParkReason> {
@@ -428,7 +428,7 @@ impl Families {
 /// One Task row as a producer reads it, with the requested fact families.
 pub(super) struct Snapshot {
     pub id: String,
-    pub input: LegacyConditionInput,
+    pub input: ConditionInput,
     pub stored: Vec<u8>,
     pub version: i64,
     pub state: String,
@@ -463,7 +463,7 @@ impl Snapshot {
         };
         Ok(Some(Self {
             id: id.to_owned(),
-            input: LegacyConditionInput::from_row(&row)?,
+            input: ConditionInput::from_row(&row)?,
             stored: row.try_get(5)?,
             version: row.try_get(6)?,
             state: row.try_get(7)?,
@@ -828,11 +828,11 @@ impl ConditionFacts {
         witnesses
     }
     /// The condition these facts and the legacy fields state together.
-    pub fn condition(&self, input: &LegacyConditionInput) -> TaskCondition {
+    pub fn condition(&self, input: &ConditionInput) -> TaskCondition {
         self.condition_of(&input.view())
     }
-    pub(super) fn condition_of(&self, view: &LegacyView<'_>) -> TaskCondition {
-        self.apply(map_view_from(self.initial, view))
+    pub(super) fn condition_of(&self, view: &ChannelView<'_>) -> TaskCondition {
+        self.apply(compose_channels_from(self.initial, view))
     }
     /// Combine the legacy mapping with these facts. Legacy is authoritative:
     /// a condition parks exactly where today's readers hold the Task.
@@ -900,7 +900,7 @@ impl ConditionFacts {
                 // Legacy dispatches a flagged root without visible children as
                 // an ordinary Task. Keep the diagnosis; do not park.
                 let observation = unknown(
-                    &LegacyConditionField::MetadataJson,
+                    &ConditionField::MetadataJson,
                     Some("coordination_review_pending"),
                     UnknownConditionProblem::UnownedEntry,
                 );
@@ -917,7 +917,7 @@ impl ConditionFacts {
         }
         let remote_cancel = !self.operations.is_empty();
         let remote_reason = ParkReason::RemoteCancelPending {
-            source: source(&LegacyConditionField::PendingRemoteCancel, None),
+            source: source(&ConditionField::PendingRemoteCancel, None),
         };
         let remaining = || {
             self.children
@@ -1034,9 +1034,9 @@ impl Snapshot {
         };
         let mapped = match write::current_statement(&self.id) {
             Some(ConditionStatement::Preserve) => stored(),
-            _ => Some(map_view(&self.input.view())),
+            _ => Some(compose_channels(&self.input.view())),
         };
-        let mapped = mapped.unwrap_or_else(|| map_view(&self.input.view()));
+        let mapped = mapped.unwrap_or_else(|| compose_channels(&self.input.view()));
         if !matches!(
             mapped,
             TaskCondition::Parked {

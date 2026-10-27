@@ -45,7 +45,7 @@ fn legacy_conditions_keep_parity_and_integration_waits_have_owned_offers() {
         s.task.blocked_json = b.map(|v: Value| v.to_string());
         s.task.failed_json = f.map(|v| v.to_string());
         s.task.metadata_json = m.map(|v| v.to_string());
-        let mut condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&s.task));
+        let mut condition = db::compose_condition(&db::ConditionInput::from(&s.task));
         if kind == "entering" {
             condition = db::TaskCondition::Entering {
                 state: s.task.status.clone(),

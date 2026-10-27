@@ -136,10 +136,10 @@ async fn owner_reset_real_writer_equals_legacy_oracle_and_retains_long_text() {
         let facts = db::ConditionFacts::load(&mut connection, &task.id)
             .await
             .unwrap();
-        let mut legacy = db::LegacyConditionInput::from(&row);
+        let mut legacy = db::ConditionInput::from(&row);
         drop(connection);
         legacy.facts = Some(facts);
-        let mapped = db::map_legacy_condition(&legacy);
+        let mapped = db::compose_condition(&legacy);
         db::task_writer::in_task_step(step, async {
             let mut tx = db.pool().begin().await.unwrap();
             db.produce_condition_in_tx(&mut tx, &task.id, db::ConditionChange::Legacy)
@@ -214,11 +214,11 @@ async fn large_root_and_200kb_reason_store_main_encoder_bytes_and_full_diagnosti
             .await
             .unwrap();
         drop(connection);
-        let mut legacy = db::LegacyConditionInput::from(&row);
+        let mut legacy = db::ConditionInput::from(&row);
         legacy.facts = Some(facts);
         // MAIN serializes the legacy mapper directly, with no payload preparation.
         // The oracle never calls this branch's producer or condition setter.
-        let mut mapped = db::map_legacy_condition(&legacy);
+        let mut mapped = db::compose_condition(&legacy);
         if held {
             // MAIN's Hold omits legacy copies and marks its typed statement.
             mapped = mapped.typed();
@@ -233,7 +233,11 @@ async fn large_root_and_200kb_reason_store_main_encoder_bytes_and_full_diagnosti
             .fetch_one(db.pool())
             .await
             .unwrap();
-        assert_eq!(stored.as_bytes(), expected.as_bytes());
+        assert!(row.condition.channels_match(&legacy));
+        assert_eq!(
+            db::task_condition::test_support::without_channel_digest(&stored).as_bytes(),
+            db::task_condition::test_support::without_channel_digest(&expected).as_bytes()
+        );
         assert_eq!(
             row.condition
                 .evidence()

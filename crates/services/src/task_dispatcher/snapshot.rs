@@ -22,6 +22,8 @@ pub(super) struct Prepared {
     pub machine_wait: bool,
     /// The stored condition did not match the legacy fields it shadows.
     pub condition_stale: bool,
+    /// Only the cache encoding changed; do not report a missed producer.
+    pub condition_encoding_upgrade: bool,
 }
 /// Snapshot form of `task_hierarchy::effective_role_assignment`, over the rows
 /// the schedule read loaded (the Task's own, and its root's `coder` and
@@ -98,7 +100,7 @@ fn from_barrier(reason: &ParkReason) -> bool {
         | ParkReason::UnknownCondition { source, .. } => source,
         _ => return false,
     };
-    source.field == db::LegacyConditionField::EntryBarrierJson
+    source.field == db::ConditionField::EntryBarrierJson
 }
 /// `barrier_holds` is false where the base scheduler never read the entry
 /// barrier: admission from an initial state, and a gate that cascades past an
@@ -139,7 +141,7 @@ fn blocking(c: &TaskCondition, barrier_holds: bool) -> bool {
                 p,
                 ParkReason::UnknownCondition {
                     source: db::ConditionSource {
-                        field: db::LegacyConditionField::SchedulePark,
+                        field: db::ConditionField::SchedulePark,
                         ..
                     },
                     ..
@@ -174,13 +176,11 @@ fn earlier(deadline: &mut Option<String>, time: Option<DateTime<Utc>>, now: Date
     }
 }
 fn stale_condition(stored: &TaskCondition, task: &db::Task) -> Option<TaskCondition> {
-    // A writer stated this condition in the transaction of its write:
-    // it is not a copy of the legacy fields and cannot lag them.
     let unreadable = stored.reasons().find_map(|reason| match reason {
         ParkReason::UnknownCondition {
             source:
                 db::ConditionSource {
-                    field: db::LegacyConditionField::ConditionJson,
+                    field: db::ConditionField::ConditionJson,
                     ..
                 },
             problem,
@@ -193,25 +193,11 @@ fn stale_condition(stored: &TaskCondition, task: &db::Task) -> Option<TaskCondit
         Some(db::UnknownConditionProblem::UnknownKind) => return None,
         // Corrupt or empty: the legacy fields are intact, so resolve
         // from them and let the check restate the stored copy.
-        Some(_) => {
-            return Some(db::map_legacy_condition(&db::LegacyConditionInput::from(
-                task,
-            )))
-        }
+        Some(_) => return Some(db::compose_condition(&db::ConditionInput::from(task))),
         None => {}
     }
-    if stored.evidence().stated {
-        return None;
-    }
-    let legacy = stored.restate_legacy(&db::LegacyConditionInput::from(task));
-    let (stored, fresh) = (stored.evidence(), legacy.evidence());
-    (stored.error_annotation != fresh.error_annotation
-        || stored.blocked_json != fresh.blocked_json
-        || stored.failed_json != fresh.failed_json
-        || stored.entry_barrier_json != fresh.entry_barrier_json
-        || stored.metadata != fresh.metadata
-        || stored.unparsed_metadata != fresh.unparsed_metadata)
-        .then_some(legacy)
+    let input = db::ConditionInput::from(task);
+    (!stored.channels_match(&input)).then(|| stored.recompose(&input))
 }
 impl TaskDispatcher {
     pub(super) fn prepare_schedule(
@@ -226,6 +212,9 @@ impl TaskDispatcher {
         // fields hold, and leave the stored copy to be repaired.
         let legacy = stale_condition(&r.condition, &r.task);
         let condition_stale = legacy.is_some();
+        let condition_encoding_upgrade = legacy.as_ref().is_some_and(|fresh| {
+            r.condition.evidence().channel_digest.is_none() && r.condition.typed() == fresh.typed()
+        });
         if let Some(legacy) = legacy {
             // Every callee handed this Task reads the same condition this
             // pass resolved from.
@@ -733,6 +722,7 @@ impl TaskDispatcher {
             deadline,
             machine_wait: false,
             condition_stale,
+            condition_encoding_upgrade,
         }
     }
 }
@@ -741,28 +731,70 @@ impl TaskDispatcher {
 mod tests {
     use super::*;
     #[test]
+    fn digest_checks_stated_rows_and_bytes_beyond_the_evidence_limit() {
+        let mut task = crate::task_actions::test_support::snapshot("todo", None).task;
+        task.error_annotation = Some(format!(
+            "{}a",
+            "x".repeat(db::task_condition::EVIDENCE_VALUE_LIMIT + 100)
+        ));
+        let input = db::ConditionInput::from(&task);
+        let mut stored = serde_json::to_value(db::compose_condition(&input)).unwrap();
+        stored["evidence"]["stated"] = serde_json::json!(true);
+        let stored: TaskCondition = serde_json::from_value(stored).unwrap();
+        assert!(stale_condition(&stored, &task).is_none());
+        let raw = task.error_annotation.as_mut().unwrap();
+        raw.pop();
+        raw.push('b');
+        let fresh =
+            stale_condition(&stored, &task).expect("a stated cache can miss a raw write too");
+        assert_eq!(
+            stored.evidence().error_annotation,
+            fresh.evidence().error_annotation
+        );
+        assert_ne!(
+            stored.evidence().channel_digest,
+            fresh.evidence().channel_digest
+        );
+    }
+
+    #[test]
+    fn unrelated_metadata_does_not_stale_the_dispatcher_cache() {
+        let mut task = crate::task_actions::test_support::snapshot("todo", None).task;
+        task.metadata_json = None;
+        let stored = db::compose_condition(&db::ConditionInput::from(&task));
+        task.metadata_json = Some(r#"{"unrelated":123}"#.into());
+        assert!(stale_condition(&stored, &task).is_none());
+        task.metadata_json = Some(r#"{"awaiting_human":false}"#.into());
+        let stored = db::compose_condition(&db::ConditionInput::from(&task));
+        task.metadata_json =
+            Some(r#"{"unrelated":{"large":"payload"}, "awaiting_human":false}"#.into());
+        assert!(stale_condition(&stored, &task).is_none());
+    }
+    #[test]
     fn corrupt_rows_use_the_legacy_oracle() {
         let mut task = crate::task_actions::test_support::snapshot(
             "todo",
             Some(api_types::FailureKind::WorkspaceError),
         )
         .task;
-        task.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&task));
+        task.condition = db::compose_condition(&db::ConditionInput::from(&task));
         let corrupt = db::task_condition::decode_or_unknown("{}");
-        let expected = db::map_legacy_condition(&db::LegacyConditionInput::from(&task));
+        let expected = db::compose_condition(&db::ConditionInput::from(&task));
         assert_eq!(stale_condition(&corrupt, &task), Some(expected));
     }
 
     #[tokio::test]
-    async fn legacy_evidence_detects_missed_syncs_in_each_legacy_input() {
+    async fn channel_digest_detects_raw_sql_missed_syncs_and_the_sweep_repairs_them() {
         use db::TaskRepo;
         let db = crate::recovery::test_support::sqlite_db().await;
         let (project, _) = crate::recovery::test_support::seed_project_repo(&db).await;
         let task =
             crate::recovery::test_support::seed_task(&db, project, "in_progress".into(), None)
                 .await;
+        let prefix = "x".repeat(db::task_condition::EVIDENCE_VALUE_LIMIT + 100);
         let annotation =
-            serde_json::json!({"type":"workspace_error", "blocking_reason":"old"}).to_string();
+            serde_json::json!({"type":"workspace_error", "blocking_reason":format!("{prefix}a")})
+                .to_string();
         let metadata = serde_json::json!({"coordination_review_pending":true}).to_string();
         let mut tx = db.pool().begin().await.unwrap();
         for i in 0..400 {
@@ -803,6 +835,8 @@ mod tests {
             sqlx::query(&format!("UPDATE task SET {field}=? WHERE id=?"))
                 .bind(if field == "metadata_json" {
                     serde_json::json!({"coordination_review_pending":true, "awaiting_human":false}).to_string()
+                } else if field == "error_annotation" {
+                    serde_json::json!({"type":"workspace_error", "blocking_reason":format!("{prefix}b")}).to_string()
                 } else {
                     serde_json::json!({"kind":"manual_stop","type":"manual_stop","reason":"new hold"}).to_string()
                 })
@@ -813,10 +847,17 @@ mod tests {
                 .unwrap();
             let restated =
                 stale_condition(&stored, &changed).unwrap_or_else(|| panic!("missed {field} sync"));
+            if field == "error_annotation" {
+                assert_eq!(
+                    stored.evidence().error_annotation,
+                    restated.evidence().error_annotation,
+                    "the missed raw write differs only beyond the bounded evidence copy"
+                );
+            }
             assert_eq!(
                 restated.public(),
                 stored
-                    .restate_legacy(&db::LegacyConditionInput::from(&changed))
+                    .recompose(&db::ConditionInput::from(&changed))
                     .public()
             );
             assert!(blocking(&restated, true), "{field}");
@@ -860,8 +901,8 @@ mod tests {
     #[test]
     fn integration_restatement_preserves_lineage_and_new_legacy_holds() {
         for condition in crate::task_actions::tests::integration_conditions() {
-            let input = db::LegacyConditionInput { error_annotation: Some(serde_json::json!({"type":"manual_stop","blocking_reason":"new hold","blocked_by":"user"}).to_string()), ..Default::default() };
-            let restated = condition.restate_legacy(&input);
+            let input = db::ConditionInput { error_annotation: Some(serde_json::json!({"type":"manual_stop","blocking_reason":"new hold","blocked_by":"user"}).to_string()), ..Default::default() };
+            let restated = condition.recompose(&input);
             assert_eq!(
                 restated.integration_reason(),
                 condition.integration_reason()

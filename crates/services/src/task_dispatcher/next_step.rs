@@ -647,7 +647,7 @@ pub fn next_step(s: &Snapshot<'_>) -> Next {
 mod tests {
     use super::*;
     use crate::workflow::engine::WorkflowEngine;
-    use db::{ConditionEvidence, LegacyConditionInput};
+    use db::{ConditionEvidence, ConditionInput};
     fn facts(bits: u32) -> Facts {
         let bit = |n: u32| (bits & (1_u32 << n)) != 0_u32;
         Facts {
@@ -702,7 +702,7 @@ mod tests {
                 resume: db::ConditionContinuation::Reconcile,
                 evidence: evidence.clone(),
             },
-            db::map_legacy_condition(&LegacyConditionInput {
+            db::compose_condition(&ConditionInput {
                 blocked_json: Some("{}".into()),
                 ..Default::default()
             }),
@@ -837,7 +837,7 @@ mod tests {
                 integration_handoff_ready: true,
                 ..Default::default()
             }
-            .condition(&db::LegacyConditionInput::default());
+            .condition(&db::ConditionInput::default());
             let f = Facts {
                 role_target: Some(("assigned_role".into(), "agent".into())),
                 child_ready: true,
@@ -1034,7 +1034,7 @@ mod tests {
         use db::{ConditionCapacityScope, ConditionEnvironmentKind, ConditionSource};
         let workflow = WorkflowEngine::resolve_workflow("{}");
         let source = || ConditionSource {
-            field: db::LegacyConditionField::MetadataJson,
+            field: db::ConditionField::MetadataJson,
             key: None,
         };
         let self_clearing = [

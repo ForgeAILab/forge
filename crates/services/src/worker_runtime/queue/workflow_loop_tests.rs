@@ -42,7 +42,7 @@ async fn loop_event_is_broadcast_once_with_durable_audit_envelope() {
         }
     )));
     let mut connection = db.pool().acquire().await.unwrap();
-    let mut input = db::LegacyConditionInput::from(&task);
+    let mut input = db::ConditionInput::from(&task);
     input.facts = Some(
         db::ConditionFacts::load(&mut connection, "t")
             .await
@@ -51,7 +51,7 @@ async fn loop_event_is_broadcast_once_with_durable_audit_envelope() {
     drop(connection);
     assert_eq!(
         task.condition.typed(),
-        db::map_legacy_condition(&input).typed()
+        db::compose_condition(&input).typed()
     );
     relay.broadcast_once(100).await.unwrap();
     relay.broadcast_once(100).await.unwrap();

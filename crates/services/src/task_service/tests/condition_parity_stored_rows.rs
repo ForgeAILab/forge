@@ -226,7 +226,7 @@ fn shapes() -> Vec<Shape> {
         annotation: ann("workspace_error"),
         ..shape("failed_and_annotation", "in_progress")
     });
-    for kind in db::LEGACY_BLOCKING_ANNOTATION_KINDS {
+    for kind in db::BLOCKING_ANNOTATION_KINDS {
         let label: &'static str = Box::leak(format!("ann_{kind}").into_boxed_str());
         v.push(Shape {
             annotation: ann(kind),
@@ -506,7 +506,7 @@ async fn stored_rows_read_the_same_through_legacy_and_condition_readers() {
     let (project, _, _repo_dir) = seed_project_repo(&db).await;
     let agent = seed_agent(&db).await;
     let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(1024)));
-    let kinds = serde_json::to_string(db::LEGACY_BLOCKING_ANNOTATION_KINDS).unwrap();
+    let kinds = serde_json::to_string(db::BLOCKING_ANNOTATION_KINDS).unwrap();
     let mut found: Vec<(&'static str, Vec<String>)> = Vec::new();
     let all = shapes();
     assert!(all.len() > 90, "the stored-row table: {}", all.len());

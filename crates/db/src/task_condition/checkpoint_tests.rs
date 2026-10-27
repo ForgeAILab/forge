@@ -275,7 +275,7 @@ async fn additive_upgrade_and_revision_seven_preserve_existing_condition_bytes_a
         let row = TaskRepo::get_by_id(&db, id, false).await.unwrap().unwrap();
         let mut c = db.pool().acquire().await.unwrap();
         let facts = ConditionFacts::load(&mut c, id).await.unwrap();
-        let legacy = facts.condition(&LegacyConditionInput::from(&row));
+        let legacy = facts.condition(&ConditionInput::from(&row));
         let raw = encode(&legacy); // Same legacy mapper and encoding as MAIN.
         sqlx::query("UPDATE task SET condition_json=? WHERE id=?")
             .bind(&raw)
@@ -286,9 +286,13 @@ async fn additive_upgrade_and_revision_seven_preserve_existing_condition_bytes_a
         drop(c);
         before.push((id, raw, material_blocker(&legacy), legacy.public()));
     }
-    db.set_setting(MAPPING_REVISION_KEY, "7", &crate::now_rfc3339())
-        .await
-        .unwrap();
+    db.set_setting(
+        MAPPING_REVISION_KEY,
+        &MAPPING_REVISION.to_string(),
+        &crate::now_rfc3339(),
+    )
+    .await
+    .unwrap();
     sqlx::raw_sql(
         "DROP TABLE task_diagnostic_text; DELETE FROM _migration WHERE version=202610250745;",
     )
@@ -297,7 +301,7 @@ async fn additive_upgrade_and_revision_seven_preserve_existing_condition_bytes_a
     .unwrap();
     crate::run_migrations(db.pool()).await.unwrap();
     assert_eq!(
-        MAPPING_REVISION, 7,
+        MAPPING_REVISION, 8,
         "no forced re-encoding walk for the additive checkpoint"
     );
     assert!(!db.backfill_task_conditions_if_stale().await.unwrap());
@@ -359,7 +363,7 @@ async fn corrupt_legacy_blockers_rebuild_with_the_base_condition_and_attention_i
         let row = TaskRepo::get_by_id(&db, id, false).await.unwrap().unwrap();
         let mut c = db.pool().acquire().await.unwrap();
         let facts = ConditionFacts::load(&mut c, id).await.unwrap();
-        expected.push((id, facts.condition(&LegacyConditionInput::from(&row))));
+        expected.push((id, facts.condition(&ConditionInput::from(&row))));
     }
     assert_eq!(db.check_task_conditions(100).await.unwrap().repaired, 4);
     for (id, legacy) in expected {
@@ -436,7 +440,7 @@ async fn real_hold_with_200kb_of_json_escaped_text_keeps_operator_json_and_mater
     let expected = ConditionFacts::load(&mut c, "escaped-hold")
         .await
         .unwrap()
-        .condition(&LegacyConditionInput::from(&row));
+        .condition(&ConditionInput::from(&row));
     drop(c);
     assert_eq!(
         material_blocker(&row.condition),

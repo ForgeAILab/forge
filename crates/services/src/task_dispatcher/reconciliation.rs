@@ -551,11 +551,13 @@ impl TaskDispatcher {
                 .db
                 .check_task_conditions_of(std::slice::from_ref(&p.read.task.id))
                 .await?;
-            self.schedule_state
-                .lock()
-                .expect("schedule state")
-                .sweep
-                .repairs += repaired;
+            if !p.condition_encoding_upgrade {
+                self.schedule_state
+                    .lock()
+                    .expect("schedule state")
+                    .sweep
+                    .repairs += repaired;
+            }
         }
         if !p.read.queue_owned
             && p.read.reviews.is_empty()
@@ -611,7 +613,7 @@ impl TaskDispatcher {
                         }
                         | db::ParkReason::UnknownCondition {
                             source: db::ConditionSource {
-                                field: db::LegacyConditionField::SchedulePark,
+                                field: db::ConditionField::SchedulePark,
                                 ..
                             },
                             ..

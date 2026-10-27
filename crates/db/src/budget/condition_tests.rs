@@ -21,6 +21,7 @@ async fn snapshot(db: &SqliteDb, phase: &str) {
         .fetch_one(db.pool())
         .await
         .unwrap();
+    let condition = crate::task_condition::test_support::without_channel_digest(&condition);
     let actual = json!({"case":format!("review-entry-budget/{phase}"),"fields":{
         "error_annotation":row.error_annotation,"blocked_json":row.blocked_json,"failed_json":row.failed_json,
         "entry_barrier_json":row.entry_barrier_json,"metadata_json":row.metadata_json,"condition_json":condition,

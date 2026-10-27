@@ -49,6 +49,6 @@ Its disposable Git fixture was built without commit/add/checkout/reset commands.
 SQL patches to existing JSON are a separate boundary: a patch can append a
 member after the sorted fields. Gate 2 must preserve those SQL edits and use
 typed-value comparisons where needed, as documented in
-[architecture.md](../../../../../../docs/architecture.md#task-condition-statements-and-diagnostic-text-31-in-progress).
+[architecture.md](../../../../../../docs/architecture.md#task-condition-channels-producer-and-cache-repair).
 These fixtures do not authorize canonicalizing historical or patched rows
 through a strict decoder.

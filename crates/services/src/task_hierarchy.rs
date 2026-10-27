@@ -984,9 +984,7 @@ fn decision_condition(child: &Task) -> db::TaskCondition {
     if child.condition.evidence().stated {
         child.condition.clone()
     } else {
-        child
-            .condition
-            .restate_legacy(&db::LegacyConditionInput::from(child))
+        child.condition.recompose(&db::ConditionInput::from(child))
     }
 }
 
@@ -1394,7 +1392,7 @@ mod replan_tests {
         // The identity survives a restatement of the stored condition and
         // changes with the next park.
         let mut restated = parked("child", at, "retry_exhausted");
-        restated.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&restated));
+        restated.condition = db::compose_condition(&db::ConditionInput::from(&restated));
         assert_eq!(subtask_decision_park(&restated).as_deref(), Some(at));
         assert_ne!(
             subtask_decision_park(&parked("child", "2026-10-12T02:00:00Z", "retry_exhausted")),
@@ -1501,7 +1499,7 @@ mod replan_tests {
         // A blocked or held root never re-plans.
         let mut blocked = root("in_progress");
         blocked.blocked_json = Some("{}".to_owned());
-        blocked.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&blocked));
+        blocked.condition = db::compose_condition(&db::ConditionInput::from(&blocked));
         assert_eq!(
             policy.replan_due(&blocked, &children, &lead_row(), &[]),
             None
@@ -1668,22 +1666,22 @@ mod tests {
         assert!(!root_blocked(&root));
 
         root.blocked_json = Some("{}".to_owned());
-        root.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&root));
+        root.condition = db::compose_condition(&db::ConditionInput::from(&root));
         assert!(root_blocked(&root));
         root.blocked_json = None;
-        root.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&root));
+        root.condition = db::compose_condition(&db::ConditionInput::from(&root));
         root.failed_json = Some("{}".to_owned());
-        root.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&root));
+        root.condition = db::compose_condition(&db::ConditionInput::from(&root));
         assert!(root_blocked(&root));
         root.failed_json = None;
-        root.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&root));
+        root.condition = db::compose_condition(&db::ConditionInput::from(&root));
         root.error_annotation = Some("{}".to_owned());
-        root.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&root));
+        root.condition = db::compose_condition(&db::ConditionInput::from(&root));
         assert!(root_blocked(&root));
         root.error_annotation = None;
-        root.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&root));
+        root.condition = db::compose_condition(&db::ConditionInput::from(&root));
         root.entry_barrier_json = Some("{}".to_owned());
-        root.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&root));
+        root.condition = db::compose_condition(&db::ConditionInput::from(&root));
         assert!(root_blocked(&root));
     }
 
@@ -1931,7 +1929,7 @@ mod tests {
         assert!(!coordination_root_allows_child_dispatch(&root, &workflow));
         root.status = default_states::IN_PROGRESS.to_owned();
         root.error_annotation = Some("{}".to_owned());
-        root.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&root));
+        root.condition = db::compose_condition(&db::ConditionInput::from(&root));
         assert!(!coordination_root_allows_child_dispatch(&root, &workflow));
     }
 }

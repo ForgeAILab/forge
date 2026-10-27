@@ -51,9 +51,9 @@ async fn large_root_detail_and_list_restore_all_child_ids() {
     let mut c = db.pool().acquire().await.unwrap();
     let facts = db::ConditionFacts::load(&mut c, &root.id).await.unwrap();
     drop(c);
-    let mut legacy = db::LegacyConditionInput::from(&row);
+    let mut legacy = db::ConditionInput::from(&row);
     legacy.facts = Some(facts);
-    let expected = db::map_legacy_condition(&legacy).public();
+    let expected = db::compose_condition(&legacy).public();
     let detail: TaskResponse = common::empty_request(
         &harness.app,
         Method::GET,

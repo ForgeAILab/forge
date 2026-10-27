@@ -782,7 +782,7 @@ impl TaskService {
                     evidence.error_annotation = queued.error_annotation.clone();
                     evidence.blocked_json = queued.blocked_json.clone();
                     evidence.condition =
-                        db::map_legacy_condition(&db::LegacyConditionInput::from(&evidence));
+                        db::compose_condition(&db::ConditionInput::from(&evidence));
                     if matches!(
                         &request.action,
                         api_types::TaskAction::Retry {
@@ -807,7 +807,7 @@ impl TaskService {
                     evidence.error_annotation = queued.error_annotation.clone();
                     evidence.blocked_json = queued.blocked_json.clone();
                     evidence.condition =
-                        db::map_legacy_condition(&db::LegacyConditionInput::from(&evidence));
+                        db::compose_condition(&db::ConditionInput::from(&evidence));
                     self.continue_task_process(evidence, guidance.clone(), guidance)
                         .await
                 }

@@ -24,14 +24,14 @@ mod sqlite;
 pub mod task_condition;
 mod task_metadata;
 pub use task_condition::{
-    capacity_reason, legacy_annotation_blocks, map_legacy_condition, material_blocker,
+    annotation_blocks_dispatch, capacity_reason, compose_condition, material_blocker,
     ConditionCapacityScope, ConditionChange, ConditionCheckPass, ConditionCheckState,
     ConditionCheckStatus, ConditionContinuation, ConditionEnvironmentKind, ConditionEvidence,
-    ConditionFacts, ConditionRead, ConditionRefusal, ConditionRetry, ConditionSource,
-    ConditionStatement, ConditionWitness, HumanBoundary, LegacyConditionField,
-    LegacyConditionInput, MaterialBlocker, ParkReason, ProjectWait, RetryCause, TaskCondition,
-    TerminalOutcome, UnknownConditionProblem, COMMENT_KIND_HANDOFF, COMMENT_KIND_REQUEST_INPUT,
-    CONDITION_CHECK_PAGE, EVIDENCE_VALUE_LIMIT, LEAD_INPUT_WAIT, LEGACY_BLOCKING_ANNOTATION_KINDS,
+    ConditionFacts, ConditionField, ConditionInput, ConditionRead, ConditionRefusal,
+    ConditionRetry, ConditionSource, ConditionStatement, ConditionWitness, HumanBoundary,
+    MaterialBlocker, ParkReason, ProjectWait, RetryCause, TaskCondition, TerminalOutcome,
+    UnknownConditionProblem, BLOCKING_ANNOTATION_KINDS, COMMENT_KIND_HANDOFF,
+    COMMENT_KIND_REQUEST_INPUT, CONDITION_CHECK_PAGE, EVIDENCE_VALUE_LIMIT, LEAD_INPUT_WAIT,
     MAPPING_REVISION, MAPPING_REVISION_KEY,
 };
 pub use task_condition::{

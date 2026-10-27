@@ -201,7 +201,7 @@ fn material_shapes() -> Vec<(Option<String>, Option<String>, Option<String>)> {
             None,
         ),
     ];
-    for kind in LEGACY_BLOCKING_ANNOTATION_KINDS {
+    for kind in BLOCKING_ANNOTATION_KINDS {
         let annotation = json!({"type":kind,"message":"detail","blocking_reason":"reason","blocked_by":"owner","blocked_execution_id":"execution"});
         let interruption = json!({"kind":kind,"reason":"reason","execution_id":"execution","details":{"key":"detail"}});
         shapes.push((text(annotation.clone()), None, None));
@@ -230,7 +230,7 @@ fn wrongly_typed_wait_keys_stay_non_parking_observations() {
         r#"{"daemon_upgrade_refusal":"x"}"#,
         r#"{"plan_settlement_wait":true}"#,
     ] {
-        let mapped = map_legacy_condition(&LegacyConditionInput {
+        let mapped = compose_condition(&ConditionInput {
             metadata_json: Some(metadata.into()),
             ..Default::default()
         });
@@ -245,7 +245,7 @@ fn wrongly_typed_wait_keys_stay_non_parking_observations() {
         Some(json!({"deferred_dispatch":{"kind":"environment_probe_pending","reason":"probe"}})),
     );
     assert!(matches!(
-        map_legacy_condition(&environment),
+        compose_condition(&environment),
         TaskCondition::Deferred {
             until: None,
             reason: RetryCause::Environment,
@@ -267,7 +267,7 @@ fn entry_barriers_and_unparsable_metadata_park_like_legacy() {
         json!([1]).to_string(),
         "not json".to_owned(),
     ] {
-        let mapped = map_legacy_condition(&LegacyConditionInput {
+        let mapped = compose_condition(&ConditionInput {
             entry_barrier_json: Some(barrier.clone()),
             ..Default::default()
         });
@@ -277,14 +277,14 @@ fn entry_barriers_and_unparsable_metadata_park_like_legacy() {
                 TaskCondition::Parked {
                     primary: ParkReason::UnknownCondition { source, .. },
                     ..
-                } if source.field == LegacyConditionField::EntryBarrierJson
+                } if source.field == ConditionField::EntryBarrierJson
             ),
             "{barrier}: {mapped:?}"
         );
         assert!(mapped.evidence().observations.is_empty(), "{barrier}");
     }
     for metadata in ["not JSON", "[]", "42"] {
-        let mapped = map_legacy_condition(&LegacyConditionInput {
+        let mapped = compose_condition(&ConditionInput {
             metadata_json: Some(metadata.into()),
             ..Default::default()
         });
@@ -294,7 +294,7 @@ fn entry_barriers_and_unparsable_metadata_park_like_legacy() {
                 TaskCondition::Parked {
                     primary: ParkReason::UnknownCondition { source, .. },
                     ..
-                } if source.field == LegacyConditionField::MetadataJson
+                } if source.field == ConditionField::MetadataJson
             ),
             "{metadata}: {mapped:?}"
         );
@@ -431,9 +431,7 @@ async fn children_and_lifecycle_have_real_durable_witnesses() {
         .unwrap();
     assert_eq!(
         before,
-        facts.apply(map_legacy_condition(&LegacyConditionInput::from(
-            &root_task
-        )))
+        facts.apply(compose_condition(&ConditionInput::from(&root_task)))
     );
     // A real terminal workflow entry (a custom workflow would use its own kind).
     sqlx::query("UPDATE task SET status='done',version=version+1 WHERE id=?")
@@ -717,9 +715,7 @@ async fn stale_mapping_revision_reruns_the_backfill_once() {
     for (id,) in &rows {
         let t = TaskRepo::get_by_id(&db, id, true).await.unwrap().unwrap();
         sqlx::query("UPDATE task SET condition_json=? WHERE id=?")
-            .bind(encode(&map_legacy_condition(&LegacyConditionInput::from(
-                &t,
-            ))))
+            .bind(encode(&compose_condition(&ConditionInput::from(&t))))
             .bind(id)
             .execute(db.pool())
             .await
@@ -866,7 +862,7 @@ async fn entry_barrier_parks_everywhere_but_an_initial_state() {
         .any(|reason| matches!(
             reason,
             ParkReason::UnknownCondition { source, .. }
-                if source.field == LegacyConditionField::EntryBarrierJson
+                if source.field == ConditionField::EntryBarrierJson
         )));
     let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
     sqlx::query("UPDATE task SET status='in_progress',status_epoch=status_epoch+1 WHERE id=?")

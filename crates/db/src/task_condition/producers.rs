@@ -40,7 +40,7 @@ pub enum ConditionChange {
 /// A condition as one producer states it, with the fences it was read under.
 pub(crate) struct Produced {
     pub version: i64,
-    pub legacy: LegacyConditionInput,
+    pub input: ConditionInput,
     pub condition: TaskCondition,
     pub encoded: String,
     /// The stored text differs and must be written.
@@ -104,7 +104,7 @@ pub(crate) async fn derive(
         snapshot
             .input
             .non_text
-            .retain(|field| *field != LegacyConditionField::MetadataJson);
+            .retain(|field| *field != ConditionField::MetadataJson);
     }
     let carried = (!explicit)
         .then(|| write::applied_condition(task_id, &snapshot.stored, snapshot.version))
@@ -118,7 +118,7 @@ pub(crate) async fn derive(
         _ => None,
     };
     let from_statement = stated.is_some();
-    let mapped = stated.unwrap_or_else(|| map_view(&snapshot.input.view()));
+    let mapped = stated.unwrap_or_else(|| compose_channels(&snapshot.input.view()));
     let exhausted = mapped.budget_exhausted();
     if change == Change::Budget && !exhausted {
         // Only an exhausted condition witnesses the ledger.
@@ -230,7 +230,7 @@ pub(crate) async fn derive(
     }
     // An initial state reads the entry barrier differently; only then is the
     // mapping taken again, from the same snapshot.
-    let condition = if (facts.initial && !from_statement)
+    let mut condition = if (facts.initial && !from_statement)
         || matches!(
             statement,
             Some(
@@ -245,6 +245,7 @@ pub(crate) async fn derive(
     } else {
         facts.apply(mapped)
     };
+    condition.evidence_mut().channel_digest = Some(snapshot.input.channel_digest());
     integration::validate(&condition)?;
     check::validate(&condition)?;
     if corruption.is_some() {
@@ -264,7 +265,7 @@ pub(crate) async fn derive(
             .parent_watches
             .then(|| snapshot.parent.clone())
             .flatten(),
-        legacy: snapshot.input,
+        input: snapshot.input,
         condition,
         encoded,
     }))

@@ -102,9 +102,8 @@ impl From<TaskArchive> for Task {
             updated_at: archive.updated_at,
             condition: crate::TaskCondition::default(),
         };
-        task.condition = condition.unwrap_or_else(|| {
-            crate::map_legacy_condition(&crate::LegacyConditionInput::from(&task))
-        });
+        task.condition = condition
+            .unwrap_or_else(|| crate::compose_condition(&crate::ConditionInput::from(&task)));
         task
     }
 }

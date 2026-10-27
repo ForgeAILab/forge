@@ -89,15 +89,14 @@ pub(super) fn input(
     failed: Option<Value>,
     barrier: Option<Value>,
     metadata: Option<Value>,
-) -> LegacyConditionInput {
-    LegacyConditionInput {
+) -> ConditionInput {
+    ConditionInput {
         error_annotation: annotation.map(|v| v.to_string()),
         blocked_json: blocked.map(|v| v.to_string()),
         failed_json: failed.map(|v| v.to_string()),
         entry_barrier_json: barrier.map(|v| v.to_string()),
         metadata_json: metadata.map(|v| v.to_string()),
-        non_text: Vec::new(),
-        facts: None,
+        ..Default::default()
     }
 }
 fn reasons(condition: &TaskCondition) -> Vec<&ParkReason> {
@@ -121,7 +120,7 @@ fn reasons(condition: &TaskCondition) -> Vec<&ParkReason> {
 #[test]
 fn machine_capacity_wait_names_disk_when_its_scope_says_so() {
     let scope = |disposition: serde_json::Value| {
-        let condition = map_legacy_condition(&input(
+        let condition = compose_condition(&input(
             None,
             None,
             None,
@@ -154,7 +153,7 @@ fn machine_capacity_wait_names_disk_when_its_scope_says_so() {
 #[tokio::test]
 async fn mapping_table_preserves_known_unknown_and_combined_conditions() {
     let cases = [
-        ("clear", LegacyConditionInput::default(), "clear", None),
+        ("clear", ConditionInput::default(), "clear", None),
         (
             "held",
             input(
@@ -529,7 +528,7 @@ async fn mapping_table_preserves_known_unknown_and_combined_conditions() {
         ),
     ];
     for (name, legacy, expected, primary) in cases {
-        let condition = map_legacy_condition(&legacy);
+        let condition = compose_condition(&legacy);
         let value = serde_json::to_value(&condition).unwrap();
         assert_eq!(value["kind"], expected, "{name}");
         if let Some(kind) = primary {
@@ -559,7 +558,7 @@ async fn mapping_table_preserves_known_unknown_and_combined_conditions() {
             json!(legacy.entry_barrier_json),
             "{name}"
         );
-        let again = map_legacy_condition(&legacy);
+        let again = compose_condition(&legacy);
         assert_eq!(condition, again, "deterministic {name}");
         assert_eq!(
             decode(&encode(&condition)).unwrap(),
@@ -569,7 +568,7 @@ async fn mapping_table_preserves_known_unknown_and_combined_conditions() {
     }
     for field in 0..5 {
         for raw in ["", "{invalid", "null", "[]", "42", "\"scalar\""] {
-            let mut legacy = LegacyConditionInput::default();
+            let mut legacy = ConditionInput::default();
             *match field {
                 0 => &mut legacy.error_annotation,
                 1 => &mut legacy.blocked_json,
@@ -577,7 +576,7 @@ async fn mapping_table_preserves_known_unknown_and_combined_conditions() {
                 3 => &mut legacy.entry_barrier_json,
                 _ => &mut legacy.metadata_json,
             } = Some(raw.into());
-            let condition = map_legacy_condition(&legacy);
+            let condition = compose_condition(&legacy);
             if field == 0 {
                 // M1: the dispatcher dispatches through an annotation it
                 // cannot read, so it is evidence, not a park.
@@ -603,7 +602,7 @@ async fn mapping_table_preserves_known_unknown_and_combined_conditions() {
             json!({"owner_wait":{"daemon_id":"d"},"paused_integration":{"state":"review"},"deferred_dispatch":{"not_before":"2026-10-06T00:01:00Z","reason":"wait","target_state":"review"}}),
         ),
     );
-    let condition = map_legacy_condition(&combined);
+    let condition = compose_condition(&combined);
     assert_eq!(reasons(&condition).len(), 5);
     assert!(reasons(&condition)
         .iter()
@@ -624,7 +623,7 @@ async fn mapping_table_preserves_known_unknown_and_combined_conditions() {
         None,
     );
     assert!(matches!(
-        reasons(&map_legacy_condition(&ambiguous))[0],
+        reasons(&compose_condition(&ambiguous))[0],
         ParkReason::BudgetExhausted {
             budget_kind: None,
             ..
@@ -637,7 +636,7 @@ async fn mapping_table_preserves_known_unknown_and_combined_conditions() {
         None,
         None,
     );
-    assert_eq!(reasons(&map_legacy_condition(&duplicate)).len(), 1);
+    assert_eq!(reasons(&compose_condition(&duplicate)).len(), 1);
     let ci = input(
         Some(
             json!({"type":"before_work_hook_failed","blocking_reason":"review_ci_infrastructure"}),
@@ -650,7 +649,7 @@ async fn mapping_table_preserves_known_unknown_and_combined_conditions() {
         ),
     );
     assert!(matches!(
-        map_legacy_condition(&ci),
+        compose_condition(&ci),
         TaskCondition::Deferred {
             reason: RetryCause::ReviewCiInfrastructure,
             resume: ConditionContinuation::RetryEntry { .. },
@@ -663,7 +662,7 @@ async fn mapping_table_preserves_known_unknown_and_combined_conditions() {
 fn every_condition_variant_round_trips_without_fabricated_owners() {
     let evidence = ConditionEvidence::default();
     let source = ConditionSource {
-        field: LegacyConditionField::EntryBarrierJson,
+        field: ConditionField::EntryBarrierJson,
         key: None,
     };
     let primary = ParkReason::UnknownCondition {
@@ -751,7 +750,7 @@ async fn condition_migration_replay_preserves_populated_legacy_rows() {
                 json!({"paused_integration":{"state":"review"},"queued_recovery":{"id":"intent","request":{"guidance":"private"}},"custom":1}),
             ),
         ),
-        LegacyConditionInput {
+        ConditionInput {
             error_annotation: Some("{bad".into()),
             metadata_json: Some("[1,2]".into()),
             ..Default::default()
@@ -765,7 +764,7 @@ async fn condition_migration_replay_preserves_populated_legacy_rows() {
                 json!({"plan_publication_claim":{"execution_id":"e"},"terminal_execution_settlement":{"execution_id":"e"}}),
             ),
         ),
-        LegacyConditionInput::default(),
+        ConditionInput::default(),
     ];
     for (i, input) in rows.iter().enumerate() {
         sqlx::query("INSERT INTO task VALUES(?,7,'unchanged','archived','deleted',?,?,?,?,?)")
@@ -783,19 +782,19 @@ async fn condition_migration_replay_preserves_populated_legacy_rows() {
     migrate(&mut conn).await;
     for (i, expected) in rows.iter().enumerate() {
         let row = sqlx::query(&format!(
-            "SELECT {LEGACY_SELECT},version,updated_at,archived_at,deleted_at FROM task WHERE id=?"
+            "SELECT {CHANNEL_SELECT},version,updated_at,archived_at,deleted_at FROM task WHERE id=?"
         ))
         .bind(i.to_string())
         .fetch_one(&mut *conn)
         .await
         .unwrap();
-        assert_eq!(LegacyConditionInput::from_row(&row).unwrap(), *expected);
+        assert_eq!(ConditionInput::from_row(&row).unwrap(), *expected);
         assert_eq!(row.get::<i64, _>("version"), 7);
         assert_eq!(row.get::<String, _>("updated_at"), "unchanged");
         assert_eq!(row.get::<String, _>("archived_at"), "archived");
         assert_eq!(row.get::<String, _>("deleted_at"), "deleted");
         let condition = decode(row.get("condition_json")).unwrap();
-        assert_eq!(condition, map_legacy_condition(expected));
+        assert_eq!(condition, compose_condition(expected));
         let evidence = serde_json::to_value(condition).unwrap()["evidence"].clone();
         assert!(evidence["metadata"].get("queued_recovery").is_none());
         assert!(evidence["metadata"].get("plan_publication_claim").is_none());
@@ -829,7 +828,7 @@ async fn column_default_is_the_mapping_of_no_condition_facts() {
     let condition = decode(old_default).unwrap();
     assert_eq!(
         condition.read(),
-        map_legacy_condition(&LegacyConditionInput::default()).read()
+        compose_condition(&ConditionInput::default()).read()
     );
     assert!(
         condition.evidence().witnesses.is_empty(),
@@ -987,8 +986,8 @@ async fn stale_condition_version_source_and_lease_are_rejected() {
     let step = claim(&db, &t.id).await;
     crate::task_writer::in_task_step(step.clone(), async {
         let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
-        let input = LegacyConditionInput::from(&t);
-        let condition = map_legacy_condition(&input);
+        let input = ConditionInput::from(&t);
+        let condition = compose_condition(&input);
         assert!(matches!(
             db.set_condition(&mut tx, &t.id, t.version - 1, &input, &condition)
                 .await,
@@ -1009,7 +1008,7 @@ async fn stale_condition_version_source_and_lease_are_rejected() {
         ));
         // m1: the seam is real. With the current source it writes the shadow,
         // and it refuses a condition the legacy fields do not map to.
-        let current = LegacyConditionInput {
+        let current = ConditionInput {
             metadata_json: Some("{\"owner_wait\":{\"daemon_id\":\"d\"}}".into()),
             ..input.clone()
         };
@@ -1019,7 +1018,7 @@ async fn stale_condition_version_source_and_lease_are_rejected() {
             Err(DbError::Check(_))
         ));
         let facts = ConditionFacts::load(&mut tx, &t.id).await.unwrap();
-        let parked = facts.apply(map_legacy_condition(&current));
+        let parked = facts.apply(compose_condition(&current));
         db.set_condition(&mut tx, &t.id, t.version, &current, &parked)
             .await
             .unwrap();
@@ -1046,8 +1045,8 @@ async fn stale_condition_version_source_and_lease_are_rejected() {
     })
     .await;
     let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
-    let input = LegacyConditionInput::from(&t);
-    let condition = map_legacy_condition(&input);
+    let input = ConditionInput::from(&t);
+    let condition = compose_condition(&input);
     assert!(matches!(
         db.set_condition(&mut tx, &t.id, t.version, &input, &condition)
             .await,
@@ -1224,12 +1223,12 @@ async fn sqlite_legacy_number_unicode_and_deep_evidence_remain_lossless() {
     let db = db().await;
     let annotation = r#"{"type":"manual_stop","blocked_by":"\ud800","message":"retained"}"#;
     let metadata = r#"{"paused_integration_generation":1e999,"last_workflow_guard_reason":"\ud800","owner_wait":{"daemon_id":"Nڠ","started_at":"now"}}"#;
-    let legacy = LegacyConditionInput {
+    let legacy = ConditionInput {
         error_annotation: Some(annotation.into()),
         metadata_json: Some(metadata.into()),
         ..Default::default()
     };
-    let condition = map_legacy_condition(&legacy);
+    let condition = compose_condition(&legacy);
     let evidence = serde_json::to_value(&condition).unwrap();
     assert_eq!(evidence["evidence"]["error_annotation"], annotation);
     assert_eq!(
@@ -1251,11 +1250,11 @@ async fn sqlite_legacy_number_unicode_and_deep_evidence_remain_lossless() {
         "{\"nested\":".repeat(200),
         format_args!("0{}", "}".repeat(200))
     );
-    let legacy = LegacyConditionInput {
+    let legacy = ConditionInput {
         metadata_json: Some(deep.clone()),
         ..Default::default()
     };
-    let condition = map_legacy_condition(&legacy);
+    let condition = compose_condition(&legacy);
     let value = serde_json::to_value(condition).unwrap();
     let fragment = value["evidence"]["metadata"]["owner_wait"]
         .as_str()
@@ -1574,7 +1573,7 @@ async fn hostile_legacy_values_survive_backfill_and_writer_seam() {
         4,
         "clear, deferred, parked and failed all occur: {kinds:?}"
     );
-    for (offset, field) in LEGACY_FIELDS.iter().enumerate() {
+    for (offset, field) in CHANNEL_FIELDS.iter().enumerate() {
         let id = format!("h{}", n - 6 + offset);
         let condition = db.task_condition(&id).await.unwrap();
         assert!(
@@ -1661,7 +1660,7 @@ fn real_producer_shapes_map_to_what_legacy_blocks_on() {
     let now = (chrono::Utc::now() + chrono::Duration::seconds(30)).to_rfc3339();
     let meta = |value: Value| input(None, None, None, None, Some(value));
     let ann = |value: Value| input(Some(value), None, None, None, None);
-    let cases: Vec<(&str, LegacyConditionInput, &str, Option<&str>)> = vec![
+    let cases: Vec<(&str, ConditionInput, &str, Option<&str>)> = vec![
         (
             "deferred real rfc3339",
             meta(
@@ -1927,7 +1926,7 @@ fn real_producer_shapes_map_to_what_legacy_blocks_on() {
         ),
     ];
     for (name, legacy, expected, primary) in cases {
-        let condition = map_legacy_condition(&legacy);
+        let condition = compose_condition(&legacy);
         let value = serde_json::to_value(&condition).unwrap();
         assert_eq!(value["kind"], expected, "{name}: {value}");
         assert_eq!(
@@ -1944,7 +1943,7 @@ fn real_producer_shapes_map_to_what_legacy_blocks_on() {
         }
     }
     assert!(matches!(
-        map_legacy_condition(&meta(
+        compose_condition(&meta(
             json!({"last_execution_failure_execution_id":"e","deferred_dispatch":{"not_before":now,"reason":"retry","target_state":"in_progress"}})
         )),
         TaskCondition::Deferred {
@@ -1954,7 +1953,7 @@ fn real_producer_shapes_map_to_what_legacy_blocks_on() {
         }
     ));
     assert!(matches!(
-        map_legacy_condition(&meta(
+        compose_condition(&meta(
             json!({"plan_settlement_wait":{"execution_id":"e"},"deferred_dispatch":{"not_before":now,"reason":"r","target_state":"planning"}})
         )),
         TaskCondition::Deferred {
@@ -1975,9 +1974,9 @@ fn annotation_parks_exactly_where_the_dispatcher_blocks() {
         let blocks = serde_json::from_str::<Value>(&raw)
             .ok()
             .and_then(|annotation| annotation.get("type")?.as_str().map(str::to_owned))
-            .is_some_and(|kind| LEGACY_BLOCKING_ANNOTATION_KINDS.contains(&kind.as_str()));
-        assert_eq!(legacy_annotation_blocks(Some(&raw)), blocks, "{name}");
-        let condition = map_legacy_condition(&LegacyConditionInput {
+            .is_some_and(|kind| BLOCKING_ANNOTATION_KINDS.contains(&kind.as_str()));
+        assert_eq!(annotation_blocks_dispatch(Some(&raw)), blocks, "{name}");
+        let condition = compose_condition(&ConditionInput {
             error_annotation: Some(raw),
             ..Default::default()
         });
@@ -1986,80 +1985,16 @@ fn annotation_parks_exactly_where_the_dispatcher_blocks() {
             assert!(matches!(condition, TaskCondition::Clear { .. }), "{name}");
         }
     }
-    for kind in LEGACY_BLOCKING_ANNOTATION_KINDS {
+    for kind in BLOCKING_ANNOTATION_KINDS {
         let condition =
-            map_legacy_condition(&input(Some(json!({"type":kind})), None, None, None, None));
+            compose_condition(&input(Some(json!({"type":kind})), None, None, None, None));
         let primary = serde_json::to_value(reasons(&condition)[0]).unwrap();
         assert_ne!(
             primary["kind"], "unknown_condition",
             "{kind} has a typed mapping"
         );
     }
-    assert!(!legacy_annotation_blocks(None));
-}
-
-/// m2 (port of `audit_size_scaling`'s concern): the stored condition is
-/// bounded whatever the row holds, and an unrelated large metadata key is
-/// neither copied nor needed.
-#[tokio::test]
-async fn evidence_is_bounded_and_large_unrelated_fields_are_not_copied() {
-    let big = "m".repeat(1_000_000);
-    let legacy = LegacyConditionInput {
-        error_annotation: Some(json!({"type":"workspace_error","message":big}).to_string()),
-        blocked_json: Some(json!({"kind":"workspace_error","reason":big}).to_string()),
-        metadata_json: Some(json!({"custom":big,"owner_wait":{"daemon_id":"d","snapshot":big},"last_workflow_guard_reason":big}).to_string()),
-        ..Default::default()
-    };
-    let condition = map_legacy_condition(&legacy);
-    let stored = encode(&condition);
-    assert!(
-        stored.len() < 6 * (EVIDENCE_VALUE_LIMIT + 64),
-        "{}",
-        stored.len()
-    );
-    assert!(!stored.contains("custom"));
-    let TaskCondition::Parked { evidence, .. } = &condition else {
-        panic!("{condition:?}")
-    };
-    let annotation = evidence.error_annotation.as_deref().unwrap();
-    assert!(annotation.ends_with(&format!(
-        "…[truncated; {} bytes]",
-        legacy.error_annotation.as_ref().unwrap().len()
-    )));
-    assert!(evidence.metadata["owner_wait"].contains("[truncated; "));
-    assert!(reasons(&condition)
-        .iter()
-        .any(|r| matches!(r, ParkReason::OwnerOffline { daemon_id: Some(id), .. } if id == "d")));
-    // Truncation never splits a character.
-    let wide = LegacyConditionInput {
-        blocked_json: Some(format!(
-            "{{\"kind\":\"x\",\"reason\":\"{}\"}}",
-            "\u{06A9}".repeat(40_000)
-        )),
-        ..Default::default()
-    };
-    assert_eq!(
-        decode(&encode(&map_legacy_condition(&wide))).unwrap(),
-        map_legacy_condition(&wide)
-    );
-
-    // The legacy columns keep the full data.
-    let db = db().await;
-    let t = task(&db, "big").await;
-    let step = claim(&db, &t.id).await;
-    crate::task_writer::in_task_step(step, async {
-        let mut u = update(&t);
-        u.error_annotation = Some(legacy.error_annotation.clone());
-        let updated = TaskRepo::update(&db, u).await.unwrap();
-        assert_eq!(updated.error_annotation, legacy.error_annotation);
-        db.check_task_condition_invariant(&updated).await.unwrap();
-    })
-    .await;
-    let length: i64 = sqlx::query_scalar("SELECT length(condition_json) FROM task WHERE id='big'")
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
-    assert!(length < 2 * EVIDENCE_VALUE_LIMIT as i64, "{length}");
+    assert!(!annotation_blocks_dispatch(None));
 }
 
 /// Port of `audit_backfill_timing_5k` (measurement, not a correctness check).
@@ -2142,14 +2077,14 @@ async fn measure_backfill_5k() {
 #[ignore = "measurement"]
 fn measure_mapping_size_scaling() {
     for size in [1_000usize, 10_000, 100_000, 1_000_000] {
-        let legacy = LegacyConditionInput {
+        let legacy = ConditionInput {
             error_annotation: Some(json!({"type":"ci_failed","message":"m".repeat(size)}).to_string()),
             metadata_json: Some(json!({"custom":"y".repeat(size),"deferred_dispatch":{"not_before":"2026-10-05T12:00:00Z","target_state":"todo","reason":"\u{06A9}".repeat(size / 2)}}).to_string()),
             ..Default::default()
         };
         let started = std::time::Instant::now();
         for _ in 0..20 {
-            std::hint::black_box(encode(&map_legacy_condition(&legacy)));
+            std::hint::black_box(encode(&compose_condition(&legacy)));
         }
         println!(
             "MEASURE map+encode size={size}: {:?}",
@@ -2159,14 +2094,14 @@ fn measure_mapping_size_scaling() {
 }
 #[test]
 fn a_queued_command_keeps_its_continuation_under_a_planning_parent_wait() {
-    let mut input = super::LegacyConditionInput {
+    let mut input = super::ConditionInput {
         metadata_json: Some(serde_json::json!({
             "deferred_dispatch": {"not_before":"2026-10-13T05:00:00Z", "target_state":"lead_check", "reason":"task action queued"},
             "queued_recovery": {"id":"retry"},
         }).to_string()),
         ..Default::default()
     };
-    let deferred = super::map_legacy_condition(&input);
+    let deferred = super::compose_condition(&input);
     assert!(matches!(&deferred, super::TaskCondition::Deferred { .. }));
     let wait =
         serde_json::json!({"reason":{"ParentWait":{"parent_id":"root", "cause":"planning"}}});
@@ -2185,9 +2120,11 @@ fn a_queued_command_keeps_its_continuation_under_a_planning_parent_wait() {
     );
     assert!(
         matches!(
-            super::readers::apply_owner_park(super::map_legacy_condition(&input), Some(&wait)),
+            super::readers::apply_owner_park(super::compose_condition(&input), Some(&wait)),
             super::TaskCondition::Deferred { .. }
         ),
         "a timer without an accepted command keeps its own continuation"
     );
 }
+
+mod evidence;

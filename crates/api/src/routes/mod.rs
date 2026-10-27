@@ -615,7 +615,7 @@ mod retry_projection_tests {
         ] {
             let mut task = test_task();
             task.blocked_json = Some(serde_json::json!({"reason":"owner unavailable", "created_at":"2026-10-01T00:00:00Z", "kind":kind, "execution_id":null}).to_string());
-            task.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&task));
+            task.condition = db::compose_condition(&db::ConditionInput::from(&task));
             let response = super::task_response_inner(
                 &db,
                 &service.workspace_backend_router(),
@@ -661,7 +661,7 @@ mod retry_projection_tests {
             }),
             ..Default::default()
         }
-        .condition(&db::LegacyConditionInput::default());
+        .condition(&db::ConditionInput::default());
         let expected = task.condition.public();
         let response = super::task_response_inner(
             &db,

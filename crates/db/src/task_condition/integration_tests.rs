@@ -139,8 +139,8 @@ async fn every_statement_requires_a_live_step_and_round_trips_without_legacy_wri
             );
             let after = read(&db, &id).await;
             assert_eq!(
-                LegacyConditionInput::from(&before),
-                LegacyConditionInput::from(&after)
+                ConditionInput::from(&before),
+                ConditionInput::from(&after)
             );
             assert_eq!(
                 (before.version, &before.updated_at),
@@ -191,7 +191,7 @@ async fn every_statement_requires_a_live_step_and_round_trips_without_legacy_wri
                     .await,
                 Err(DbError::VersionConflict)
             ));
-            let input = LegacyConditionInput::from(&after);
+            let input = ConditionInput::from(&after);
             let mut facts = ConditionFacts::load(&mut tx, &id).await.unwrap();
             facts.integration = Some(IntegrationReason::Applied {
                 attempt_id: IntegrationAttemptId::new("replacement"),
@@ -330,7 +330,7 @@ fn real_handoff_owns_execution_while_integration_lineage_survives() {
             execution: Some(("run".into(), "coder".into())),
             ..Default::default()
         };
-        let condition = facts.condition(&LegacyConditionInput::default());
+        let condition = facts.condition(&ConditionInput::default());
         assert_eq!(condition.integration_reason(), Some(&reason));
         // Handed off or not, a live execution reads as Running: the Task is
         // never presented as parked on integration while it runs.
@@ -457,7 +457,7 @@ fn progress_digest_excludes_operational_state_and_rejects_operational_fields() {
             integration: Some(reason),
             ..Default::default()
         }
-        .condition(&LegacyConditionInput::default());
+        .condition(&ConditionInput::default());
         let material = material_blocker(&condition);
         assert!(!material.requires_intervention);
         assert!(material.interruption.is_none());
@@ -525,7 +525,7 @@ fn malformed_integration_witnesses_are_not_interpreted() {
             integration: Some(reason),
             ..Default::default()
         }
-        .condition(&LegacyConditionInput::default());
+        .condition(&ConditionInput::default());
         assert!(decode(&encode(&condition)).is_err());
     }
 }
@@ -539,7 +539,7 @@ fn unsupported_owner_witness_fields_are_quarantined() {
         }),
         ..Default::default()
     }
-    .condition(&LegacyConditionInput::default());
+    .condition(&ConditionInput::default());
     let mut raw = serde_json::to_value(&condition).unwrap();
     raw["evidence"]["witnesses"][1]["future_guard"] = json!("unknown ownership");
     assert!(decode(&raw.to_string()).is_err());
@@ -1102,7 +1102,7 @@ fn overlay_of_running_entering_and_deferred() {
         execution: execution.then(|| ("run".to_owned(), "coder".to_owned())),
         ..Default::default()
     };
-    let none = LegacyConditionInput::default();
+    let none = ConditionInput::default();
     let timer = super::tests::input(
         None,
         None,
@@ -1112,7 +1112,7 @@ fn overlay_of_running_entering_and_deferred() {
             json!({"deferred_dispatch":{"not_before":"2099-01-01T00:00:00Z","reason":"retry","target_state":"merging"}}),
         ),
     );
-    let without = |mut facts: ConditionFacts, input: &LegacyConditionInput| {
+    let without = |mut facts: ConditionFacts, input: &ConditionInput| {
         facts.integration = None;
         facts.condition(input)
     };

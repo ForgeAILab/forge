@@ -22,12 +22,12 @@ async fn corrupt_condition_is_rebuilt_inside_engine_and_worker_writes() {
         let mut c = db.pool().acquire().await.unwrap();
         let facts = db::ConditionFacts::load(&mut c, "t").await.unwrap();
         drop(c);
-        let mut legacy = db::LegacyConditionInput::from(&row);
+        let mut legacy = db::ConditionInput::from(&row);
         legacy.facts = Some(facts);
-        assert_eq!(condition.typed(), db::map_legacy_condition(&legacy).typed());
+        assert_eq!(condition.typed(), db::compose_condition(&legacy).typed());
         assert_eq!(
             raw,
-            serde_json::to_string(&db::map_legacy_condition(&legacy)).unwrap()
+            serde_json::to_string(&db::compose_condition(&legacy)).unwrap()
         );
         let texts = db.task_diagnostic_texts("t", None, 100).await.unwrap();
         assert_eq!(texts.items.iter().filter(|t| t.text == "{}").count(), 1);
