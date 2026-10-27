@@ -1,15 +1,18 @@
-use crate::worker_runtime::queue::writer_parity::Fixture;
+use crate::recovery::test_support::writer_fixture::{ClockMode, Fixture};
 use db::TaskStepRepo;
 
 #[tokio::test]
 async fn blocked_entry_barrier() {
     for target in ["in_progress", "review"] {
         let _clock = db::test_clock::freeze("2026-10-25T00:00:00.123456+00:00".parse().unwrap());
-        let f = Fixture::new(if target == "review" {
-            "in_progress"
-        } else {
-            "todo"
-        })
+        let f = Fixture::with_clock(
+            if target == "review" {
+                "in_progress"
+            } else {
+                "todo"
+            },
+            ClockMode::PreserveCaller,
+        )
         .await;
         let mut workflow = (*f.ctx.workflow).clone();
         for state in &mut workflow.states {

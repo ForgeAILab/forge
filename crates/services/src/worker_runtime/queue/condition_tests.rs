@@ -36,7 +36,7 @@ pub(crate) async fn merge_after_writer(
     task
 }
 
-use super::writer_parity::{case, channel_sample};
+use crate::recovery::test_support::writer_fixture::{case, channel_sample};
 
 #[tokio::test]
 async fn queue_channels_and_overlays() {
