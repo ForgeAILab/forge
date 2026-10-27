@@ -1283,3 +1283,10 @@ pub use orchestration::overview::{
 pub use orchestration::documents::{ProjectDocumentIdRead, ProjectDocumentRevisionRead};
 
 pub use orchestration::decisions::{ProjectDecisionCandidateRead, ProjectDecisionRead};
+
+pub use orchestration::decisions::InsertMilestoneWaiverDecisionInput;
+pub use orchestration::milestones::{
+    MaterializeMilestoneCheckInput, MilestoneDefinitionTransitionRead, ProjectMilestoneIdRead,
+    TransitionMilestoneLifecycleInput,
+};
+pub use orchestration::readiness::{MilestoneCheckTargetRead, MilestoneManualResultRead};

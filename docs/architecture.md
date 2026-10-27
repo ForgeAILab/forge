@@ -353,6 +353,17 @@ Query-specific snapshots defer decoding where projection validation or skip
 branches determine read order; context pointers and scalar lookups decode eagerly.
 Artifact and context SQL/decode errors keep the same historical mutation response;
 Overview errors retain `Project Overview is temporarily unavailable`.
+Milestone pages and definition/check persistence use inherent `SqliteDb` methods
+in `sqlite/orchestration/milestones/{reads,commands}.rs`, `readiness/checks.rs`
+and `decisions.rs`. Routes retain `BEGIN IMMEDIATE` across service transition
+validation, per-check definition validation, and authority/provenance validation.
+Their `*_in_tx` helpers share that transaction: lifecycle writes include primary
+pointer repair, check materialization includes its scoped insert/update, and
+manual result insertion includes the check-version CAS. The no-op version locks,
+statement order, and event append/commit order remain unchanged. Deferred read
+snapshots preserve validation and replay decode order; scalar lookups decode
+eagerly. SQL/decode failures retain `Project artifact mutation failed`, and routes
+retain the contextual version and idempotency refusals.
 Project deletion ownership probes live in `sqlite/workspace_root/cleanup.rs`:
 typed owner selectors replace route SQL. The Project route owns `BEGIN IMMEDIATE`,
 the quarantine rename, commit/restore, and post-commit recursive removal; each

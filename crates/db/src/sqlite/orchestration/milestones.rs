@@ -1828,3 +1828,8 @@ pub(super) async fn append_project_milestone_check_result(
     tx.commit().await?;
     map_milestone_result(row)
 }
+
+mod commands;
+mod reads;
+pub use commands::{MaterializeMilestoneCheckInput, TransitionMilestoneLifecycleInput};
+pub use reads::{MilestoneDefinitionTransitionRead, ProjectMilestoneIdRead};
