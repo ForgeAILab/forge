@@ -342,9 +342,17 @@ decoding live in `sqlite/shared_media/reads.rs`; routes retain authorization,
 cursor encoding and response projection. Execution timing is fetched before
 ledger usage and decoded afterward; media rows are decoded one at a time before
 checksum reconciliation or response conversion, preserving read and error order.
-SQL/decode failures from these CLI runtime and Project media methods retain the existing
-`500 internal_error` response with `Project artifact mutation failed`; CLI runtime
+SQL/decode failures from these CLI runtime and Project media methods retain the
+existing `500 internal_error` response with `Project artifact mutation failed`; CLI runtime
 policy version conflicts retain their dedicated `cli_runtime.version_conflict`.
+Project artifact pages, Charter/Genesis lookups, context pointers and Overview
+read SQL live in `sqlite/orchestration/` and its `documents/reads.rs`,
+`decisions/reads.rs`, `charters/reads.rs` and `overview.rs` children. Routes retain
+visibility checks, cursor encoding, JSON validation and public response projection.
+Query-specific snapshots defer decoding where projection validation or skip
+branches determine read order; context pointers and scalar lookups decode eagerly.
+Artifact and context SQL/decode errors keep the same historical mutation response;
+Overview errors retain `Project Overview is temporarily unavailable`.
 Project deletion ownership probes live in `sqlite/workspace_root/cleanup.rs`:
 typed owner selectors replace route SQL. The Project route owns `BEGIN IMMEDIATE`,
 the quarantine rename, commit/restore, and post-commit recursive removal; each

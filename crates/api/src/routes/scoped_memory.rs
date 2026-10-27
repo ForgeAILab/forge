@@ -20,7 +20,6 @@ use db::{
 };
 use services::{MemoryAccessContext, MemoryLifecycleInput, MemoryPublicationInput};
 use services_agents::ContextManifestService;
-use sqlx::Row;
 use uuid::Uuid;
 
 use crate::{
@@ -661,56 +660,31 @@ async fn load_project_context_pointers(
         pointers.insert("project_charter", charter_id, revision_id);
     }
 
-    for row in sqlx::query(
-        "SELECT id, current_approved_revision_id
-         FROM project_document
-         WHERE project_id = ? AND current_approved_revision_id IS NOT NULL",
-    )
-    .bind(project_id)
-    .fetch_all(state.db.pool())
-    .await?
+    for (id, revision) in state
+        .db
+        .approved_project_document_pointers(project_id)
+        .await
+        .map_err(ApiError::project_artifact_mutation)?
     {
-        pointers.insert(
-            "project_document",
-            row.try_get::<String, _>("id")?.as_str(),
-            row.try_get::<String, _>("current_approved_revision_id")?
-                .as_str(),
-        );
+        pointers.insert("project_document", &id, &revision);
     }
 
-    for row in sqlx::query(
-        "SELECT id, current_definition_revision_id
-         FROM project_milestone
-         WHERE project_id = ?
-           AND lifecycle IN ('planned', 'active', 'ready_for_release')
-           AND current_definition_revision_id IS NOT NULL",
-    )
-    .bind(project_id)
-    .fetch_all(state.db.pool())
-    .await?
+    for (id, revision) in state
+        .db
+        .current_project_milestone_pointers(project_id)
+        .await
+        .map_err(ApiError::project_artifact_mutation)?
     {
-        pointers.insert(
-            "project_milestone_definition",
-            row.try_get::<String, _>("id")?.as_str(),
-            row.try_get::<String, _>("current_definition_revision_id")?
-                .as_str(),
-        );
+        pointers.insert("project_milestone_definition", &id, &revision);
     }
 
-    for row in sqlx::query(
-        "SELECT id, policy_revision
-         FROM project_agent_binding
-         WHERE project_id = ? AND state = 'active'",
-    )
-    .bind(project_id)
-    .fetch_all(state.db.pool())
-    .await?
+    for (id, revision) in state
+        .db
+        .active_project_binding_pointers(project_id)
+        .await
+        .map_err(ApiError::project_artifact_mutation)?
     {
-        pointers.insert(
-            "project_agent_binding",
-            row.try_get::<String, _>("id")?.as_str(),
-            row.try_get::<String, _>("policy_revision")?.as_str(),
-        );
+        pointers.insert("project_agent_binding", &id, &revision);
     }
 
     Ok(pointers)

@@ -284,3 +284,6 @@ mod project_authorization;
 
 #[path = "suite/large_root_condition.rs"]
 mod large_root_condition;
+
+#[path = "suite/project_artifact_reads.rs"]
+mod project_artifact_reads;

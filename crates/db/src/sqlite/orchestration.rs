@@ -584,6 +584,7 @@ pub(crate) mod documents;
 pub(crate) mod effective_project;
 pub(crate) mod genesis;
 pub(crate) mod milestones;
+pub(crate) mod overview;
 pub(crate) mod project_creation;
 pub(crate) mod readiness;
 pub(crate) mod reconciliation;
@@ -959,5 +960,70 @@ impl ProjectOrchestrationRepo for SqliteDb {
         id: &str,
     ) -> Result<Option<ProjectReconciliationResolutionRecord>> {
         reconciliation::get_project_reconciliation_resolution(self, id).await
+    }
+}
+
+impl SqliteDb {
+    pub async fn approved_project_document_pointers(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<(String, String)>> {
+        let rows = sqlx::query(
+            "SELECT id, current_approved_revision_id
+         FROM project_document
+         WHERE project_id = ? AND current_approved_revision_id IS NOT NULL",
+        )
+        .bind(project_id)
+        .fetch_all(self.pool())
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok((
+                    row.try_get("id")?,
+                    row.try_get("current_approved_revision_id")?,
+                ))
+            })
+            .collect()
+    }
+
+    pub async fn current_project_milestone_pointers(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<(String, String)>> {
+        let rows = sqlx::query(
+            "SELECT id, current_definition_revision_id
+         FROM project_milestone
+         WHERE project_id = ?
+           AND lifecycle IN ('planned', 'active', 'ready_for_release')
+           AND current_definition_revision_id IS NOT NULL",
+        )
+        .bind(project_id)
+        .fetch_all(self.pool())
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok((
+                    row.try_get("id")?,
+                    row.try_get("current_definition_revision_id")?,
+                ))
+            })
+            .collect()
+    }
+
+    pub async fn active_project_binding_pointers(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<(String, String)>> {
+        let rows = sqlx::query(
+            "SELECT id, policy_revision
+         FROM project_agent_binding
+         WHERE project_id = ? AND state = 'active'",
+        )
+        .bind(project_id)
+        .fetch_all(self.pool())
+        .await?;
+        rows.into_iter()
+            .map(|row| Ok((row.try_get("id")?, row.try_get("policy_revision")?)))
+            .collect()
     }
 }

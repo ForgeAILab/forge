@@ -1340,3 +1340,6 @@ pub(super) async fn approve_project_document_command(
     tx.commit().await?;
     map_document_approval(row)
 }
+
+mod reads;
+pub use reads::{ProjectDocumentIdRead, ProjectDocumentRevisionRead};

@@ -28,7 +28,6 @@ use db::{
 };
 use serde::Deserialize;
 use serde_json::Value;
-use sqlx::Row;
 
 use crate::{
     errors::{ApiError, ApiResult},
@@ -70,34 +69,14 @@ pub async fn list_project_documents(
     .await?;
     let limit = bounded_limit(query.limit);
     let cursor = decode_cursor(query.cursor.as_deref())?;
-    let rows = if let Some((updated_at, id)) = cursor.as_ref() {
-        sqlx::query(
-            "SELECT id FROM project_document
-             WHERE project_id = ?
-               AND (updated_at < ? OR (updated_at = ? AND id < ?))
-             ORDER BY updated_at DESC, id DESC LIMIT ?",
-        )
-        .bind(&project_id)
-        .bind(updated_at)
-        .bind(updated_at)
-        .bind(id)
-        .bind(limit + 1)
-        .fetch_all(state.db.pool())
-        .await?
-    } else {
-        sqlx::query(
-            "SELECT id FROM project_document
-             WHERE project_id = ?
-             ORDER BY updated_at DESC, id DESC LIMIT ?",
-        )
-        .bind(&project_id)
-        .bind(limit + 1)
-        .fetch_all(state.db.pool())
-        .await?
-    };
+    let rows = state
+        .db
+        .project_document_id_page(&project_id, cursor, limit)
+        .await
+        .map_err(ApiError::project_artifact_mutation)?;
     let mut documents = Vec::with_capacity(rows.len().min(limit as usize));
     for row in rows.into_iter().take(limit as usize) {
-        let id: String = row.try_get("id")?;
+        let id = row.id().map_err(ApiError::project_artifact_mutation)?;
         let document = ProjectOrchestrationRepo::get_project_document(&*state.db, &id)
             .await?
             .ok_or_else(|| ApiError::not_found("project_document", id.clone()))?;
@@ -211,27 +190,19 @@ pub async fn list_project_document_revisions(
         )),
         None => None,
     };
-    let mut statement = String::from(
-        "SELECT * FROM project_document_revision
-         WHERE document_id = ?",
-    );
-    if cursor.is_some() {
-        statement.push_str(" AND (revision < ? OR (revision = ? AND id < ?))");
-    }
-    statement.push_str(" ORDER BY revision DESC, id DESC LIMIT ?");
-    let mut revision_query = sqlx::query(&statement).bind(&document.id);
-    if let Some((revision, id)) = cursor {
-        revision_query = revision_query.bind(revision).bind(revision).bind(id);
-    }
-    let rows = revision_query
-        .bind(limit + 1)
-        .fetch_all(state.db.pool())
-        .await?;
+    let rows = state
+        .db
+        .project_document_revision_page(&document.id, cursor, limit)
+        .await
+        .map_err(ApiError::project_artifact_mutation)?;
     let has_more = rows.len() > limit as usize;
     let revisions = rows
         .into_iter()
         .take(limit as usize)
-        .map(document_revision_record_from_row)
+        .map(|row| {
+            row.into_revision()
+                .map_err(ApiError::project_artifact_mutation)
+        })
         .map(|record| record.and_then(|record| revision_to_api(&document, record)))
         .collect::<ApiResult<Vec<_>>>()?;
     let next_cursor = revisions
@@ -479,30 +450,19 @@ pub async fn list_decision_candidates(
     .await?;
     let limit = bounded_limit(query.limit);
     let cursor = decode_cursor(query.cursor.as_deref())?;
-    let mut statement = String::from(
-        "SELECT * FROM project_decision_candidate
-         WHERE project_id = ?",
-    );
-    if cursor.is_some() {
-        statement.push_str(" AND (created_at < ? OR (created_at = ? AND id < ?))");
-    }
-    statement.push_str(" ORDER BY created_at DESC, id DESC LIMIT ?");
-    let mut candidate_query = sqlx::query(&statement).bind(&project_id);
-    if let Some((created_at, id)) = cursor {
-        candidate_query = candidate_query
-            .bind(created_at.clone())
-            .bind(created_at)
-            .bind(id);
-    }
-    let rows = candidate_query
-        .bind(limit + 1)
-        .fetch_all(state.db.pool())
-        .await?;
+    let rows = state
+        .db
+        .project_decision_candidate_page(&project_id, cursor, limit)
+        .await
+        .map_err(ApiError::project_artifact_mutation)?;
     let has_more = rows.len() > limit as usize;
     let candidates = rows
         .into_iter()
         .take(limit as usize)
-        .map(candidate_record_from_row)
+        .map(|row| {
+            row.into_candidate()
+                .map_err(ApiError::project_artifact_mutation)
+        })
         .map(|record| record.and_then(candidate_to_api))
         .collect::<ApiResult<Vec<_>>>()?;
     let next_cursor = candidates
@@ -678,45 +638,30 @@ pub async fn list_decisions(
     .await?;
     let limit = bounded_limit(query.limit);
     let cursor = decode_cursor(query.cursor.as_deref())?;
-    let mut statement = String::from(
-        "SELECT * FROM project_decision
-         WHERE project_id = ?",
-    );
-    if cursor.is_some() {
-        statement.push_str(" AND (created_at < ? OR (created_at = ? AND id < ?))");
-    }
-    statement.push_str(" ORDER BY created_at DESC, id DESC LIMIT ?");
-    let mut decision_query = sqlx::query(&statement).bind(&project_id);
-    if let Some((created_at, id)) = cursor {
-        decision_query = decision_query
-            .bind(created_at.clone())
-            .bind(created_at)
-            .bind(id);
-    }
-    let rows = decision_query
-        .bind(limit + 1)
-        .fetch_all(state.db.pool())
-        .await?;
+    let rows = state
+        .db
+        .project_decision_page(&project_id, cursor, limit)
+        .await
+        .map_err(ApiError::project_artifact_mutation)?;
     let has_more = rows.len() > limit as usize;
     let mut records = rows
         .into_iter()
         .take(limit as usize)
-        .map(decision_record_from_row)
+        .map(|row| {
+            row.into_decision()
+                .map_err(ApiError::project_artifact_mutation)
+        })
         .collect::<ApiResult<Vec<_>>>()?;
     for record in &mut records {
         // A replacement can fall on a later keyset page.  Derive effective
         // state from the full Project-scoped append-only log rather than only
         // the current page, otherwise an old record would briefly appear
         // active while its replacement is paginated out.
-        let replacement_state: Option<String> = sqlx::query_scalar(
-            "SELECT state FROM project_decision
-             WHERE project_id = ? AND supersedes_decision_id = ?
-             ORDER BY created_at DESC, id DESC LIMIT 1",
-        )
-        .bind(&project_id)
-        .bind(&record.id)
-        .fetch_optional(state.db.pool())
-        .await?;
+        let replacement_state: Option<String> = state
+            .db
+            .project_decision_replacement_state(&project_id, &record.id)
+            .await
+            .map_err(ApiError::project_artifact_mutation)?;
         record.state = effective_decision_state(&record.state, replacement_state.as_deref());
     }
     let records = records
@@ -746,16 +691,12 @@ pub async fn get_decision(
         crate::routes::authorization::ProjectAccess::Read,
     )
     .await?;
-    let mut record = get_decision_record(&state, &project_id, &decision_id).await?;
-    let replaced_state: Option<String> = sqlx::query_scalar(
-        "SELECT state FROM project_decision
-         WHERE project_id = ? AND supersedes_decision_id = ?
-         ORDER BY created_at DESC, id DESC LIMIT 1",
-    )
-    .bind(&project_id)
-    .bind(&decision_id)
-    .fetch_optional(state.db.pool())
-    .await?;
+    let (mut record, replaced_state) = state
+        .db
+        .project_decision_detail_source(&project_id, &decision_id)
+        .await
+        .map_err(ApiError::project_artifact_mutation)?
+        .ok_or_else(|| ApiError::not_found("decision", decision_id.to_owned()))?;
     if record.state == "active" {
         record.state = effective_decision_state(&record.state, replaced_state.as_deref());
     }
@@ -793,16 +734,11 @@ async fn has_more_documents(
     let Some(last) = documents.last() else {
         return Ok(false);
     };
-    let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM project_document
-         WHERE project_id = ? AND (updated_at < ? OR (updated_at = ? AND id < ?))",
-    )
-    .bind(project_id)
-    .bind(&last.updated_at)
-    .bind(&last.updated_at)
-    .bind(&last.id)
-    .fetch_one(state.db.pool())
-    .await?;
+    let count = state
+        .db
+        .project_document_count_before(project_id, &last.updated_at, &last.id)
+        .await
+        .map_err(ApiError::project_artifact_mutation)?;
     Ok(count > 0)
 }
 
@@ -1100,92 +1036,6 @@ fn decision_to_api(record: ProjectDecisionRecord) -> ApiResult<DecisionRecord> {
         provenance,
         created_at: record.created_at.clone(),
         effective_at: record.created_at,
-    })
-}
-
-async fn get_decision_record(
-    state: &AppState,
-    project_id: &str,
-    decision_id: &str,
-) -> ApiResult<ProjectDecisionRecord> {
-    let row = sqlx::query("SELECT * FROM project_decision WHERE id = ? AND project_id = ?")
-        .bind(decision_id)
-        .bind(project_id)
-        .fetch_optional(state.db.pool())
-        .await?
-        .ok_or_else(|| ApiError::not_found("decision", decision_id.to_owned()))?;
-    decision_record_from_row(row)
-}
-
-fn decision_record_from_row(row: sqlx::sqlite::SqliteRow) -> ApiResult<ProjectDecisionRecord> {
-    Ok(ProjectDecisionRecord {
-        id: row.try_get("id")?,
-        project_id: row.try_get("project_id")?,
-        state: row.try_get("state")?,
-        decision_class: row.try_get("decision_class")?,
-        question: row.try_get("question")?,
-        context_json: row.try_get("context_json")?,
-        options_json: row.try_get("options_json")?,
-        selected_outcome: row.try_get("selected_outcome")?,
-        rationale: row.try_get("rationale")?,
-        principal_type: row.try_get("principal_type")?,
-        principal_id: row.try_get("principal_id")?,
-        authority_basis: row.try_get("authority_basis")?,
-        authorization_action: row.try_get("authorization_action")?,
-        explicit_event: row.try_get("explicit_event")?,
-        authorization_occurred_at: row.try_get("authorization_occurred_at")?,
-        charter_revision_id: row.try_get("charter_revision_id")?,
-        source_refs_json: row.try_get("source_refs_json")?,
-        affected_records_json: row.try_get("affected_records_json")?,
-        supersedes_decision_id: row.try_get("supersedes_decision_id")?,
-        created_at: row.try_get("created_at")?,
-    })
-}
-
-fn document_revision_record_from_row(
-    row: sqlx::sqlite::SqliteRow,
-) -> ApiResult<ProjectDocumentRevisionRecord> {
-    Ok(ProjectDocumentRevisionRecord {
-        id: row.try_get("id")?,
-        document_id: row.try_get("document_id")?,
-        revision: row.try_get("revision")?,
-        base_revision: row.try_get("base_revision")?,
-        base_revision_id: row.try_get("base_revision_id")?,
-        lifecycle: row.try_get("lifecycle")?,
-        schema_version: row.try_get("schema_version")?,
-        render_version: row.try_get("render_version")?,
-        content_json: row.try_get("content_json")?,
-        rendered_view: row.try_get("rendered_view")?,
-        change_summary: row.try_get("change_summary")?,
-        author_type: row.try_get("author_type")?,
-        author_id: row.try_get("author_id")?,
-        source_refs_json: row.try_get("source_refs_json")?,
-        content_digest: row.try_get("content_digest")?,
-        rendered_digest: row.try_get("rendered_digest")?,
-        created_at: row.try_get("created_at")?,
-    })
-}
-
-fn candidate_record_from_row(
-    row: sqlx::sqlite::SqliteRow,
-) -> ApiResult<ProjectDecisionCandidateRecord> {
-    Ok(ProjectDecisionCandidateRecord {
-        id: row.try_get("id")?,
-        project_id: row.try_get("project_id")?,
-        lifecycle: row.try_get("lifecycle")?,
-        question: row.try_get("question")?,
-        context_json: row.try_get("context_json")?,
-        options_json: row.try_get("options_json")?,
-        selected_outcome: row.try_get("selected_outcome")?,
-        rationale: row.try_get("rationale")?,
-        principal_type: row.try_get("principal_type")?,
-        principal_id: row.try_get("principal_id")?,
-        source_refs_json: row.try_get("source_refs_json")?,
-        expected_project_version: row.try_get("expected_project_version")?,
-        effective_decision_id: row.try_get("effective_decision_id")?,
-        version: row.try_get("version")?,
-        created_at: row.try_get("created_at")?,
-        updated_at: row.try_get("updated_at")?,
     })
 }
 

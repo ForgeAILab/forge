@@ -318,12 +318,11 @@ async fn replay_genesis_charter_approval(
     storage_idempotency_key: &str,
     request: &ApproveProjectCharterRequest,
 ) -> ApiResult<Option<ProjectCharterApproval>> {
-    let approval_id = sqlx::query_scalar::<_, String>(
-        "SELECT id FROM project_charter_approval WHERE idempotency_key = ? LIMIT 1",
-    )
-    .bind(storage_idempotency_key)
-    .fetch_optional(state.db.pool())
-    .await?;
+    let approval_id = state
+        .db
+        .project_charter_approval_id_by_key(storage_idempotency_key)
+        .await
+        .map_err(ApiError::project_artifact_mutation)?;
     let Some(approval_id) = approval_id else {
         return Ok(None);
     };
@@ -332,13 +331,12 @@ async fn replay_genesis_charter_approval(
         .ok_or_else(|| {
             ApiError::internal("persisted Charter approval idempotency row is missing")
         })?;
-    let stored_session_id = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT genesis_session_id FROM project_charter WHERE id = ?",
-    )
-    .bind(&record.charter_id)
-    .fetch_optional(state.db.pool())
-    .await?
-    .flatten();
+    let stored_session_id = state
+        .db
+        .project_charter_genesis_session_id(&record.charter_id)
+        .await
+        .map_err(ApiError::project_artifact_mutation)?
+        .flatten();
     let same = record.approval_type == "project_creation"
         && stored_session_id.as_deref() == Some(session_id)
         && record.charter_id == request.charter_id
@@ -467,13 +465,11 @@ async fn genesis_charter_projection(
         .as_ref()
         .and_then(|id| revisions.iter().find(|revision| &revision.id == id))
         .cloned();
-    let approval_id = sqlx::query_scalar::<_, String>(
-        "SELECT id FROM project_charter_approval
-         WHERE charter_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
-    )
-    .bind(&charter_record.id)
-    .fetch_optional(state.db.pool())
-    .await?;
+    let approval_id = state
+        .db
+        .latest_project_charter_approval_id(&charter_record.id)
+        .await
+        .map_err(ApiError::project_artifact_mutation)?;
     let approval = match approval_id {
         Some(id) => ProjectOrchestrationRepo::get_project_charter_approval(&*state.db, &id)
             .await?
@@ -772,27 +768,17 @@ fn required_text(field: &'static str, value: String) -> ApiResult<String> {
 }
 
 async fn current_project_agent_operating_skill_revision(state: &AppState) -> ApiResult<String> {
-    sqlx::query_scalar::<_, String>(
-        "SELECT revision.id
-         FROM operating_skill AS skill
-         JOIN operating_skill_revision AS revision
-           ON revision.id = skill.current_revision_id
-          AND revision.operating_skill_id = skill.id
-          AND revision.skill_key = skill.skill_key
-         WHERE skill.skill_key = ?
-           AND skill.lifecycle = 'active'
-           AND skill.current_revision_id IS NOT NULL
-         LIMIT 1",
-    )
-    .bind(PROJECT_OPERATING_SKILL_KEY)
-    .fetch_optional(state.db.pool())
-    .await?
-    .ok_or_else(|| {
-        ApiError::conflict_with_code(
-            "operating_skill_conflict",
-            "the Project Agent operating skill has no current active revision",
-        )
-    })
+    state
+        .db
+        .current_project_operating_skill_revision_id(PROJECT_OPERATING_SKILL_KEY)
+        .await
+        .map_err(ApiError::project_artifact_mutation)?
+        .ok_or_else(|| {
+            ApiError::conflict_with_code(
+                "operating_skill_conflict",
+                "the Project Agent operating skill has no current active revision",
+            )
+        })
 }
 
 fn project_mode_name(value: ProjectMode) -> &'static str {
