@@ -425,18 +425,19 @@ async fn replay_milestone_check_waiver(
         .and_then(serde_json::Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| ApiError::internal("persisted milestone waiver id is missing"))?;
-    let payload_policy_revision = payload
-        .get("governing_policy_revision")
-        .and_then(serde_json::Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            ApiError::internal("persisted milestone waiver policy revision is missing")
-        })?;
-    let payload_policy_digest = payload
-        .get("governing_policy_digest")
-        .and_then(serde_json::Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| ApiError::internal("persisted milestone waiver policy digest is missing"))?;
+    if !stored_governing_policy_matches(&payload) {
+        let message = if payload
+            .get("governing_policy_revision")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .is_none()
+        {
+            "persisted milestone waiver policy revision is missing"
+        } else {
+            "persisted milestone waiver policy digest is missing"
+        };
+        return Err(ApiError::internal(message));
+    }
     let decision = state
         .db
         .project_decision_command_source(waiver_id, project_id)
@@ -522,14 +523,8 @@ async fn replay_milestone_check_waiver(
                 .and_then(|value| serde_json::from_value::<Vec<String>>(value).ok())
                 .as_ref()
                 == Some(&request.governing_revision_ids)
-            && affected
-                .get("governing_policy_revision")
-                .and_then(serde_json::Value::as_str)
-                == Some(payload_policy_revision)
-            && affected
-                .get("governing_policy_digest")
-                .and_then(serde_json::Value::as_str)
-                == Some(payload_policy_digest)
+            && affected.get("governing_policy_revision") == payload.get("governing_policy_revision")
+            && affected.get("governing_policy_digest") == payload.get("governing_policy_digest")
     } else {
         false
     };
@@ -574,15 +569,7 @@ async fn replay_milestone_check_waiver(
             .cloned()
             .and_then(|value| serde_json::from_value::<Vec<String>>(value).ok())
             .as_ref()
-            == Some(&request.governing_revision_ids)
-        && payload
-            .get("governing_policy_revision")
-            .and_then(serde_json::Value::as_str)
-            == Some(payload_policy_revision)
-        && payload
-            .get("governing_policy_digest")
-            .and_then(serde_json::Value::as_str)
-            == Some(payload_policy_digest);
+            == Some(&request.governing_revision_ids);
     if !same_request || !decision_matches {
         return Err(ApiError::conflict_with_code(
             "idempotency_conflict",
@@ -825,6 +812,25 @@ fn check_result_outcome(value: api_types::AcceptanceCheckResultStatus) -> &'stat
     }
 }
 
+fn stored_governing_policy_matches(manifest: &serde_json::Value) -> bool {
+    match (
+        manifest.get("governing_policy_revision"),
+        manifest.get("governing_policy_digest"),
+    ) {
+        // Since v0.9, receipts omit the removed execution-baseline release policy.
+        (None, None) => true,
+        (Some(revision), Some(digest)) => {
+            revision
+                .as_str()
+                .is_some_and(|value| !value.trim().is_empty())
+                && digest
+                    .as_str()
+                    .is_some_and(|value| !value.trim().is_empty())
+        }
+        _ => false,
+    }
+}
+
 fn validation_result_from_read(
     row: &db::MilestoneManualResultRead,
     project_id: &str,
@@ -912,14 +918,7 @@ fn validation_result_from_read(
                 .map_err(ApiError::project_artifact_mutation)?
                 .as_str(),
         )
-        || source_manifest
-            .get("governing_policy_revision")
-            .and_then(serde_json::Value::as_str)
-            .is_none_or(|value| value.trim().is_empty())
-        || source_manifest
-            .get("governing_policy_digest")
-            .and_then(serde_json::Value::as_str)
-            .is_none_or(|value| value.trim().is_empty())
+        || !stored_governing_policy_matches(&source_manifest)
     {
         return Err(ApiError::internal(
             "persisted manual check authority manifest is incomplete",

@@ -119,6 +119,380 @@ async fn seed_milestone(harness: &common::Harness, project_id: &str, checks: boo
         .bind(project_id).execute(pool).await.unwrap();
 }
 
+enum ReceiptShape {
+    New,
+    WithoutPolicy,
+    ReleasePolicy,
+}
+
+async fn seed_legacy_receipt(
+    harness: &common::Harness,
+    project: &str,
+    waive: bool,
+    request: &Value,
+    policy_fields: &Value,
+) -> Value {
+    let pool = harness.state.db.pool();
+    let now = db::now_rfc3339();
+    let authorization: api_types::AuthorizationProvenance =
+        serde_json::from_value(request["mutation"]["authorization"].clone()).unwrap();
+    let mut tx = db::begin_immediate(pool).await.unwrap();
+    let response = if waive {
+        let mut affected = json!({
+            "milestone_id": "milestone", "check_id": "check",
+            "definition_revision_id": "revision", "input_digest": "input",
+            "expected_version": 1, "governing_revision_ids": request["governing_revision_ids"],
+        });
+        affected
+            .as_object_mut()
+            .unwrap()
+            .extend(policy_fields.as_object().unwrap().clone());
+        harness
+            .state
+            .db
+            .insert_milestone_waiver_decision_in_tx(
+                &mut tx,
+                db::InsertMilestoneWaiverDecisionInput {
+                    waiver_id: "legacy-receipt",
+                    project_id: project,
+                    check_id: "check",
+                    reason: request["reason"].as_str().unwrap(),
+                    user_id: "test-user-id",
+                    authorization_basis: &authorization.authorization_basis,
+                    authorization_action: &authorization.action,
+                    explicit_event: &authorization.event_id,
+                    authorization_occurred_at: &authorization.occurred_at,
+                    charter_revision_id: "charter-revision",
+                    affected_records_json: &affected.to_string(),
+                    created_at: &now,
+                },
+            )
+            .await
+            .unwrap();
+        let mut response = json!({
+            "waiver_id": "legacy-receipt", "project_id": project,
+            "milestone_id": "milestone", "check_id": "check",
+            "definition_revision_id": "revision", "reason": request["reason"],
+            "input_digest": "input", "expected_version": 1,
+            "principal_id": "test-user-id", "authorization": authorization,
+            "governing_revision_ids": request["governing_revision_ids"], "created_at": now,
+        });
+        response
+            .as_object_mut()
+            .unwrap()
+            .extend(policy_fields.as_object().unwrap().clone());
+        response
+    } else {
+        let mut manifest = json!({
+            "result": request["result"], "check_definition_revision_id": "revision",
+            "governing_revision_ids": request["governing_revision_ids"],
+        });
+        manifest
+            .as_object_mut()
+            .unwrap()
+            .extend(policy_fields.as_object().unwrap().clone());
+        let key = format!(
+            "forge-idem-v1:{}:{}:{}:record",
+            hex::encode("milestone-check"),
+            hex::encode(project),
+            hex::encode("test-user-id"),
+        );
+        sqlx::query("INSERT INTO project_milestone_check_result (id, project_id, milestone_id, check_id, definition_revision_id, outcome, source_kind, source_manifest_json, input_digest, governing_charter_revision_id, principal_type, principal_id, authorization_basis, authorization_action, authorization_occurred_at, expected_version, explicit_event, idempotency_key, created_at) VALUES ('legacy-receipt', ?, 'milestone', 'check', 'revision', ?, 'manual', ?, 'input', 'charter-revision', 'user', 'test-user-id', ?, ?, ?, 1, ?, ?, ?)")
+            .bind(project).bind(if request["status"] == "pass" { "passed" } else { "failed" })
+            .bind(manifest.to_string())
+            .bind(&authorization.authorization_basis).bind(&authorization.action)
+            .bind(&authorization.occurred_at).bind(&authorization.event_id)
+            .bind(key).bind(&now).execute(&mut *tx).await.unwrap();
+        sqlx::query("UPDATE project_milestone_check SET current_result_id = 'legacy-receipt', version = version + 1 WHERE id = 'check'")
+            .execute(&mut *tx).await.unwrap();
+        let digest_input = json!({
+            "id": "legacy-receipt", "check_id": "check", "status": request["status"],
+            "result": request["result"], "input_digest": "input",
+            "governing_revision_ids": request["governing_revision_ids"],
+            "authorization": authorization, "evaluated_at": now,
+            "source_manifest": manifest,
+        });
+        let digest = api_types::canonical_digest_with_schema(
+            services::MILESTONE_READINESS_DIGEST_SCHEMA_VERSION,
+            &digest_input,
+        )
+        .unwrap();
+        json!({
+            "id": "legacy-receipt", "project_id": project, "check_id": "check",
+            "status": request["status"], "result": request["result"],
+            "principal": authorization.principal, "authorization": authorization,
+            "input_digest": "input", "governing_revision_ids": request["governing_revision_ids"],
+            "expected_version": 1, "event_id": authorization.event_id,
+            "evaluated_at": now, "result_digest": digest,
+        })
+    };
+    let event_type = if waive {
+        "milestone.check.waived"
+    } else {
+        "milestone.check.recorded"
+    };
+    let event_payload = if waive {
+        response.clone()
+    } else {
+        json!({
+            "project_id": project, "milestone_id": "milestone", "check_id": "check",
+            "result_id": "legacy-receipt",
+            "status": if request["status"] == "pass" { "passed" } else { "failed" },
+            "authorization": authorization,
+            "governing_revision_ids": request["governing_revision_ids"],
+        })
+    };
+    db::DomainEventRepo::append_event_in_tx(
+        &*harness.state.db,
+        &mut tx,
+        &db::CreateDomainEvent {
+            id: "legacy-event".to_owned(),
+            event_type: event_type.to_owned(),
+            entity_type: if waive {
+                "milestone_check_waiver"
+            } else {
+                "milestone_check_result"
+            }
+            .to_owned(),
+            entity_id: "legacy-receipt".to_owned(),
+            actor_type: "user".to_owned(),
+            actor_id: Some("test-user-id".to_owned()),
+            scope_type: "project".to_owned(),
+            scope_id: project.to_owned(),
+            correlation_id: authorization.event_id.clone(),
+            causation_id: Some(authorization.event_id),
+            causation_depth: 0,
+            dedupe_key: Some(format!(
+                "{event_type}:{project}:{}",
+                request["mutation"]["idempotency_key"].as_str().unwrap()
+            )),
+            payload_json: event_payload.to_string(),
+            created_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    response
+}
+
+async fn assert_committed_check_replays(waive: bool, receipt: ReceiptShape, status: &str) {
+    let (_root, harness, project) = fixture().await;
+    seed_milestone(&harness, &project, true).await;
+    let suffix = if waive { "waive" } else { "result" };
+    let url = format!("/api/v1/projects/{project}/milestones/milestone/checks/check/{suffix}");
+    let mut request = check_request(waive);
+    if !waive {
+        request["status"] = json!(status);
+    }
+    let policy_fields = if matches!(receipt, ReceiptShape::ReleasePolicy) {
+        // e304ec83 pinned the Charter and baseline, with a separate release-policy pair.
+        request["governing_revision_ids"] = json!(["charter-revision", "baseline-revision"]);
+        json!({
+            "governing_policy_revision": "v076-policy-r1",
+            "governing_policy_digest": "v076-policy-digest",
+        })
+    } else {
+        json!({})
+    };
+    let first: Value = if matches!(receipt, ReceiptShape::New) {
+        common::json_request(
+            &harness.app,
+            Method::POST,
+            &url,
+            request.clone(),
+            StatusCode::OK,
+        )
+        .await
+    } else {
+        seed_legacy_receipt(&harness, &project, waive, &request, &policy_fields).await
+    };
+    let replay: Value = common::json_request(
+        &harness.app,
+        Method::POST,
+        &url,
+        request.clone(),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(replay, first);
+
+    if matches!(receipt, ReceiptShape::New) {
+        let queries = if waive {
+            vec![
+                "SELECT payload_json FROM domain_event WHERE event_type = 'milestone.check.waived'",
+                "SELECT affected_records_json FROM project_decision WHERE decision_class = 'waiver'",
+            ]
+        } else {
+            vec!["SELECT source_manifest_json FROM project_milestone_check_result"]
+        };
+        for query in queries {
+            let stored: String = sqlx::query_scalar(query)
+                .fetch_one(harness.state.db.pool())
+                .await
+                .unwrap();
+            let stored: Value = serde_json::from_str(&stored).unwrap();
+            assert!(stored.get("governing_policy_revision").is_none());
+            assert!(stored.get("governing_policy_digest").is_none());
+        }
+    }
+
+    sqlx::query("UPDATE project SET current_charter_id = NULL, current_charter_revision_id = NULL WHERE id = ?")
+        .bind(&project)
+        .execute(harness.state.db.pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE project_milestone SET current_definition_revision_id = NULL WHERE id = 'milestone'",
+    )
+    .execute(harness.state.db.pool())
+    .await
+    .unwrap();
+    let replay: Value = common::json_request(
+        &harness.app,
+        Method::POST,
+        &url,
+        request.clone(),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(replay, first, "replay must retain the committed governance");
+
+    let mut changed = request;
+    changed[if waive { "reason" } else { "result" }] = json!("Different body");
+    let conflict: Value = common::json_request(
+        &harness.app,
+        Method::POST,
+        &url,
+        changed,
+        StatusCode::CONFLICT,
+    )
+    .await;
+    assert_command_error(
+        conflict,
+        "idempotency_conflict",
+        if waive {
+            "the waiver idempotency key was already used for a different waiver"
+        } else {
+            "the manual check idempotency key was already used for a different result"
+        },
+    );
+    let pool = harness.state.db.pool();
+    let results: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM project_milestone_check_result")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let decisions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM project_decision")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM domain_event WHERE event_type LIKE 'milestone.check.%'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(results, i64::from(!waive));
+    assert_eq!(decisions, i64::from(waive));
+    assert_eq!(events, 1);
+}
+
+#[tokio::test]
+async fn committed_manual_result_replays_without_a_second_row_or_event() {
+    for status in ["pass", "fail"] {
+        assert_committed_check_replays(false, ReceiptShape::New, status).await;
+    }
+}
+
+#[tokio::test]
+async fn committed_waiver_replays_without_a_second_row_or_event() {
+    assert_committed_check_replays(true, ReceiptShape::New, "").await;
+}
+
+#[tokio::test]
+async fn legacy_manual_result_replays_without_policy_fields() {
+    for status in ["pass", "fail"] {
+        assert_committed_check_replays(false, ReceiptShape::WithoutPolicy, status).await;
+    }
+}
+
+#[tokio::test]
+async fn legacy_waiver_replays_without_policy_fields() {
+    assert_committed_check_replays(true, ReceiptShape::WithoutPolicy, "").await;
+}
+
+#[tokio::test]
+async fn v08_manual_result_replays_with_release_policy_fields() {
+    for status in ["pass", "fail"] {
+        assert_committed_check_replays(false, ReceiptShape::ReleasePolicy, status).await;
+    }
+}
+
+#[tokio::test]
+async fn v08_waiver_replays_with_original_release_policy_fields() {
+    assert_committed_check_replays(true, ReceiptShape::ReleasePolicy, "").await;
+}
+
+#[tokio::test]
+async fn replay_refuses_partial_or_empty_policy_fields() {
+    for waive in [false, true] {
+        for (policy_fields, missing_field) in [
+            (
+                json!({"governing_policy_revision": "v076-policy-r1"}),
+                "digest",
+            ),
+            (
+                json!({"governing_policy_digest": "v076-policy-digest"}),
+                "revision",
+            ),
+            (
+                json!({"governing_policy_revision": "", "governing_policy_digest": "v076-policy-digest"}),
+                "revision",
+            ),
+            (
+                json!({"governing_policy_revision": "v076-policy-r1", "governing_policy_digest": ""}),
+                "digest",
+            ),
+            (
+                json!({"governing_policy_revision": "  ", "governing_policy_digest": "v076-policy-digest"}),
+                "revision",
+            ),
+            (
+                json!({"governing_policy_revision": "v076-policy-r1", "governing_policy_digest": "  "}),
+                "digest",
+            ),
+        ] {
+            let (_root, harness, project) = fixture().await;
+            seed_milestone(&harness, &project, true).await;
+            let mut request = check_request(waive);
+            request["governing_revision_ids"] = json!(["charter-revision", "baseline-revision"]);
+            seed_legacy_receipt(&harness, &project, waive, &request, &policy_fields).await;
+            let suffix = if waive { "waive" } else { "result" };
+            let error = common::json_request(
+                &harness.app,
+                Method::POST,
+                &format!("/api/v1/projects/{project}/milestones/milestone/checks/check/{suffix}"),
+                request,
+                StatusCode::INTERNAL_SERVER_ERROR,
+            )
+            .await;
+            if waive {
+                assert_command_error(
+                    error,
+                    "internal_error",
+                    &format!("persisted milestone waiver policy {missing_field} is missing"),
+                );
+            } else {
+                assert_command_error(
+                    error,
+                    "internal_error",
+                    "persisted manual check authority manifest is incomplete",
+                );
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn milestone_database_errors_preserve_body() {
     let (_root, harness, project) = fixture().await;
