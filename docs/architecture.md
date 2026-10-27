@@ -6192,6 +6192,9 @@ overlay. Unknown fields and tags are rejected, including in closed nested
 objects; missing and null stay distinct. `plan_settlement_wait` and interruption
 kind `integration_admission_failed` are stored tags outside `FailureKind`.
 The queue's kindless interruption has a required nullable reason.
+DetectedState, PlacementRefusal, PlanWait and UpgradeDispatch also carry an
+optional String `blocking_reason` for queued-action restore; fresh writers omit
+it, and the queue preserves it when adding a step-failure overlay.
 
 Storage encoding follows each main writer: `json!`/`Value` sorts object keys;
 `TaskBlockingAnnotation` uses declaration order, and demo message literals put

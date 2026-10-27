@@ -1,5 +1,41 @@
 use crate::worker_runtime::queue::writer_parity::case;
 
+#[test]
+fn restored_shapes_use_typed_path_and_match_main_bytes() {
+    let reason = crate::ServiceError::invalid_operation("restore refused").to_string();
+    for sample in [
+        "dispatch-state",
+        "placement",
+        "plan-wait",
+        "dispatch-upgrade",
+    ] {
+        let raw = crate::worker_runtime::queue::writer_parity::channel_sample(sample);
+        serde_json::from_str::<super::channels::ErrorAnnotation>(&raw)
+            .expect("saved annotation has a strict shape");
+        let expected =
+            include_str!("../../../../worker_runtime/queue/fixtures/writer-main-94609411.jsonl")
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .find(|record| record["name"] == format!("restore-{sample}/first"))
+                .unwrap();
+        let expected: serde_json::Value =
+            serde_json::from_str(expected["raw"].as_str().unwrap()).unwrap();
+        let expected = expected["annotation"].as_str().unwrap();
+        assert_eq!(
+            super::restore_action_annotation(Some(&raw), &reason).as_deref(),
+            Some(expected),
+            "{sample} must restore through the typed path"
+        );
+        serde_json::from_str::<super::channels::ErrorAnnotation>(expected)
+            .expect("restored annotation has a strict shape");
+        assert_eq!(
+            super::restore_action_annotation(Some(expected), &reason).as_deref(),
+            Some(expected),
+            "{sample} must also restore an existing blocking_reason"
+        );
+    }
+}
+
 #[tokio::test]
 async fn restored_condition() {
     for sample in [
