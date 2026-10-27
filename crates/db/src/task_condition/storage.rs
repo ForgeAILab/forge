@@ -187,7 +187,7 @@ pub(super) async fn set_condition(
         // Historical migration replay can enqueue steps before the digest
         // column exists. Keep the same condition and version fences there.
         Err(sqlx::Error::Database(error))
-            if error.message() == "no such column: condition_digest" =>
+            if error.message().contains("no such column: condition_digest") =>
         {
             sqlx::query("UPDATE task SET condition_json=?1 WHERE id=?2 AND (?3 IS NULL OR version=?3) AND condition_json IS NOT ?1")
                 .bind(condition)

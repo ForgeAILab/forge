@@ -2,6 +2,61 @@ use super::super::*;
 use db::{PageRequest, SortBy, SortOrder};
 
 #[tokio::test]
+async fn claim_returns_the_stored_condition_after_clearing_environment_wait() {
+    // The placement precheck clears one environment_wait member. Duplicate
+    // members are valid persisted JSON; the final resolver clears the remaining
+    // member after the repository has returned its claim snapshot.
+    for metadata_json in [
+        r#"{"environment_wait":{"kind":"environment_not_ready"},"deferred_dispatch":{"kind":"environment_not_ready"}}"#,
+        r#"{"environment_wait":{},"environment_wait":{"kind":"environment_not_ready"},"deferred_dispatch":{"kind":"environment_not_ready"}}"#,
+    ] {
+        let db = Arc::new(sqlite_db().await);
+        let workspace_root = TempDir::new().expect("workspace root creates");
+        let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)))
+            .with_workspace_root(workspace_root.path().to_path_buf());
+        let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+        let agent_id = seed_agent(&db).await;
+        let task = service
+            .create_task(
+                project_id,
+                "Claim after environment recovery",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE task SET metadata_json=? WHERE id=?")
+            .bind(metadata_json)
+            .bind(&task.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let claimed = service
+            .claim_task(task.id.clone(), Assignee::Agent(agent_id), None)
+            .await
+            .unwrap();
+        let stored = TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        let metadata: Value =
+            serde_json::from_str(stored.metadata_json.as_deref().unwrap()).unwrap();
+        assert!(metadata.get("environment_wait").is_none());
+        assert!(metadata.get("deferred_dispatch").is_none());
+        assert!(stored.condition_digest.is_some());
+        assert_eq!(claimed.task.condition, stored.condition);
+        assert_eq!(claimed.task.condition_digest, stored.condition_digest);
+        assert_eq!(claimed.task, stored);
+    }
+}
+
+#[tokio::test]
 async fn project_agent_identity_can_claim_a_task_role() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));

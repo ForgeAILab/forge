@@ -297,7 +297,7 @@ impl TaskService {
             },
         )
         .await;
-        let claimed = match claimed {
+        let mut claimed = match claimed {
             Ok(claimed) => claimed,
             Err(error) => {
                 drop(transaction);
@@ -364,6 +364,9 @@ impl TaskService {
             &task_id,
         )
         .await?;
+        claimed.task = TaskRepo::get_by_id_in_tx(&*self.db, &mut transaction, &task_id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
         if let Err(error) = transaction.commit().await.map_err(DbError::from) {
             // The commit may have succeeded at SQLite despite a transport
             // error; revoke the lease idempotently so a crashed claimant can
