@@ -1,4 +1,4 @@
-use crate::worker_runtime::queue::writer_parity::case;
+use crate::recovery::test_support::writer_fixture::case;
 
 #[tokio::test]
 async fn transition_deferred_marker() {

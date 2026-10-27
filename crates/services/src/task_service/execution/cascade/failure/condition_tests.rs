@@ -63,7 +63,7 @@ async fn typed_executor_failure_matches_archived_main_for_every_shape_and_second
     assert_writer_cases("executor", visited);
 }
 
-use crate::worker_runtime::queue::writer_parity::case;
+use crate::recovery::test_support::writer_fixture::{case, ClockNormalization};
 
 #[tokio::test]
 async fn unavailable_and_retry() {
@@ -117,15 +117,6 @@ async fn unavailable_and_retry() {
             assert!(deadline >= before + chrono::Duration::seconds(10));
             assert!(deadline <= after + chrono::Duration::seconds(10));
         },
-        |row, raw| {
-            let metadata: serde_json::Value =
-                serde_json::from_str(row.metadata_json.as_deref().unwrap()).unwrap();
-            let deadline = metadata["deferred_dispatch"]["not_before"]
-                .as_str()
-                .unwrap();
-            let parsed = chrono::DateTime::parse_from_rfc3339(deadline).unwrap();
-            assert_eq!(parsed.to_rfc3339(), deadline);
-            raw.replace(deadline, "<execution-retry-deadline>")
-        }
+        ClockNormalization::ExecutionRetry
     );
 }
