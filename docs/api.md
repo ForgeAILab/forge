@@ -802,8 +802,8 @@ map both `blocked` and `unavailable` to `missing`. This replay metadata is outsi
 the digested source manifest, so result digest inputs are unchanged. Older events
 without `result_status` keep the existing outcome reconstruction (`missing`
 replays as `blocked`); their original `unavailable` status cannot be recovered.
-Those older receipts also cannot distinguish retries changing only `blocked`
-to `unavailable` or vice versa.
+Those older receipts also cannot distinguish retries changing only between
+`blocked`, `unavailable`, and `pending`.
 Authorization display names are recovered from older events when available;
 rows without an event retain the existing null display name reconstruction.
 Waiver replay returns the stored original response body, including any historical

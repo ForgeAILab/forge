@@ -121,6 +121,13 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   500. Results recorded by v0.7.4/v0.8 keep replaying with their original
   response. A retry with a changed body still returns 409
   `idempotency_conflict`.
+- A replayed manual milestone check result now returns the same body and
+  `result_digest` as the first response: the principal's `display_name` is
+  kept, and an `unavailable` result no longer replays as `blocked`. The
+  `milestone.check.recorded` event payload gains `result_status`. Results
+  recorded before this fix cannot tell `unavailable` or `pending` from
+  `blocked` and still replay as `blocked`. A retry that changes only the
+  `display_name` or the status now returns 409 `idempotency_conflict`.
 - Whether a Project capacity wait is "at capacity" or "waiting on owner" is
   now recorded as a typed field instead of being read from the message wording.
   Existing waits keep their classification.

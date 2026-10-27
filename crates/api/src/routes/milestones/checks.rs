@@ -147,6 +147,14 @@ async fn replay_milestone_check_result(
         .map(|event| serde_json::from_str(&event.payload_json))
         .transpose()
         .map_err(|_| ApiError::internal("persisted manual check event is invalid"))?;
+    if details.as_ref().is_some_and(|details| {
+        details.authorization != request.mutation.authorization
+            || details
+                .result_status
+                .is_some_and(|status| status != request.status)
+    }) {
+        return Err(idempotency_conflict());
+    }
     let result_id = existing.id().map_err(ApiError::project_artifact_mutation)?;
     if details.as_ref().is_some_and(|details| {
         details.project_id != project_id
@@ -159,14 +167,6 @@ async fn replay_milestone_check_result(
         ));
     }
     let result = validation_result_from_read(&existing, project_id, details.as_ref())?;
-    if details.as_ref().is_some_and(|details| {
-        details.authorization != request.mutation.authorization
-            || details
-                .result_status
-                .is_some_and(|status| status != request.status)
-    }) {
-        return Err(idempotency_conflict());
-    }
 
     Ok(Some(result))
 }
