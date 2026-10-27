@@ -6,11 +6,7 @@
 6814 crates/api/tests/model_workflow.rs
 2012 crates/api/tests/suite/happy_path.rs
 2672 crates/api/tests/suite/manual_review_and_comments.rs
-2494 crates/db/src/budget.rs
-2654 crates/db/src/check_run/tests.rs
 2193 crates/db/src/task_condition/tests.rs
-12529 crates/db/src/tests.rs
-2931 crates/forge-solo/src/session.rs
 3168 crates/mcp-server/src/tests.rs
 4376 crates/services-agents/tests/suite/attention_service.rs
 2124 crates/services-agents/tests/suite/direct_command_classification.rs
