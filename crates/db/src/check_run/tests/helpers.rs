@@ -1,8 +1,6 @@
 //! Shared database fixtures and test request builders.
 use super::*;
 
-pub(super) const AFTER: &str = "2026-10-08T00:01:01Z";
-pub(super) const AFTER_UNTIL: &str = "2026-10-08T00:02:00Z";
 pub(super) const NOW: &str = "2026-10-08T00:00:00Z";
 pub(super) const UNTIL: &str = "2026-10-08T00:01:00Z";
 
@@ -255,53 +253,6 @@ pub(super) fn before_work(key: &str, task: &str, workspace: &str) -> CheckRunReq
 
 pub(super) async fn rows(db: &SqliteDb, table: &str) -> i64 {
     sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
-        .fetch_one(db.pool())
-        .await
-        .unwrap()
-}
-
-/// A certified reusable pass for `identity()`, then a request that differs
-/// only by `change`: it must neither reuse that result nor join a live run.
-pub(super) async fn assert_never_shared(change: fn(&mut CheckRunIdentity)) {
-    let db = fixture().await;
-    let result = complete(
-        &db,
-        request("one"),
-        CheckResultOutcome::Pass,
-        CheckCleanup::Success,
-    )
-    .await;
-    assert!(result.certified && result.cacheable);
-    let mut changed = request("two");
-    change(&mut changed.identity);
-    let other = changed.identity.clone();
-    assert!(db.reusable_check_result(&other).await.unwrap().is_none());
-    let scheduled = db.request_check_run(changed).await.unwrap();
-    assert!(matches!(
-        scheduled.disposition,
-        CheckRequestDisposition::Scheduled
-    ));
-    assert_eq!(scheduled.consumer.result_id, None);
-    assert_ne!(
-        scheduled.consumer.run_id.as_deref(),
-        Some(result.run_id.as_str())
-    );
-    // While that second run is live, the original identity does not join it.
-    let original = db.request_check_run(request("three")).await.unwrap();
-    assert!(matches!(
-        original.disposition,
-        CheckRequestDisposition::Reused
-    ));
-    assert_eq!(
-        db.find_live_check_run(&other).await.unwrap().unwrap().id,
-        scheduled.consumer.run_id.unwrap()
-    );
-    assert!(db.find_live_check_run(&identity()).await.unwrap().is_none());
-}
-
-pub(super) async fn run_state(db: &SqliteDb, id: &str) -> String {
-    sqlx::query_scalar("SELECT state FROM check_run WHERE id=?")
-        .bind(id)
         .fetch_one(db.pool())
         .await
         .unwrap()

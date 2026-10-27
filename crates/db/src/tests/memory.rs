@@ -452,3 +452,13 @@ fn test_memory_enum_round_trips() {
         assert_eq!(value.parse::<MemoryConfidence>().unwrap(), confidence);
     }
 }
+
+fn memory_cursor(item: &MemoryItem) -> String {
+    URL_SAFE_NO_PAD.encode(
+        serde_json::to_vec(&serde_json::json!({
+            "created_at": &item.created_at,
+            "id": &item.id,
+        }))
+        .expect("memory cursor serializes"),
+    )
+}

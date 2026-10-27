@@ -642,3 +642,44 @@ async fn agent_list_active_assignments_match_scalar_for_workflow_shapes() {
         }
     }
 }
+
+async fn seed_agent(
+    db: &SqliteDb,
+    name: &str,
+    visibility: &str,
+    owner_id: Option<String>,
+) -> String {
+    let now = now_rfc3339();
+    let agent_id = new_uuid_v4();
+    AgentRepo::create(
+        db,
+        CreateAgent {
+            id: agent_id.clone(),
+            name: name.to_owned(),
+            description: None,
+            executor_type: "shell".to_owned(),
+            model: None,
+            reasoning_effort: None,
+            permission_policy: None,
+            prompt_template: None,
+            capabilities_json: "[]".to_owned(),
+            config_json: "{}".to_owned(),
+            credential_ref: None,
+            daemon_id: None,
+            max_concurrent_tasks: 1,
+            heartbeat_interval_seconds: 30,
+            max_missed_heartbeats: 3,
+            status: AgentStatus::Idle,
+            last_heartbeat_at: None,
+            is_default: false,
+            paused: false,
+            owner_id,
+            visibility: visibility.to_owned(),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("agent creates");
+    agent_id
+}
