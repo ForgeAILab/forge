@@ -84,6 +84,8 @@ pub struct PausedIntegration {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlacementRefusal {
+    /// Shares the restored annotation shape, so decoding accepts a String
+    /// `blocking_reason` even though production marker writers always omit it.
     pub annotation: super::PlacementRefusalAnnotation,
     pub eligibility_key: String,
     pub repo_id: String,

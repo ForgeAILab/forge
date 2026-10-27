@@ -40,7 +40,8 @@ The branch calls the unchanged lenient mapper for those cases. Non-text input is
 represented by the mapper's existing `non_text` boundary, including BLOB and
 invalid-UTF8 classifications; no strict channel decoder is involved.
 
-`provenance.tsv` maps every literal to its producer. The external generation
+`provenance.tsv` maps every `main-13bc2ae1.jsonl` literal to its producer;
+the sibling restore corpus has its provenance below. The external generation
 drivers, archive, source audit and command logs are retained with the gate's
 report. The archive widens test visibility and adds test-only clock/capture
 hooks; it does not replace the channel constructors or serialization code.
@@ -52,3 +53,12 @@ typed-value comparisons where needed, as documented in
 [architecture.md](../../../../../../docs/architecture.md#task-condition-statements-and-diagnostic-text-31-in-progress).
 These fixtures do not authorize canonicalizing historical or patched rows
 through a strict decoder.
+
+`main-cc39cac5.jsonl` adds four annotation literals captured by calling archived
+main `cc39cac5`'s production `restore_failed_task_action` under a claimed Task
+step, then rereading `error_annotation`. The saved inputs and failure reason
+match the writer-parity scenarios `restore-dispatch-state`, `restore-placement`,
+`restore-plan-wait` and `restore-dispatch-upgrade`; their new String
+`blocking_reason` accompanies the replaced `message`. The capture harness,
+unchanged-production-source audit and run log are retained in `31g1f/`.
+The original `main-13bc2ae1.jsonl` remains frozen.

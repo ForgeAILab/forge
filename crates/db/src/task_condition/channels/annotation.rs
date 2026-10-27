@@ -167,6 +167,12 @@ pub struct DetectedAnnotation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DetectedStateAnnotation {
+    #[serde(
+        default,
+        deserialize_with = "super::optional",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub blocking_reason: Option<String>,
     pub detected_at: String,
     pub message: String,
     pub state: String,
@@ -205,6 +211,12 @@ pub struct StepFailureAnnotation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlacementRefusalAnnotation {
+    #[serde(
+        default,
+        deserialize_with = "super::optional",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub blocking_reason: Option<String>,
     pub code: PlacementCode,
     pub machines: Vec<RefusedMachine>,
     pub message: String,
@@ -218,6 +230,12 @@ pub struct PlacementRefusalAnnotation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlanWaitAnnotation {
+    #[serde(
+        default,
+        deserialize_with = "super::optional",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub blocking_reason: Option<String>,
     pub code: PlanWaitCode,
     pub daemon_id: String,
     pub execution_id: String,
@@ -230,6 +248,12 @@ pub struct PlanWaitAnnotation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpgradeDispatchAnnotation {
+    #[serde(
+        default,
+        deserialize_with = "super::optional",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub blocking_reason: Option<String>,
     pub code: UpgradeCode,
     pub daemon_ids: Vec<String>,
     pub detected_at: String,
@@ -301,7 +325,7 @@ impl ErrorAnnotation {
                 // Adding the step ID makes this indistinguishable from a native
                 // step payload. Use the same field-set normal form as decode.
                 self.shape = AnnotationShape::StepFailure(StepFailureAnnotation {
-                    blocking_reason: None,
+                    blocking_reason: detected.blocking_reason.clone().map(Some),
                     detected_at: detected.detected_at.clone(),
                     message: Some(detected.message.clone()),
                     state: detected.state.clone(),

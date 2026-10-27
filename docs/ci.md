@@ -130,6 +130,15 @@ normalization, byte fingerprints, and canonical Attention incident digests.
 Expected records must come from the harness running against the archived main
 source, never from the branch being checked.
 
+The DB unit-test roots `src/tests.rs` and `src/check_run/tests.rs` register
+sibling topic modules under `src/tests/` and `src/check_run/tests/`.
+Shared fixtures live in each directory's `helpers.rs`, which registers no tests.
+Their test paths use `tests::<topic>::<test>` and
+`check_run::tests::<topic>::<test>`; existing check retention paths remain
+`check_run::tests::retention::<test>`. Budget and Solo session tests retain
+`budget::tests::<test>` and `session::tests::<test>`. The DB shard still selects
+all targets, and the rest shard still covers Solo.
+
 ### Test features and required-features
 
 `forge-agent-host`, `services` and `db` do not dev-depend on themselves.
@@ -593,6 +602,12 @@ workspace protocol tests use topic files beside a small module root; shared
 fixtures live in each directory's `helpers.rs`. Migration and acceptance fixture
 includes still resolve to the original files.
 
+Workflow engine and action unit tests also use this layout, as do the
+`services-agents` integration modules `attention_service`, `wake_turn_consumer`,
+and `direct_command_classification`. Their integration target remains `main`;
+the module filters still select every topic, and individual test paths gain
+one topic segment. Existing workflow engine child modules retain their paths.
+
 To prove a consolidation preserves tests, record combined stdout and stderr
 before moving files, repeat after the change, and compare the names. The
 checker preserves unit names and normalizes only the old binary name into the
@@ -625,6 +640,15 @@ cargo test -p api --test main happy_path::test_name
 cargo test -p api --test main daemon_connect::test_name
 cargo test -p api --test model_workflow test_name
 ```
+
+The large daemon and model targets mount topic modules from
+`tests/daemon_workspace_roundtrip/` and `tests/model_workflow/`. Their test
+paths add one topic segment; the model keeps its generator, state, invariant
+checker, runner and fixtures separate from its cases. The manual-review suite
+similarly mounts topics from `tests/suite/manual_review_and_comments/`.
+Happy-path cases retain their existing `happy_path::` paths, with shared
+fixtures in `tests/suite/happy_path/helpers.rs`. MCP unit-test topics and their
+shared fixtures live under `crates/mcp-server/src/tests/`.
 
 | Separate binary | Why it stays in its own process |
 | --- | --- |

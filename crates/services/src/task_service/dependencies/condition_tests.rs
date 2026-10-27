@@ -300,6 +300,18 @@ async fn placement_writers_match_main() {
                 .record_placement_dispatch_refusal(&f.task, &error)
                 .await
                 .unwrap();
+            // All placement_refusal marker writes share this producer; cover
+            // its unverified, empty-check and provisioning-failure branches.
+            let stored = f.read().await;
+            let metadata: Value =
+                serde_json::from_str(stored.metadata_json.as_deref().unwrap()).unwrap();
+            let annotation = metadata["placement_refusal"]["annotation"]
+                .as_object()
+                .expect("the production writer stored a placement_refusal marker");
+            assert!(
+                !annotation.contains_key("blocking_reason"),
+                "{name}: production markers must omit the restore-only reason"
+            );
         });
     }
     case!(
