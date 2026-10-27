@@ -536,44 +536,6 @@ async fn manual_result_cas_uses_the_explicit_check_version() {
 }
 
 #[tokio::test]
-async fn check_charter_digest_is_scoped_and_reads_the_callers_transaction() {
-    let db = database().await;
-    project(&db).await;
-    let mut tx = db::begin_immediate(db.pool()).await.unwrap();
-    sqlx::query("INSERT INTO project_charter (id, account_id, project_id, project_mode, maturity, lifecycle, created_at, updated_at) VALUES ('charter', 'user-1', ?, 'compact', 'mvp', 'attached', ?, ?)")
-        .bind(PROJECT_ID).bind(NOW).bind(NOW).execute(&mut *tx).await.unwrap();
-    sqlx::query("INSERT INTO project_charter_revision (id, charter_id, revision, lifecycle, schema_version, render_version, content_json, rendered_view, author_type, author_id, content_digest, rendered_digest, created_at) VALUES ('charter-revision', 'charter', 1, 'approved', 'test', 'test', '{}', 'Charter', 'user', 'user-1', 'governing-content-digest', 'render', ?)")
-        .bind(NOW).execute(&mut *tx).await.unwrap();
-    assert_eq!(
-        db.milestone_check_charter_digest_in_tx(&mut tx, PROJECT_ID, "charter-revision")
-            .await
-            .unwrap()
-            .as_deref(),
-        Some("governing-content-digest"),
-    );
-    for (project, revision) in [
-        ("other-project", "charter-revision"),
-        (PROJECT_ID, "missing-revision"),
-    ] {
-        assert_eq!(
-            db.milestone_check_charter_digest_in_tx(&mut tx, project, revision)
-                .await
-                .unwrap(),
-            None,
-        );
-    }
-    tx.rollback().await.unwrap();
-    let mut tx = db::begin_immediate(db.pool()).await.unwrap();
-    assert_eq!(
-        db.milestone_check_charter_digest_in_tx(&mut tx, PROJECT_ID, "charter-revision")
-            .await
-            .unwrap(),
-        None,
-    );
-    tx.rollback().await.unwrap();
-}
-
-#[tokio::test]
 async fn waiver_decision_insert_and_existing_scoped_read_share_rollback() {
     let db = database().await;
     project(&db).await;

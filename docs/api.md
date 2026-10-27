@@ -788,16 +788,25 @@ or milestone with 400 `bad_request`. Manual result writes return 409
 check changes before its result is committed; either failure rolls back the
 result and its event.
 
-Exact retries of committed manual Pass/Fail results and waivers return the original
-200 response body, including its receipt ID and timestamps, without appending
+Exact retries of committed manual Pass/Fail results and waivers return 200 from
+the stored receipt, including its original ID and timestamps, without appending
 another result, Decision, or event. Reusing the key with a different body returns
 409 `idempotency_conflict`. Replay still requires Project access and compares the
 stored request and authorization provenance; it does not revalidate against a
-later Charter or milestone definition. New receipts capture the governing
-Charter revision ID and its content digest as internal policy provenance (in the
-manual result manifest, or both the waiver event and Decision). Older receipts
-that omit both policy fields remain authoritative and replay using their stored
-governing revisions and provenance. Replay does not backfill or change them.
+later Charter or milestone definition. Manual responses are reconstructed from
+the stored result; waiver replay returns the stored original response body,
+including any historical policy fields. The policy pair has three replay shapes:
+
+- Both `governing_policy_revision` and `governing_policy_digest` absent (v0.9+
+  and new receipts): replay with 200.
+- Both present as non-empty strings (v0.7.4/v0.8 receipts): replay with 200 using
+  the original release-policy values, which need not equal the Charter ID.
+  The waiver event and Decision must agree on both fields.
+- Exactly one present, or either value empty or invalid: refuse replay with 500
+  `internal_error` for a manual result or 409 `idempotency_conflict` for a waiver.
+
+New receipts omit both policy fields. Replay preserves stored governing revisions
+and provenance without backfilling or stripping policy fields.
 
 Milestone definition revisions use `draft`, `proposed`, `approved`, or
 `superseded`; milestone instances use `planned`, `active`, `ready_for_release`,

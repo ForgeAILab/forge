@@ -119,11 +119,18 @@ async fn seed_milestone(harness: &common::Harness, project_id: &str, checks: boo
         .bind(project_id).execute(pool).await.unwrap();
 }
 
+enum ReceiptShape {
+    New,
+    WithoutPolicy,
+    ReleasePolicy,
+}
+
 async fn seed_legacy_receipt(
     harness: &common::Harness,
     project: &str,
     waive: bool,
     request: &Value,
+    policy_fields: &Value,
 ) -> Value {
     let pool = harness.state.db.pool();
     let now = db::now_rfc3339();
@@ -131,6 +138,15 @@ async fn seed_legacy_receipt(
         serde_json::from_value(request["mutation"]["authorization"].clone()).unwrap();
     let mut tx = db::begin_immediate(pool).await.unwrap();
     let response = if waive {
+        let mut affected = json!({
+            "milestone_id": "milestone", "check_id": "check",
+            "definition_revision_id": "revision", "input_digest": "input",
+            "expected_version": 1, "governing_revision_ids": request["governing_revision_ids"],
+        });
+        affected
+            .as_object_mut()
+            .unwrap()
+            .extend(policy_fields.as_object().unwrap().clone());
         harness
             .state
             .db
@@ -147,30 +163,34 @@ async fn seed_legacy_receipt(
                     explicit_event: &authorization.event_id,
                     authorization_occurred_at: &authorization.occurred_at,
                     charter_revision_id: "charter-revision",
-                    affected_records_json: &json!({
-                        "milestone_id": "milestone", "check_id": "check",
-                        "definition_revision_id": "revision", "input_digest": "input",
-                        "expected_version": 1, "governing_revision_ids": ["charter-revision"],
-                    })
-                    .to_string(),
+                    affected_records_json: &affected.to_string(),
                     created_at: &now,
                 },
             )
             .await
             .unwrap();
-        json!({
+        let mut response = json!({
             "waiver_id": "legacy-receipt", "project_id": project,
             "milestone_id": "milestone", "check_id": "check",
             "definition_revision_id": "revision", "reason": request["reason"],
             "input_digest": "input", "expected_version": 1,
             "principal_id": "test-user-id", "authorization": authorization,
-            "governing_revision_ids": ["charter-revision"], "created_at": now,
-        })
-    } else {
-        let manifest = json!({
-            "result": request["result"], "check_definition_revision_id": "revision",
-            "governing_revision_ids": ["charter-revision"],
+            "governing_revision_ids": request["governing_revision_ids"], "created_at": now,
         });
+        response
+            .as_object_mut()
+            .unwrap()
+            .extend(policy_fields.as_object().unwrap().clone());
+        response
+    } else {
+        let mut manifest = json!({
+            "result": request["result"], "check_definition_revision_id": "revision",
+            "governing_revision_ids": request["governing_revision_ids"],
+        });
+        manifest
+            .as_object_mut()
+            .unwrap()
+            .extend(policy_fields.as_object().unwrap().clone());
         let key = format!(
             "forge-idem-v1:{}:{}:{}:record",
             hex::encode("milestone-check"),
@@ -188,7 +208,7 @@ async fn seed_legacy_receipt(
         let digest_input = json!({
             "id": "legacy-receipt", "check_id": "check", "status": request["status"],
             "result": request["result"], "input_digest": "input",
-            "governing_revision_ids": ["charter-revision"],
+            "governing_revision_ids": request["governing_revision_ids"],
             "authorization": authorization, "evaluated_at": now,
             "source_manifest": manifest,
         });
@@ -201,7 +221,7 @@ async fn seed_legacy_receipt(
             "id": "legacy-receipt", "project_id": project, "check_id": "check",
             "status": request["status"], "result": request["result"],
             "principal": authorization.principal, "authorization": authorization,
-            "input_digest": "input", "governing_revision_ids": ["charter-revision"],
+            "input_digest": "input", "governing_revision_ids": request["governing_revision_ids"],
             "expected_version": 1, "event_id": authorization.event_id,
             "evaluated_at": now, "result_digest": digest,
         })
@@ -210,6 +230,17 @@ async fn seed_legacy_receipt(
         "milestone.check.waived"
     } else {
         "milestone.check.recorded"
+    };
+    let event_payload = if waive {
+        response.clone()
+    } else {
+        json!({
+            "project_id": project, "milestone_id": "milestone", "check_id": "check",
+            "result_id": "legacy-receipt",
+            "status": if request["status"] == "pass" { "passed" } else { "failed" },
+            "authorization": authorization,
+            "governing_revision_ids": request["governing_revision_ids"],
+        })
     };
     db::DomainEventRepo::append_event_in_tx(
         &*harness.state.db,
@@ -235,7 +266,7 @@ async fn seed_legacy_receipt(
                 "{event_type}:{project}:{}",
                 request["mutation"]["idempotency_key"].as_str().unwrap()
             )),
-            payload_json: response.to_string(),
+            payload_json: event_payload.to_string(),
             created_at: now,
         },
     )
@@ -245,7 +276,7 @@ async fn seed_legacy_receipt(
     response
 }
 
-async fn assert_committed_check_replays(waive: bool, legacy: bool, status: &str) {
+async fn assert_committed_check_replays(waive: bool, receipt: ReceiptShape, status: &str) {
     let (_root, harness, project) = fixture().await;
     seed_milestone(&harness, &project, true).await;
     let suffix = if waive { "waive" } else { "result" };
@@ -254,9 +285,17 @@ async fn assert_committed_check_replays(waive: bool, legacy: bool, status: &str)
     if !waive {
         request["status"] = json!(status);
     }
-    let first: Value = if legacy {
-        seed_legacy_receipt(&harness, &project, waive, &request).await
+    let policy_fields = if matches!(receipt, ReceiptShape::ReleasePolicy) {
+        // e304ec83 pinned the Charter and baseline, with a separate release-policy pair.
+        request["governing_revision_ids"] = json!(["charter-revision", "baseline-revision"]);
+        json!({
+            "governing_policy_revision": "v076-policy-r1",
+            "governing_policy_digest": "v076-policy-digest",
+        })
     } else {
+        json!({})
+    };
+    let first: Value = if matches!(receipt, ReceiptShape::New) {
         common::json_request(
             &harness.app,
             Method::POST,
@@ -265,6 +304,8 @@ async fn assert_committed_check_replays(waive: bool, legacy: bool, status: &str)
             StatusCode::OK,
         )
         .await
+    } else {
+        seed_legacy_receipt(&harness, &project, waive, &request, &policy_fields).await
     };
     let replay: Value = common::json_request(
         &harness.app,
@@ -276,7 +317,7 @@ async fn assert_committed_check_replays(waive: bool, legacy: bool, status: &str)
     .await;
     assert_eq!(replay, first);
 
-    if !legacy {
+    if matches!(receipt, ReceiptShape::New) {
         let queries = if waive {
             vec![
                 "SELECT payload_json FROM domain_event WHERE event_type = 'milestone.check.waived'",
@@ -291,8 +332,8 @@ async fn assert_committed_check_replays(waive: bool, legacy: bool, status: &str)
                 .await
                 .unwrap();
             let stored: Value = serde_json::from_str(&stored).unwrap();
-            assert_eq!(stored["governing_policy_revision"], "charter-revision");
-            assert_eq!(stored["governing_policy_digest"], "content");
+            assert!(stored.get("governing_policy_revision").is_none());
+            assert!(stored.get("governing_policy_digest").is_none());
         }
     }
 
@@ -359,25 +400,83 @@ async fn assert_committed_check_replays(waive: bool, legacy: bool, status: &str)
 #[tokio::test]
 async fn committed_manual_result_replays_without_a_second_row_or_event() {
     for status in ["pass", "fail"] {
-        assert_committed_check_replays(false, false, status).await;
+        assert_committed_check_replays(false, ReceiptShape::New, status).await;
     }
 }
 
 #[tokio::test]
 async fn committed_waiver_replays_without_a_second_row_or_event() {
-    assert_committed_check_replays(true, false, "").await;
+    assert_committed_check_replays(true, ReceiptShape::New, "").await;
 }
 
 #[tokio::test]
 async fn legacy_manual_result_replays_without_policy_fields() {
     for status in ["pass", "fail"] {
-        assert_committed_check_replays(false, true, status).await;
+        assert_committed_check_replays(false, ReceiptShape::WithoutPolicy, status).await;
     }
 }
 
 #[tokio::test]
 async fn legacy_waiver_replays_without_policy_fields() {
-    assert_committed_check_replays(true, true, "").await;
+    assert_committed_check_replays(true, ReceiptShape::WithoutPolicy, "").await;
+}
+
+#[tokio::test]
+async fn v08_manual_result_replays_with_release_policy_fields() {
+    for status in ["pass", "fail"] {
+        assert_committed_check_replays(false, ReceiptShape::ReleasePolicy, status).await;
+    }
+}
+
+#[tokio::test]
+async fn v08_waiver_replays_with_original_release_policy_fields() {
+    assert_committed_check_replays(true, ReceiptShape::ReleasePolicy, "").await;
+}
+
+#[tokio::test]
+async fn replay_refuses_partial_or_empty_policy_fields() {
+    for waive in [false, true] {
+        for policy_fields in [
+            json!({"governing_policy_revision": "v076-policy-r1"}),
+            json!({"governing_policy_digest": "v076-policy-digest"}),
+            json!({"governing_policy_revision": "", "governing_policy_digest": "v076-policy-digest"}),
+            json!({"governing_policy_revision": "v076-policy-r1", "governing_policy_digest": ""}),
+            json!({"governing_policy_revision": "  ", "governing_policy_digest": "v076-policy-digest"}),
+            json!({"governing_policy_revision": "v076-policy-r1", "governing_policy_digest": "  "}),
+        ] {
+            let (_root, harness, project) = fixture().await;
+            seed_milestone(&harness, &project, true).await;
+            let mut request = check_request(waive);
+            request["governing_revision_ids"] = json!(["charter-revision", "baseline-revision"]);
+            seed_legacy_receipt(&harness, &project, waive, &request, &policy_fields).await;
+            let suffix = if waive { "waive" } else { "result" };
+            let error = common::json_request(
+                &harness.app,
+                Method::POST,
+                &format!("/api/v1/projects/{project}/milestones/milestone/checks/check/{suffix}"),
+                request,
+                if waive {
+                    StatusCode::CONFLICT
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                },
+            )
+            .await;
+            if waive {
+                assert_command_error(
+                    error,
+                    "idempotency_conflict",
+                    "the waiver idempotency key was already used for a different waiver",
+                );
+            } else {
+                assert_command_error(
+                    error,
+                    "internal_error",
+                    "persisted manual check authority manifest is incomplete",
+                );
+            }
+        }
+    }
 }
 
 #[tokio::test]

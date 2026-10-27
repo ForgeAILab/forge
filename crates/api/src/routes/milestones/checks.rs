@@ -275,13 +275,6 @@ pub async fn record_milestone_check(
             "the definition author cannot attest its own manual check",
         ));
     }
-    let governing_policy_digest = state
-        .db
-        .milestone_check_charter_digest_in_tx(&mut tx, &project_id, &governing_charter_revision_id)
-        .await
-        .map_err(ApiError::project_artifact_mutation)?
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| ApiError::internal("governing Charter content digest is missing"))?;
     let outcome = check_result_outcome(request.status);
     let result_id = new_uuid_v4();
     let created_at = now_rfc3339();
@@ -290,8 +283,6 @@ pub async fn record_milestone_check(
         "result": request.result.clone(),
         "governing_revision_ids": request.governing_revision_ids.clone(),
         "check_definition_revision_id": check_definition_revision_id.clone(),
-        "governing_policy_revision": governing_charter_revision_id.clone(),
-        "governing_policy_digest": governing_policy_digest,
     });
     state
         .db
@@ -566,20 +557,12 @@ async fn replay_milestone_check_waiver(
             .and_then(|value| serde_json::from_value::<Vec<String>>(value).ok())
             .as_ref()
             == Some(&request.governing_revision_ids)
-        && stored_governing_policy_matches(
-            &payload,
-            request.governing_revision_ids.first().map(String::as_str),
-        );
+        && stored_governing_policy_matches(&payload);
     if !same_request || !decision_matches {
         return Err(ApiError::conflict_with_code(
             "idempotency_conflict",
             "the waiver idempotency key was already used for a different waiver",
         ));
-    }
-    // Policy provenance is internal receipt metadata, not part of the response.
-    if let Some(payload) = payload.as_object_mut() {
-        payload.remove("governing_policy_revision");
-        payload.remove("governing_policy_digest");
     }
     Ok(Some(payload))
 }
@@ -710,13 +693,6 @@ pub async fn waive_milestone_check(
             "waiver governing revisions must match the current approved Charter",
         ));
     }
-    let governing_policy_digest = state
-        .db
-        .milestone_check_charter_digest_in_tx(&mut tx, &project_id, &waiver_charter_revision_id)
-        .await
-        .map_err(ApiError::project_artifact_mutation)?
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| ApiError::internal("governing Charter content digest is missing"))?;
     let waiver_id = new_uuid_v4();
     let created_at = now_rfc3339();
     let event = DomainEventRepo::append_event_in_tx(
@@ -750,8 +726,6 @@ pub async fn waive_milestone_check(
                 "principal_id": user.user_id.clone(),
                 "authorization": request.mutation.authorization.clone(),
                 "governing_revision_ids": request.governing_revision_ids.clone(),
-                "governing_policy_revision": waiver_charter_revision_id.clone(),
-                "governing_policy_digest": governing_policy_digest.clone(),
                 "created_at": created_at.clone(),
             })
             .to_string(),
@@ -790,8 +764,6 @@ pub async fn waive_milestone_check(
                     "input_digest": request.input_digest.clone(),
                     "expected_version": request.mutation.expected_version,
                     "governing_revision_ids": request.governing_revision_ids.clone(),
-                    "governing_policy_revision": waiver_charter_revision_id.clone(),
-                    "governing_policy_digest": governing_policy_digest,
                 })
                 .to_string(),
                 created_at: &created_at,
@@ -828,20 +800,17 @@ fn check_result_outcome(value: api_types::AcceptanceCheckResultStatus) -> &'stat
     }
 }
 
-fn stored_governing_policy_matches(
-    manifest: &serde_json::Value,
-    charter_revision_id: Option<&str>,
-) -> bool {
+fn stored_governing_policy_matches(manifest: &serde_json::Value) -> bool {
     match (
         manifest.get("governing_policy_revision"),
         manifest.get("governing_policy_digest"),
     ) {
-        // Earlier writes omitted both fields. Their committed receipt remains authoritative.
+        // Since v0.9, receipts omit the removed execution-baseline release policy.
         (None, None) => true,
         (Some(revision), Some(digest)) => {
             revision
                 .as_str()
-                .is_some_and(|value| !value.trim().is_empty() && Some(value) == charter_revision_id)
+                .is_some_and(|value| !value.trim().is_empty())
                 && digest
                     .as_str()
                     .is_some_and(|value| !value.trim().is_empty())
@@ -937,10 +906,7 @@ fn validation_result_from_read(
                 .map_err(ApiError::project_artifact_mutation)?
                 .as_str(),
         )
-        || !stored_governing_policy_matches(
-            &source_manifest,
-            persisted_charter_revision_id.as_deref(),
-        )
+        || !stored_governing_policy_matches(&source_manifest)
     {
         return Err(ApiError::internal(
             "persisted manual check authority manifest is incomplete",

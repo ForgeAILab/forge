@@ -79,23 +79,6 @@ impl SqliteDb {
             .transpose()
     }
 
-    pub async fn milestone_check_charter_digest_in_tx(
-        &self,
-        connection: &mut sqlx::SqliteConnection,
-        project_id: &str,
-        revision_id: &str,
-    ) -> Result<Option<String>> {
-        Ok(sqlx::query_scalar(
-            "SELECT r.content_digest FROM project_charter_revision r
-             JOIN project_charter c ON c.id = r.charter_id
-             WHERE r.id = ? AND c.project_id = ?",
-        )
-        .bind(revision_id)
-        .bind(project_id)
-        .fetch_optional(connection)
-        .await?)
-    }
-
     pub async fn record_manual_milestone_result_in_tx(
         &self,
         connection: &mut sqlx::SqliteConnection,
