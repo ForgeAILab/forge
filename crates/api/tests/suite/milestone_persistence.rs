@@ -701,7 +701,7 @@ async fn legacy_manual_event_for_another_result_is_ignored() {
     let mut request = check_request(false);
     request["mutation"]["authorization"]["principal"]["display_name"] = json!("Original reviewer");
     let first = seed_legacy_receipt(&harness, &project, false, &request, &json!({})).await;
-    sqlx::query("UPDATE domain_event SET payload_json=json_set(payload_json,'$.result_id','another-result','$.authorization.principal.id','another-user') WHERE id='legacy-event'")
+    sqlx::query("UPDATE domain_event SET entity_id='another-result',payload_json=json_set(payload_json,'$.result_id','another-result','$.authorization.principal.id','another-user') WHERE id='legacy-event'")
         .execute(harness.state.db.pool()).await.unwrap();
     let replay: Value = common::json_request(
         &harness.app,

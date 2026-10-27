@@ -133,7 +133,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   condition was already correct. It refreshes the digest quietly.
 - A second user who reuses another user's idempotency key for a manual
   milestone check result or waiver in the same Project now records their own
-  result instead of getting HTTP 400 `check_constraint` (results) or 409
+  result or waiver instead of getting HTTP 400 `check_constraint` (results) or 409
   `idempotency_conflict` (waivers).
 - Whether a Project capacity wait is "at capacity" or "waiting on owner" is
   now recorded as a typed field instead of being read from the message wording.

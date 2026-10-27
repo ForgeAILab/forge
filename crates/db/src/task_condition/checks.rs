@@ -31,7 +31,8 @@ fn condition_page_select(resuming: bool) -> String {
 pub struct ConditionCheckPass {
     pub checked: u64,
     pub repaired: u64,
-    /// Digest-only stamps tracked separately from steady-pass repairs.
+    /// Digest-only stamps. A steady pass excludes them from `repaired`; a
+    /// revision walk counts them in both.
     pub stamped: u64,
     /// Tasks whose stored condition is a newer build's encoding. They are
     /// read, counted and left byte for byte; nothing here repairs them.

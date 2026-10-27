@@ -153,10 +153,7 @@ async fn replay_milestone_check_result(
         )
         .await
         .map_err(ApiError::project_artifact_mutation)?
-        .filter(|event| {
-            serde_json::from_str::<serde_json::Value>(&event.payload_json)
-                .is_ok_and(|payload| payload["result_id"].as_str() == Some(result_id.as_str()))
-        })
+        .filter(|event| event.entity_id == result_id)
     };
     let details: Option<ManualResultReplayDetails> = event
         .map(|event| serde_json::from_str(&event.payload_json))
