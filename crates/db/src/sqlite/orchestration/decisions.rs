@@ -199,6 +199,8 @@ impl ProjectDecisionCommandSourceRow {
         Ok(self.row.try_get("charter_revision_id")?)
     }
     pub fn required_charter_revision_id(&self) -> crate::Result<String> {
+        // Waiver replay preserves the original String decode, including NULL
+        // handling and the String type in SQLx decoding errors.
         Ok(self.row.try_get("charter_revision_id")?)
     }
     pub fn source_refs_json(&self) -> crate::Result<String> {
@@ -1406,6 +1408,8 @@ pub(super) async fn list_effective_project_decisions(
 }
 
 mod reads;
+#[cfg(test)]
+mod tests;
 pub use reads::{ProjectDecisionCandidateRead, ProjectDecisionRead};
 
 pub struct InsertMilestoneWaiverDecisionInput<'a> {

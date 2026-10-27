@@ -1831,5 +1831,8 @@ pub(super) async fn append_project_milestone_check_result(
 
 mod commands;
 mod reads;
-pub use commands::{MaterializeMilestoneCheckInput, TransitionMilestoneLifecycleInput};
+pub use commands::{
+    MaterializeMilestoneCheckInput, MaterializeMilestoneCheckOutcome,
+    TransitionMilestoneLifecycleInput,
+};
 pub use reads::{MilestoneDefinitionTransitionRead, ProjectMilestoneIdRead};

@@ -59,6 +59,40 @@ fn assert_database_error(body: Value) {
     );
 }
 
+fn assert_command_error(body: Value, code: &str, message: &str) {
+    assert!(!body["request_id"].as_str().unwrap().is_empty());
+    assert_eq!(
+        body,
+        json!({
+            "code": code, "message": message,
+            "details": null, "request_id": body["request_id"],
+        })
+    );
+}
+
+async fn assert_manual_result_rolled_back(harness: &common::Harness) {
+    let pool = harness.state.db.pool();
+    let check: (i64, Option<String>) = sqlx::query_as(
+        "SELECT version, current_result_id FROM project_milestone_check WHERE id = 'check'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(check, (1, None));
+    let results: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM project_milestone_check_result")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(results, 0);
+    let events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM domain_event WHERE event_type = 'milestone.check.recorded'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(events, 0);
+}
+
 async fn seed_milestone(harness: &common::Harness, project_id: &str, checks: bool) {
     let pool = harness.state.db.pool();
     let now = db::now_rfc3339();
@@ -379,6 +413,148 @@ async fn definition_validation_still_precedes_later_column_decoding() {
     assert_database_error(common::json_request(&harness.app, Method::POST, &url,
         json!({"mutation": mutation("project.milestone.revision.transition", "valid-transition", 1), "lifecycle": "proposed"}),
         StatusCode::INTERNAL_SERVER_ERROR).await);
+}
+
+#[tokio::test]
+async fn definition_rejects_a_check_owned_by_another_project() {
+    let (_root, harness, project) = fixture().await;
+    seed_milestone(&harness, &project, false).await;
+    let other: ProjectResponse = common::json_request(
+        &harness.app,
+        Method::POST,
+        "/api/v1/projects",
+        json!({"name": "Other Project"}),
+        StatusCode::OK,
+    )
+    .await;
+    let pool = harness.state.db.pool();
+    let now = db::now_rfc3339();
+    sqlx::query("INSERT INTO project_milestone (id, project_id, milestone_sequence, milestone_key, lifecycle, created_at, updated_at) VALUES ('other-milestone', ?, 1, 'M001', 'planned', ?, ?)")
+        .bind(&other.id).bind(&now).bind(&now).execute(pool).await.unwrap();
+    sqlx::query("INSERT INTO project_milestone_revision (id, milestone_id, revision, lifecycle, outcome, schema_version, render_version, rendered_view, content_digest, rendered_digest, author_type, author_id, created_at) VALUES ('other-revision', 'other-milestone', 1, 'proposed', 'Other outcome', 'test', 'test', 'Other outcome', 'content', 'render', 'user', 'definition-author', ?)")
+        .bind(&now).execute(pool).await.unwrap();
+    sqlx::query("INSERT INTO project_milestone_check (id, project_id, milestone_id, definition_revision_id, check_key, description, required, source_kind, expected_result, evidence_required, created_at, updated_at) VALUES ('check', ?, 'other-milestone', 'other-revision', 'check', 'Other check', 0, 'manual', 'passed', 0, ?, ?)")
+        .bind(&other.id).bind(&now).bind(&now).execute(pool).await.unwrap();
+    let error = common::json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{project}/milestones/milestone/revisions/revision/transition"),
+        json!({"mutation": mutation("project.milestone.revision.transition", "cross-project", 1), "lifecycle": "proposed"}),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    assert_command_error(
+        error,
+        "bad_request",
+        "milestone acceptance check belongs to another Project or milestone",
+    );
+    let milestone: (i64, Option<String>) = sqlx::query_as(
+        "SELECT version, current_definition_revision_id FROM project_milestone WHERE id = 'milestone'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(milestone, (1, None));
+    let lifecycle: String = sqlx::query_scalar(
+        "SELECT lifecycle FROM project_milestone_revision WHERE id = 'revision'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(lifecycle, "draft");
+    let check: (String, String, String, i64) = sqlx::query_as(
+        "SELECT project_id, milestone_id, definition_revision_id, version FROM project_milestone_check WHERE id = 'check'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        check,
+        (
+            other.id,
+            "other-milestone".into(),
+            "other-revision".into(),
+            1
+        )
+    );
+    let events: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM domain_event WHERE event_type LIKE 'milestone.%'")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(events, 0);
+}
+
+#[tokio::test]
+async fn manual_result_unique_conflict_preserves_in_progress_response() {
+    let (_root, harness, project) = fixture().await;
+    seed_milestone(&harness, &project, true).await;
+    // Insert a duplicate only after the replay lookup, exercising a real UNIQUE failure.
+    sqlx::query(
+        "CREATE TRIGGER duplicate_result AFTER INSERT ON project_milestone_check_result
+         BEGIN
+             INSERT INTO project_milestone_check_result (
+                 id, project_id, milestone_id, check_id, definition_revision_id,
+                 outcome, source_kind, source_manifest_json, input_digest,
+                 governing_charter_revision_id, principal_type, principal_id,
+                 authorization_basis, authorization_action, authorization_occurred_at,
+                 expected_version, explicit_event, idempotency_key, created_at
+             ) SELECT id || '-duplicate', project_id, milestone_id, check_id,
+                 definition_revision_id, outcome, source_kind, source_manifest_json,
+                 input_digest, governing_charter_revision_id, principal_type,
+                 principal_id, authorization_basis, authorization_action,
+                 authorization_occurred_at, expected_version, explicit_event,
+                 idempotency_key, created_at
+             FROM project_milestone_check_result WHERE id = NEW.id;
+         END",
+    )
+    .execute(harness.state.db.pool())
+    .await
+    .unwrap();
+    let error = common::json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{project}/milestones/milestone/checks/check/result"),
+        check_request(false),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    assert_command_error(
+        error,
+        "idempotency_in_progress",
+        "another manual check result is being committed; retry with the same key",
+    );
+    assert_manual_result_rolled_back(&harness).await;
+}
+
+#[tokio::test]
+async fn manual_result_final_version_conflict_preserves_response_and_rolls_back() {
+    let (_root, harness, project) = fixture().await;
+    seed_milestone(&harness, &project, true).await;
+    // Change the version between the target read and the final CAS within the transaction.
+    sqlx::query(
+        "CREATE TRIGGER change_check_version AFTER INSERT ON project_milestone_check_result
+         BEGIN
+             UPDATE project_milestone_check SET version = version + 1 WHERE id = NEW.check_id;
+         END",
+    )
+    .execute(harness.state.db.pool())
+    .await
+    .unwrap();
+    let error = common::json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{project}/milestones/milestone/checks/check/result"),
+        check_request(false),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    assert_command_error(
+        error,
+        "version_conflict",
+        "the acceptance check changed before its result was committed",
+    );
+    assert_manual_result_rolled_back(&harness).await;
 }
 
 #[tokio::test]

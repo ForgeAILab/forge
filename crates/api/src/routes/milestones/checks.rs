@@ -309,6 +309,7 @@ pub async fn record_milestone_check(
                 idempotency_key: storage_idempotency_key.clone(),
                 created_at: created_at.clone(),
             },
+            check_version,
         )
         .await
         .map_err(|error| match error {

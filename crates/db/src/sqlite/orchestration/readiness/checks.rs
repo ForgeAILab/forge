@@ -83,6 +83,7 @@ impl SqliteDb {
         &self,
         connection: &mut sqlx::SqliteConnection,
         result: &CreateProjectMilestoneCheckResult,
+        check_version: i64,
     ) -> Result<()> {
         let inserted = sqlx::query(
             "INSERT INTO project_milestone_check_result (
@@ -126,7 +127,7 @@ impl SqliteDb {
         .bind(&result.id)
         .bind(&result.created_at)
         .bind(&result.check_id)
-        .bind(result.expected_version)
+        .bind(check_version)
         .execute(connection)
         .await?;
         if updated.rows_affected() != 1 {

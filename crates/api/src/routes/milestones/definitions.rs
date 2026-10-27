@@ -436,28 +436,29 @@ async fn materialize_check_definitions_in_tx(
             ));
         }
         let source_kind = acceptance_source_kind_name(check.source_kind);
-        db.materialize_milestone_definition_check_in_tx(
-            tx,
-            db::MaterializeMilestoneCheckInput {
-                project_id,
-                milestone_id,
-                definition_revision_id,
-                check_id: &check.id,
-                description: &check.description,
-                required: check.required,
-                source_kind,
-                expected_result: &check.expected_result,
-                evidence_required,
-                updated_at,
-            },
-        )
-        .await
-        .map_err(|error| match error {
-            db::DbError::VersionConflict => ApiError::bad_request(
+        let outcome = db
+            .materialize_milestone_definition_check_in_tx(
+                tx,
+                db::MaterializeMilestoneCheckInput {
+                    project_id,
+                    milestone_id,
+                    definition_revision_id,
+                    check_id: &check.id,
+                    description: &check.description,
+                    required: check.required,
+                    source_kind,
+                    expected_result: &check.expected_result,
+                    evidence_required,
+                    updated_at,
+                },
+            )
+            .await
+            .map_err(ApiError::project_artifact_mutation)?;
+        if outcome == db::MaterializeMilestoneCheckOutcome::ScopeMismatch {
+            return Err(ApiError::bad_request(
                 "milestone acceptance check belongs to another Project or milestone",
-            ),
-            error => ApiError::project_artifact_mutation(error),
-        })?;
+            ));
+        }
     }
     Ok(())
 }

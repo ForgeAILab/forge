@@ -1286,7 +1286,7 @@ pub use orchestration::decisions::{ProjectDecisionCandidateRead, ProjectDecision
 
 pub use orchestration::decisions::InsertMilestoneWaiverDecisionInput;
 pub use orchestration::milestones::{
-    MaterializeMilestoneCheckInput, MilestoneDefinitionTransitionRead, ProjectMilestoneIdRead,
-    TransitionMilestoneLifecycleInput,
+    MaterializeMilestoneCheckInput, MaterializeMilestoneCheckOutcome,
+    MilestoneDefinitionTransitionRead, ProjectMilestoneIdRead, TransitionMilestoneLifecycleInput,
 };
 pub use orchestration::readiness::{MilestoneCheckTargetRead, MilestoneManualResultRead};

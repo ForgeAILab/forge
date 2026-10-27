@@ -267,11 +267,12 @@ async fn definition_materialization_keeps_scope_noop_supersession_and_cas() {
         .unwrap();
     let mut cross_scope = check_input("next");
     cross_scope.project_id = "other-project";
-    assert!(matches!(
+    assert_eq!(
         db.materialize_milestone_definition_check_in_tx(&mut tx, cross_scope)
-            .await,
-        Err(DbError::VersionConflict)
-    ));
+            .await
+            .unwrap(),
+        db::MaterializeMilestoneCheckOutcome::ScopeMismatch
+    );
     assert_eq!(
         db.advance_milestone_definition_in_tx(
             &mut tx,
@@ -442,7 +443,7 @@ async fn manual_result_targets_cas_replay_and_unique_errors_keep_their_contract(
     let mut stale = manual_result();
     stale.expected_version = 2;
     assert!(matches!(
-        db.record_manual_milestone_result_in_tx(&mut tx, &stale)
+        db.record_manual_milestone_result_in_tx(&mut tx, &stale, 2)
             .await,
         Err(DbError::VersionConflict)
     ));
@@ -453,7 +454,7 @@ async fn manual_result_targets_cas_replay_and_unique_errors_keep_their_contract(
         .unwrap()
         .is_none());
     let mut tx = db::begin_immediate(db.pool()).await.unwrap();
-    db.record_manual_milestone_result_in_tx(&mut tx, &manual_result())
+    db.record_manual_milestone_result_in_tx(&mut tx, &manual_result(), 1)
         .await
         .unwrap();
     tx.commit().await.unwrap();
@@ -491,7 +492,7 @@ async fn manual_result_targets_cas_replay_and_unique_errors_keep_their_contract(
     duplicate.expected_version = 2;
     let mut tx = db::begin_immediate(db.pool()).await.unwrap();
     assert!(matches!(
-        db.record_manual_milestone_result_in_tx(&mut tx, &duplicate)
+        db.record_manual_milestone_result_in_tx(&mut tx, &duplicate, 2)
             .await,
         Err(DbError::IdempotencyConflict)
     ));
@@ -503,6 +504,35 @@ async fn manual_result_targets_cas_replay_and_unique_errors_keep_their_contract(
     .await
     .unwrap();
     assert_eq!(check, (2, "result".into()));
+}
+
+#[tokio::test]
+async fn manual_result_cas_uses_the_explicit_check_version() {
+    let db = database().await;
+    check_fixture(&db).await;
+    let mut result = manual_result();
+    result.expected_version = 7;
+    let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+    db.record_manual_milestone_result_in_tx(&mut tx, &result, 1)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let check: (i64, String) = sqlx::query_as(
+        "SELECT version, current_result_id FROM project_milestone_check WHERE id = 'check'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(check, (2, "result".into()));
+    assert_eq!(
+        db.milestone_manual_result_replay("manual-result")
+            .await
+            .unwrap()
+            .unwrap()
+            .expected_version()
+            .unwrap(),
+        7
+    );
 }
 
 #[tokio::test]

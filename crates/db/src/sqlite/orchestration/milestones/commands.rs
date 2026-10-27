@@ -1,5 +1,11 @@
 use super::*;
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum MaterializeMilestoneCheckOutcome {
+    Materialized,
+    ScopeMismatch,
+}
+
 pub struct MaterializeMilestoneCheckInput<'a> {
     pub project_id: &'a str,
     pub milestone_id: &'a str,
@@ -163,7 +169,7 @@ impl SqliteDb {
         &self,
         connection: &mut sqlx::SqliteConnection,
         input: MaterializeMilestoneCheckInput<'_>,
-    ) -> Result<()> {
+    ) -> Result<MaterializeMilestoneCheckOutcome> {
         let existing: Option<(String, String, String)> = sqlx::query_as(
             "SELECT project_id, milestone_id, definition_revision_id
              FROM project_milestone_check WHERE id = ?",
@@ -173,10 +179,10 @@ impl SqliteDb {
         .await?;
         if let Some((existing_project, existing_milestone, existing_revision)) = existing {
             if existing_project != input.project_id || existing_milestone != input.milestone_id {
-                return Err(DbError::VersionConflict);
+                return Ok(MaterializeMilestoneCheckOutcome::ScopeMismatch);
             }
             if existing_revision == input.definition_revision_id {
-                return Ok(());
+                return Ok(MaterializeMilestoneCheckOutcome::Materialized);
             }
             sqlx::query(
                 "UPDATE project_milestone_check
@@ -221,6 +227,6 @@ impl SqliteDb {
             .execute(connection)
             .await?;
         }
-        Ok(())
+        Ok(MaterializeMilestoneCheckOutcome::Materialized)
     }
 }
