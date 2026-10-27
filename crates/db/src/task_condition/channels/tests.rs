@@ -3,6 +3,7 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 
 const MAIN: &str = include_str!("fixtures/main-13bc2ae1.jsonl");
+const RESTORED_MAIN: &str = include_str!("fixtures/main-cc39cac5.jsonl");
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -10,6 +11,123 @@ struct Sample {
     name: String,
     channel: String,
     raw: String,
+}
+
+#[test]
+fn restored_shapes_keep_main_bytes_and_require_string_blocking_reasons() {
+    let mut names = BTreeSet::new();
+    for line in RESTORED_MAIN.lines() {
+        let sample: Sample = serde_json::from_str(line).unwrap();
+        assert!(names.insert(sample.name.clone()));
+        assert_eq!(sample.channel, "annotation");
+        let annotation: ErrorAnnotation = serde_json::from_str(&sample.raw).unwrap();
+        let reason = match (&*sample.name, &annotation.shape) {
+            ("restore-dispatch-state", AnnotationShape::DetectedState(value)) => {
+                &value.blocking_reason
+            }
+            ("restore-placement", AnnotationShape::PlacementRefusal(value)) => {
+                &value.blocking_reason
+            }
+            ("restore-plan-wait", AnnotationShape::PlanWait(value)) => &value.blocking_reason,
+            ("restore-dispatch-upgrade", AnnotationShape::UpgradeDispatch(value)) => {
+                &value.blocking_reason
+            }
+            _ => panic!("{} selected the wrong shape", sample.name),
+        };
+        assert!(reason.is_some());
+        assert_eq!(serde_json::to_string(&annotation).unwrap(), sample.raw);
+        let fields: Value = serde_json::from_str(&sample.raw).unwrap();
+        assert_eq!(fields["message"].as_str(), reason.as_deref());
+        for invalid in [Value::Null, true.into(), 1.into(), serde_json::json!([])] {
+            let mut invalid_fields = fields.clone();
+            invalid_fields["blocking_reason"] = invalid;
+            assert!(
+                serde_json::from_value::<ErrorAnnotation>(invalid_fields).is_err(),
+                "{} accepted a non-string blocking_reason",
+                sample.name
+            );
+        }
+        let mut extended = fields.clone();
+        extended["future_field"] = true.into();
+        assert!(serde_json::from_value::<ErrorAnnotation>(extended).is_err());
+        let mut unknown_kind = fields;
+        unknown_kind["type"] = "future_kind".into();
+        assert!(serde_json::from_value::<ErrorAnnotation>(unknown_kind).is_err());
+    }
+    assert_eq!(names.len(), 4);
+}
+
+#[test]
+fn every_corpus_annotation_has_exactly_one_field_set() {
+    // This guards the observed corpus field sets, not every possible input.
+    for corpus in [MAIN, RESTORED_MAIN] {
+        let mut checked = 0;
+        for line in corpus.lines() {
+            let sample: Sample = serde_json::from_str(line).unwrap();
+            if sample.channel != "annotation" {
+                continue;
+            }
+            let annotation: ErrorAnnotation = serde_json::from_str(&sample.raw).unwrap();
+            let fields = serde_json::to_value(&annotation.shape).unwrap();
+            macro_rules! accepts {
+                ($($shape:ty),+ $(,)?) => {
+                    [$(serde_json::from_value::<$shape>(fields.clone()).is_ok()),+]
+                };
+            }
+            let accepted = accepts![
+                BlockingAnnotation,
+                HoldAnnotation,
+                TimedBlockAnnotation,
+                RecoveryExecutionAnnotation,
+                RemoteCancelAnnotation,
+                MessageAnnotation,
+                ReasonAnnotation,
+                ReviewCandidateAnnotation,
+                ReviewParkAnnotation,
+                DetectedAnnotation,
+                DetectedStateAnnotation,
+                BudgetAnnotation,
+                StepFailureAnnotation,
+                PlacementRefusalAnnotation,
+                PlanWaitAnnotation,
+                UpgradeDispatchAnnotation,
+            ];
+            assert_eq!(
+                accepted.into_iter().filter(|accepted| *accepted).count(),
+                1,
+                "{} has an ambiguous field set",
+                sample.name
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "each corpus must contain annotations");
+    }
+}
+
+#[test]
+fn placement_refusal_marker_shares_the_restore_annotation_shape() {
+    let sample = MAIN
+        .lines()
+        .map(|line| serde_json::from_str::<Sample>(line).unwrap())
+        .find(|sample| sample.channel == "placement_refusal")
+        .unwrap();
+    let mut marker: Value = serde_json::from_str(&sample.raw).unwrap();
+    assert!(!marker["annotation"]
+        .as_object()
+        .unwrap()
+        .contains_key("blocking_reason"));
+    marker["annotation"]["blocking_reason"] = "restored reason".into();
+    let ConditionMetadataValue::PlacementRefusal(decoded) =
+        ConditionMetadataValue::decode("placement_refusal", &marker.to_string()).unwrap()
+    else {
+        panic!("placement_refusal must select its own metadata codec");
+    };
+    assert_eq!(
+        decoded.annotation.blocking_reason.as_deref(),
+        Some("restored reason")
+    );
+    marker["annotation"]["blocking_reason"] = Value::Null;
+    assert!(ConditionMetadataValue::decode("placement_refusal", &marker.to_string()).is_err());
 }
 
 #[test]
