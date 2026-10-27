@@ -67,6 +67,11 @@ types.
 | `task_service/execution/ledger.rs` | Pricing admission, frozen selections, and usage-event construction stay in the root; settlement preparation and terminal payloads live in `ledger/settlement.rs`, with tests in `ledger/tests.rs` |
 | `integration_worker/driver.rs` | Head sessions, scheduling, retries, and transfer coordination stay in the root; validation, rebase, check, fast-forward, and reconciliation stages live in `driver/states.rs` |
 | `integration_owner.rs` | Server owner admission, Git effects, object transfer, and receipt validation stay in the root; tests live in `integration_owner/tests.rs` |
+| `operator_status.rs` | Status computation stays in the root; payload fixtures live in `operator_status/tests.rs` and condition-check tests in `operator_status/condition_check_tests.rs`, alongside the existing log snapshot child |
+| `placement/selection.rs` | Selection types, filters, and context loading stay in the root; selection, readiness, capacity, and loader tests live in `placement/selection/tests.rs` |
+| `task_service/execution/runner.rs` | Execution launch, running, heartbeat, and settlement stay in the root; provider selection, owner launch parameters, turn limits, and log paths live in `runner/provider.rs`, with tests in `runner/tests.rs` |
+| `project_provisioning.rs` | Provisioning operations, checkpoints, repository registration, and role assignment stay in the root; Charter scaffold execution and exports live in `project_provisioning/scaffold.rs`, with tests in `project_provisioning/tests.rs` |
+| `task_service/governance.rs` | Task governance, capability admission, and workspace leases stay in the root; governance and lease tests live in `governance/tests.rs` |
 
 Unit tests remain below the same top-level module prefixes, including
 `task_service::`, so the filters in `scripts/ci_rust_shards.py` retain their shard
@@ -94,12 +99,13 @@ continue through the roots, and inherent methods remain on their original types.
 | Root | Implementation and test children |
 |---|---|
 | `forge-solo/src/bootstrap.rs` | Contract types, orchestration, and shared validation stay in the root; `bootstrap/agents.rs` owns registration and candidate selection; `bootstrap/project.rs` owns owner, repository, chat, and binding reconciliation; tests live in `bootstrap/tests.rs` |
+| `forge-solo/src/session.rs` | Contract types, validation, and snapshot projection stay in the root; `session/service.rs` owns the re-exported `SoloSessionService` and its reads and commands; tests live in `session/tests.rs` |
 | `forge-solo/src/app.rs` | Presentation and command types stay in the root; `app/reducer.rs` owns state construction, reduction, and navigation; tests live in `app/tests.rs` |
 | `forge-solo/src/ui_bridge.rs` | Controller reduction and input translation stay in the root; `ui_bridge/projection.rs` maps backend snapshots to app state, with public helpers re-exported by the root; tests live in `ui_bridge/tests.rs` |
 | `forge-client/src/daemon_persistence.rs` | Journal types and persistence stay in the root; tests live in `daemon_persistence/tests.rs` |
 | `forge-client/src/daemon_workspace.rs` | Dispatch, registry state, shared validation, and process helpers stay in the root; `daemon_workspace/locations.rs` owns repository verification and provisioning; `daemon_workspace/execution.rs` owns preparation, commands, reads, and diffs; `daemon_workspace/mutations.rs` owns merge, reset, and cleanup; existing children and test modules retain their paths |
 
-Tests retain the `bootstrap::tests::`, `app::tests::`, `ui_bridge::tests::`,
+Tests retain the `bootstrap::tests::`, `session::tests::`, `app::tests::`, `ui_bridge::tests::`,
 `daemon_persistence::tests::`, and `daemon_workspace::tests::` prefixes.
 
 The same layout applies to these agent, API route, and database modules:
@@ -111,6 +117,7 @@ The same layout applies to these agent, API route, and database modules:
 | `db/src/sqlite/orchestration/charters.rs` | Charter reads, revisions, and approval records stay in the root; atomic approval application lives in `charters/apply_approval.rs`, re-exported at its original scope |
 | `api/src/routes/project_overview.rs` | The Overview handler, the next-action input type, and the projection row-decoding and error helpers stay in the root; canonical record loading lives in `project_overview/projections.rs`, next-action selection in `project_overview/next_action.rs`, and the existing test modules in `project_overview/{classify_status_tests,next_action_parity_tests}.rs` |
 | `api/src/routes/milestones.rs` | Milestone lifecycle, readiness, release, and shared authorization helpers stay in the root; definition revision routes live in `milestones/definitions.rs`, manual check routes in `milestones/checks.rs`, and authorization timestamp tests in `milestones/tests.rs`; moved handlers are re-exported through the root |
+| `db/src/budget.rs` | Policy types, limits, and projection stay in the root; `budget/ledger.rs` owns transactional charges and receipts, `budget/review.rs` owns review windows and recovery, and `budget/repair_no_change.rs` owns the unchanged-HEAD guard; operations are re-exported through the root and existing test prefixes are retained |
 | `db/src/integration_queue/fencing.rs` | Attempt ownership and effect receipt production code stays in the root; effect, concurrent claim, and takeover tests live in `fencing/{tests,concurrency_tests,takeover_tests}.rs` |
 
 These API and fencing test modules retain their original module prefixes, and
@@ -328,6 +335,21 @@ media attachment mutations have dedicated implementation children; the repositor
 trait methods delegate to those helpers without changing their contracts.
 `sqlite.rs` remains the shared database root, with execution creation and admission
 fences in `sqlite/execution_admission.rs`.
+
+Leaf API persistence reads and CLI runtime policy CAS use inherent `SqliteDb`
+methods in the owning aggregate modules. Project media keyset reads and attachment
+decoding live in `sqlite/shared_media/reads.rs`; routes retain authorization,
+cursor encoding and response projection. Execution timing is fetched before
+ledger usage and decoded afterward; media rows are decoded one at a time before
+checksum reconciliation or response conversion, preserving read and error order.
+SQL/decode failures from these CLI runtime and Project media methods retain the existing
+`500 internal_error` response with `Project artifact mutation failed`; CLI runtime
+policy version conflicts retain their dedicated `cli_runtime.version_conflict`.
+Project deletion ownership probes live in `sqlite/workspace_root/cleanup.rs`:
+typed owner selectors replace route SQL. The Project route owns `BEGIN IMMEDIATE`,
+the quarantine rename, commit/restore, and post-commit recursive removal; each
+ownership recheck and rename still share the same write lock and contextual
+errors. `TaskMediaRepo` and `SharedMediaRepo` retain their existing contracts.
 
 The MCP `tools/handlers.rs` root retains Task and Project handlers and re-exports
 Agent Chat and memory handlers from `handlers/`; its unit tests live in
@@ -5906,6 +5928,13 @@ fields reject unknown tags and members; missing and explicit null remain distinc
 Interruption kind and time may be absent, and kindless workflow-loop interruptions
 retain their required nullable reason. Metadata codecs select by key without adding
 a wire tag; scalar values stay scalars and `planning_state_entry_token` retains null.
+Queued-action restores try the strict shape first and fall back to the existing
+`Value` edit for anything it rejects; stored-row reads stay lenient.
+DetectedState, PlacementRefusal, PlanWait and UpgradeDispatch also carry an
+optional String `blocking_reason` for queued-action restore; fresh writers omit
+it, and the queue preserves it when adding a step-failure overlay.
+The `placement_refusal` metadata marker shares PlacementRefusal's annotation
+shape, so its decoder also accepts this field; production marker writers omit it.
 
 Storage preserves each writer's bytes. Value-built JSON sorts keys; blocking
 annotation structs retain declaration order, and message literals can put `type`

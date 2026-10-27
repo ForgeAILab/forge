@@ -1,6 +1,9 @@
 //! SQL for the server workspace root and its explicit path rewrite.
 use super::*;
 
+mod cleanup;
+pub use cleanup::ProjectCleanupOwner;
+
 /// SQL: `column` is the path bound as `?1` or a path inside it.
 pub(super) fn under_sql(column: &str) -> String {
     format!("({column} = ?1 OR substr({column}, 1, length(?1) + 1) = ?1 || '/')")

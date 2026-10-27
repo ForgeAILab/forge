@@ -623,7 +623,7 @@ async fn cleanup_project_owned_paths(
         // reservation.
         match remove_confined_direct_child_if_unowned(
             state,
-            Some("SELECT 1 FROM task WHERE id = ? LIMIT 1"),
+            db::ProjectCleanupOwner::TaskId,
             task_id,
             &workspace_root,
             &workspace_root.join(task_id),
@@ -659,7 +659,7 @@ async fn cleanup_project_owned_paths(
         // wins.
         match remove_confined_direct_child_if_unowned(
             state,
-            None,
+            db::ProjectCleanupOwner::WorkspacePath,
             path,
             &workspace_root,
             FsPath::new(path),
@@ -696,7 +696,7 @@ async fn cleanup_project_owned_paths(
             // and quarantine rename are serialized under BEGIN IMMEDIATE.
             match remove_confined_direct_child_if_unowned(
                 state,
-                Some("SELECT 1 FROM repo WHERE local_path = ? LIMIT 1"),
+                db::ProjectCleanupOwner::RepoLocalPath,
                 local_path,
                 &managed_root,
                 FsPath::new(local_path),
@@ -735,7 +735,7 @@ async fn cleanup_project_owned_paths(
         // ownership check and quarantine rename share the DB write lock.
         match remove_confined_direct_child_if_unowned(
             state,
-            Some("SELECT 1 FROM repo WHERE id = ? LIMIT 1"),
+            db::ProjectCleanupOwner::RepoId,
             &repository.id,
             &cache_root,
             &cache_root.join(&repository.id),
@@ -770,7 +770,7 @@ async fn cleanup_project_owned_paths(
     // the check and quarantine rename share the DB write lock.
     match remove_confined_direct_child_if_unowned(
         state,
-        Some("SELECT 1 FROM project WHERE id = ? LIMIT 1"),
+        db::ProjectCleanupOwner::ProjectId,
         project_id,
         &project_root,
         &project_root.join(project_id),
@@ -807,7 +807,7 @@ async fn cleanup_project_owned_paths(
 /// deleting another owner's path.
 async fn remove_confined_direct_child_if_unowned(
     state: &AppState,
-    ownership_query: Option<&str>,
+    owner: db::ProjectCleanupOwner,
     ownership_value: &str,
     root: &std::path::Path,
     candidate: &std::path::Path,
@@ -816,23 +816,13 @@ async fn remove_confined_direct_child_if_unowned(
     let mut transaction = db::begin_immediate(state.db.pool())
         .await
         .map_err(|error| ApiError::internal(format!("lock Project cleanup ownership: {error}")))?;
-    let live = match ownership_query {
-        Some(query) => sqlx::query_scalar::<_, i64>(query)
-            .bind(ownership_value)
-            .fetch_optional(&mut *transaction)
-            .await
-            .map(|row| row.is_some())
-            .map_err(db::DbError::from),
-        None => {
-            db::WorkspaceRepo::embedded_path_is_owned_in_tx(
-                &*state.db,
-                &mut transaction,
-                ownership_value,
-            )
-            .await
-        }
-    }
-    .map_err(|error| ApiError::internal(format!("recheck Project cleanup ownership: {error}")))?;
+    let live = state
+        .db
+        .project_cleanup_owner_is_live_in_tx(&mut transaction, owner, ownership_value)
+        .await
+        .map_err(|error| {
+            ApiError::internal(format!("recheck Project cleanup ownership: {error}"))
+        })?;
     if live {
         transaction.commit().await.map_err(|error| {
             ApiError::internal(format!("release Project cleanup lock: {error}"))
@@ -1263,13 +1253,7 @@ async fn validate_workflow_update_safety(
         .filter(|state| state.kind == StateKind::Terminal)
         .map(|state| state.name.as_str())
         .collect();
-    let statuses = sqlx::query_as::<_, (String, i64)>(
-        "SELECT status, COUNT(*) FROM task WHERE project_id = ? AND deleted_at IS NULL GROUP BY status",
-    )
-    .bind(project_id)
-    .fetch_all(db.pool())
-    .await
-    .map_err(db::DbError::from)?;
+    let statuses = db.project_live_task_status_counts(project_id).await?;
 
     for (status, count) in statuses {
         if !new_non_terminal_states.contains(status.as_str())
@@ -1522,6 +1506,10 @@ fn review_summary_analytics(summary: ProjectReviewSummary) -> ReviewSummaryAnaly
         pass_rate: summary.pass_rate,
     }
 }
+
+#[cfg(test)]
+#[path = "projects/cleanup_tests.rs"]
+mod cleanup_tests;
 
 #[cfg(test)]
 mod tests {

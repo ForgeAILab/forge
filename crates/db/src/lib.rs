@@ -433,3 +433,8 @@ pub use sqlite::{
     SessionPersistenceFlags, SESSION_JOURNAL_ORDINARY_STORAGE_ID,
     SESSION_JOURNAL_PROTECTED_STORAGE_ID,
 };
+
+pub use sqlite::{
+    ProjectCleanupOwner, ProjectEvidenceAttachmentRead, ProjectMediaAssetIdRead,
+    TaskExecutionTimingRead,
+};

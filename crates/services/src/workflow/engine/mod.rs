@@ -57,6 +57,7 @@ fn dispatch_failed_annotation(
     let shape = match daemon_ids {
         Some(daemon_ids) => {
             channels::AnnotationShape::UpgradeDispatch(channels::UpgradeDispatchAnnotation {
+                blocking_reason: None,
                 code: channels::UpgradeCode::DaemonUpgradeRequired,
                 daemon_ids: daemon_ids.to_vec(),
                 detected_at,
@@ -66,6 +67,7 @@ fn dispatch_failed_annotation(
             })
         }
         None => channels::AnnotationShape::DetectedState(channels::DetectedStateAnnotation {
+            blocking_reason: None,
             kind: api_types::FailureKind::DispatchFailed,
             message: message.into(),
             state: state.into(),

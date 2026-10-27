@@ -110,3 +110,5 @@ mod session_journal_probe;
 
 #[path = "suite/task_condition_digest_upgrade.rs"]
 mod task_condition_digest_upgrade;
+#[path = "suite/route_persistence.rs"]
+mod route_persistence;

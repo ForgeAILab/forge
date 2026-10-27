@@ -1,3 +1,5 @@
+//! Placement selection, readiness, capacity, and context loading tests.
+
 #[test]
 fn partial_machine_facts_do_not_skip_full_checks_for_another_role() {
     let mut context = context();

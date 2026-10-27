@@ -6,6 +6,8 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 mod attachment_mutation;
+mod reads;
+pub use reads::{ProjectEvidenceAttachmentRead, ProjectMediaAssetIdRead};
 mod repository;
 
 fn map_media_asset(row: &SqliteRow) -> Result<MediaAsset> {

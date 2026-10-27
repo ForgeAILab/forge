@@ -3,6 +3,33 @@
 use super::*;
 
 impl SqliteDb {
+    pub async fn memory_visible_project_ids(&self, user_id: &str) -> Result<Vec<String>> {
+        let rows = sqlx::query(
+            "SELECT project.id FROM project WHERE project.owner_id IS NULL OR project.owner_id = ? OR EXISTS (SELECT 1 FROM project_member WHERE project_member.project_id = project.id AND project_member.user_id = ?)",
+        )
+        .bind(user_id)
+        .bind(user_id)
+        .fetch_all(self.pool())
+        .await?;
+        rows.into_iter()
+            .map(|row| row.try_get("id").map_err(DbError::from))
+            .collect()
+    }
+
+    pub async fn project_live_task_status_counts(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<(String, i64)>> {
+        Ok(sqlx::query_as::<_, (String, i64)>(
+            "SELECT status, COUNT(*) FROM task WHERE project_id = ? AND deleted_at IS NULL GROUP BY status",
+        )
+        .bind(project_id)
+        .fetch_all(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
     pub async fn lock_primary_milestone_project_version_in_tx(
         &self,
         connection: &mut sqlx::SqliteConnection,

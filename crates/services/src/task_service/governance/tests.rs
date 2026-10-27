@@ -1,3 +1,5 @@
+//! Task governance, capability admission, reconciliation, and workspace lease tests.
+
 use super::*;
 use events::EventBus;
 use std::sync::Arc;
