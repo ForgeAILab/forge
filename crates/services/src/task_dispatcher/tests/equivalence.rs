@@ -1,11 +1,11 @@
 //! Real-database scheduler equivalence against `9d9b228f`.
 //!
-//! This file compiles unchanged on the base commit. There it records what the
-//! scanning dispatcher did with each shape (`SCHEDULER_EQUIVALENCE_RECORD=<dir>`);
-//! here it replays the same rows through the reconciling dispatcher and compares
-//! the outcome with that checked-in recording: dispatched or held, the target,
-//! and every legacy field and event written. The only differences accepted are
-//! the `@<Exception>` lines of the fixture, each naming one allowed change.
+//! The original harness recorded the scanning dispatcher's outcomes on that
+//! commit (`SCHEDULER_EQUIVALENCE_RECORD=<dir>`). This module and its children
+//! replay the same rows through the reconciling dispatcher and compare the
+//! outcome with that checked-in recording: dispatched or held, the target,
+//! and every legacy field and event written. The only differences accepted
+//! are the `@<Exception>` lines of the fixture, each naming one allowed change.
 use super::*;
 use std::collections::HashMap;
 

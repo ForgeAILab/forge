@@ -315,6 +315,11 @@ async fn replacements(
 }
 
 pub(crate) async fn snapshot(f: &Fixture, case: &str, phase: &str, options: SnapshotOptions) {
+    debug_assert!(
+        matches!(options.comparison, Comparison::FieldFingerprints)
+            || (options.metadata_times.is_empty() && options.condition_times.is_empty()),
+        "{case}/{phase}: named timestamps require the FieldFingerprints profile"
+    );
     let row = f.read().await;
     let replacements = replacements(f, &row, options).await;
     let normalize = |raw: &str| normalize_ids(raw, &replacements);
@@ -429,7 +434,7 @@ pub(crate) fn assert_main_parity(name: &str, actual: &Value, comparison: Compari
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
         .find(|value| value[key] == name)
-        .expect("archived main case");
+        .unwrap_or_else(|| panic!("archived main case missing: {name}"));
     let actual = json!({(key): name, (field): actual});
     assert_eq!(actual, expected, "archived main parity: {name}");
 }
