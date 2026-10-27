@@ -94,6 +94,7 @@ async fn list_review_step_results_json(
 
 mod review;
 mod usage_read;
+pub use usage_read::TaskExecutionTimingRead;
 
 // -------------------------------------------------------------------------
 // Ledger-backed usage analytics

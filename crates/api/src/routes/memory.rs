@@ -174,24 +174,16 @@ async fn visible_project_grants(
     state: &AppState,
     user: &AuthenticatedUser,
 ) -> ApiResult<Vec<MemoryScopeGrant>> {
-    let rows = sqlx::query(
-        "SELECT project.id FROM project WHERE project.owner_id IS NULL OR project.owner_id = ? OR EXISTS (SELECT 1 FROM project_member WHERE project_member.project_id = project.id AND project_member.user_id = ?)",
-    )
-    .bind(&user.user_id)
-    .bind(&user.user_id)
-    .fetch_all(state.db.pool())
-    .await
-    .map_err(db::DbError::from)?;
-    use sqlx::Row;
-    rows.into_iter()
-        .map(|row| {
-            Ok(MemoryScopeGrant {
-                scope_type: "project".to_owned(),
-                scope_id: row.try_get("id")?,
-                visibility: vec!["project".to_owned()],
-                identity_id: None,
-            })
+    Ok(state
+        .db
+        .memory_visible_project_ids(&user.user_id)
+        .await?
+        .into_iter()
+        .map(|scope_id| MemoryScopeGrant {
+            scope_type: "project".to_owned(),
+            scope_id,
+            visibility: vec!["project".to_owned()],
+            identity_id: None,
         })
-        .collect::<Result<Vec<_>, sqlx::Error>>()
-        .map_err(|error| ApiError::from(db::DbError::from(error)))
+        .collect())
 }

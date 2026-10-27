@@ -248,48 +248,24 @@ pub async fn set_cli_runtime_availability(
             ApiError::not_found("cli_runtime", format!("{daemon_id}/{executor_type}"))
         })?;
     let now = now_rfc3339();
-    let updated = sqlx::query(
-        "UPDATE cli_runtime_policy
-         SET enabled = ?, version = version + 1, updated_at = ?
-         WHERE owner_user_id = ? AND daemon_id = ? AND executor_type = ?
-           AND version = ?",
-    )
-    .bind(request.enabled)
-    .bind(&now)
-    .bind(&user.user_id)
-    .bind(&daemon_id)
-    .bind(&executor_type)
-    .bind(request.version)
-    .execute(state.db.pool())
-    .await?;
-    let changed = if updated.rows_affected() == 1 {
-        true
-    } else if request.version == 0 {
-        sqlx::query(
-            "INSERT OR IGNORE INTO cli_runtime_policy (
-                 owner_user_id, daemon_id, executor_type, enabled,
-                 version, created_at, updated_at
-             ) VALUES (?, ?, ?, ?, 1, ?, ?)",
+    state
+        .db
+        .set_cli_runtime_enabled(
+            &user.user_id,
+            &daemon_id,
+            &executor_type,
+            request.enabled,
+            request.version,
+            &now,
         )
-        .bind(&user.user_id)
-        .bind(&daemon_id)
-        .bind(&executor_type)
-        .bind(request.enabled)
-        .bind(&now)
-        .bind(&now)
-        .execute(state.db.pool())
-        .await?
-        .rows_affected()
-            == 1
-    } else {
-        false
-    };
-    if !changed {
-        return Err(ApiError::conflict_with_code(
-            "cli_runtime.version_conflict",
-            "CLI runtime availability changed before it could be updated",
-        ));
-    }
+        .await
+        .map_err(|error| match error {
+            DbError::VersionConflict => ApiError::conflict_with_code(
+                "cli_runtime.version_conflict",
+                "CLI runtime availability changed before it could be updated",
+            ),
+            other => ApiError::from(other),
+        })?;
     let entries = cli_runtime_entries_for_daemon(&state, &user.user_id, daemon).await?;
     let entry = entries
         .into_iter()
@@ -488,26 +464,10 @@ async fn cli_runtime_entries_for_daemon(
 ) -> ApiResult<Vec<CliRuntimeEntryResponse>> {
     let detected: Vec<DetectedCli> =
         serde_json::from_str(&daemon.detected_clis_json).unwrap_or_default();
-    let policies = sqlx::query(
-        "SELECT executor_type, enabled, version FROM cli_runtime_policy
-         WHERE owner_user_id = ? AND daemon_id = ?",
-    )
-    .bind(owner_user_id)
-    .bind(&daemon.id)
-    .fetch_all(state.db.pool())
-    .await?;
-    let policy_by_executor: HashMap<String, (bool, i64)> = policies
-        .into_iter()
-        .map(|row| {
-            Ok((
-                sqlx::Row::try_get(&row, "executor_type")?,
-                (
-                    sqlx::Row::try_get(&row, "enabled")?,
-                    sqlx::Row::try_get(&row, "version")?,
-                ),
-            ))
-        })
-        .collect::<Result<_, sqlx::Error>>()?;
+    let policy_by_executor = state
+        .db
+        .cli_runtime_policies_for_daemon(owner_user_id, &daemon.id)
+        .await?;
     Ok(detected
         .into_iter()
         .map(|cli| {

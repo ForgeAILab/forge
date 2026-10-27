@@ -126,7 +126,9 @@ async fn dependencies_with_created_at(
 ) -> ApiResult<Vec<TaskDependency>> {
     let mut response = Vec::with_capacity(dependencies.len());
     for depends_on_id in dependencies {
-        let created_at = dependency_created_at(db, &task_id, &depends_on_id).await?;
+        let created_at = db
+            .task_dependency_created_at(&task_id, &depends_on_id)
+            .await?;
         response.push(TaskDependency {
             task_id: task_id.clone(),
             depends_on_id,
@@ -143,7 +145,9 @@ async fn dependents_with_created_at(
 ) -> ApiResult<Vec<TaskDependency>> {
     let mut response = Vec::with_capacity(dependents.len());
     for task_id in dependents {
-        let created_at = dependency_created_at(db, &task_id, &depends_on_id).await?;
+        let created_at = db
+            .task_dependency_created_at(&task_id, &depends_on_id)
+            .await?;
         response.push(TaskDependency {
             task_id,
             depends_on_id: depends_on_id.clone(),
@@ -151,20 +155,4 @@ async fn dependents_with_created_at(
         });
     }
     Ok(response)
-}
-
-async fn dependency_created_at(
-    db: &db::SqliteDb,
-    task_id: &str,
-    depends_on_id: &str,
-) -> ApiResult<String> {
-    sqlx::query_scalar::<_, String>(
-        "SELECT created_at FROM task_dependency WHERE task_id = ? AND depends_on_id = ?",
-    )
-    .bind(task_id)
-    .bind(depends_on_id)
-    .fetch_one(db.pool())
-    .await
-    .map_err(db::DbError::from)
-    .map_err(ApiError::from)
 }

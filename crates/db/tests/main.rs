@@ -107,3 +107,6 @@ mod worker_dead_letter_resolution;
 
 #[path = "suite/session_journal_probe.rs"]
 mod session_journal_probe;
+
+#[path = "suite/route_persistence.rs"]
+mod route_persistence;

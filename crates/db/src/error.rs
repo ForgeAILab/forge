@@ -25,6 +25,9 @@ pub enum DbError {
     #[error("database commit outcome is unknown")]
     AmbiguousCommit(#[source] sqlx::Error),
 
+    #[error("{0}")]
+    ProjectCleanup(String),
+
     #[error("not found")]
     NotFound,
 

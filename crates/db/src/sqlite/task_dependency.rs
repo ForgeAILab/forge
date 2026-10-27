@@ -1,5 +1,21 @@
 use super::*;
 
+impl SqliteDb {
+    pub async fn task_dependency_created_at(
+        &self,
+        task_id: &str,
+        depends_on_id: &str,
+    ) -> Result<String> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT created_at FROM task_dependency WHERE task_id = ? AND depends_on_id = ?",
+        )
+        .bind(task_id)
+        .bind(depends_on_id)
+        .fetch_one(self.pool())
+        .await?)
+    }
+}
+
 /// Explicit prerequisites and the hierarchy's completion/order waits form
 /// one graph of `(Task, phase)` nodes: a Task's start waits on each
 /// prerequisite's completion; its completion waits on its own start; a child
